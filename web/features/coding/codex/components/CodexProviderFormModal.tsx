@@ -19,6 +19,8 @@ import type { FetchedModel, FetchModelsResponse } from '@/components/common/Fetc
 import BillingConfigCollapse from '@/features/coding/shared/providerBilling/BillingConfigCollapse';
 import CustomHeadersCollapse from '@/features/coding/shared/providerHeaders/CustomHeadersCollapse';
 import ProviderNotesCollapse from '@/features/coding/shared/providerConfig/ProviderNotesCollapse';
+import ReasoningLevelsEditor from './ReasoningLevelsEditor';
+import { findPresetModelById } from '@/constants/presetModels';
 import {
   getBillingConfigFromMeta,
   mergeBillingConfigIntoMeta,
@@ -1179,7 +1181,7 @@ const CodexProviderFormModal: React.FC<CodexProviderFormModalProps> = ({
                   key={index}
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: 'minmax(120px, 1fr) minmax(160px, 1.2fr) 120px 32px',
+                    gridTemplateColumns: 'minmax(120px, 1fr) minmax(160px, 1.2fr) 120px minmax(150px, 1fr) 32px',
                     gap: 8,
                     alignItems: 'center',
                   }}
@@ -1199,7 +1201,40 @@ const CodexProviderFormModal: React.FC<CodexProviderFormModalProps> = ({
                       (option?.label?.toString().toLowerCase().includes(inputValue.toLowerCase()) ||
                       option?.value?.toString().toLowerCase().includes(inputValue.toLowerCase())) ?? false
                     }
-                    onChange={(value) => handleUpdateModelMapping(index, { model: value })}
+                    onChange={(value) => {
+                      const patch: Partial<CodexCatalogModel> = { model: value };
+                      // When a model id is entered, auto-fill contextWindow and
+                      // reasoning levels from the preset (matching the preset's
+                      // contextLimit and reasoning flag) when those fields are
+                      // still empty/unset on this row.
+                      const trimmedModel = value?.trim();
+                      if (trimmedModel) {
+                        const matchedPreset = findPresetModelById(trimmedModel);
+                        if (matchedPreset) {
+                          if (
+                            (item.contextWindow === undefined || item.contextWindow === '' || item.contextWindow === 0) &&
+                            typeof matchedPreset.contextLimit === 'number' &&
+                            matchedPreset.contextLimit > 0
+                          ) {
+                            patch.contextWindow = matchedPreset.contextLimit;
+                          }
+                          if (
+                            (!item.reasoningLevels || item.reasoningLevels.length === 0) &&
+                            matchedPreset.reasoning === true
+                          ) {
+                            // Default to a conservative set: low/high/max.
+                            // Users can add medium/xhigh/ultra manually.
+                            patch.reasoningLevels = ['low', 'high', 'max'];
+                            // Default to "high" when first auto-filled, matching
+                            // the config.toml model_reasoning_effort default.
+                            if (!item.defaultReasoningLevel) {
+                              patch.defaultReasoningLevel = 'high';
+                            }
+                          }
+                        }
+                      }
+                      handleUpdateModelMapping(index, patch);
+                    }}
                   />
                   <Input
                     value={item.contextWindow ?? ''}
@@ -1209,6 +1244,12 @@ const CodexProviderFormModal: React.FC<CodexProviderFormModalProps> = ({
                     onChange={(event) => handleUpdateModelMapping(index, {
                       contextWindow: event.target.value.replace(/[^\d]/g, ''),
                     })}
+                  />
+                  <ReasoningLevelsEditor
+                    levels={item.reasoningLevels}
+                    defaultLevel={item.defaultReasoningLevel}
+                    onLevelsChange={(levels) => handleUpdateModelMapping(index, { reasoningLevels: levels })}
+                    onDefaultLevelChange={(level) => handleUpdateModelMapping(index, { defaultReasoningLevel: level })}
                   />
                   <Button
                     type="text"
