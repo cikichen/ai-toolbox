@@ -29,6 +29,7 @@ import {
   MessageOutlined,
   PlusOutlined,
   SyncOutlined,
+  ThunderboltOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { invoke } from '@tauri-apps/api/core';
@@ -62,6 +63,16 @@ import {
 import { refreshTrayMenu } from '@/services/appApi';
 import { GlobalPromptSettings } from '@/features/coding/shared/prompt';
 import { SessionManagerPanel } from '@/features/coding/shared/sessionManager';
+import ProviderConnectivityTestModal, {
+  buildKimiProviderConnectivityInfo,
+  type ProviderConnectivityInfo,
+} from '@/features/coding/shared/providerConnectivity/ProviderConnectivityTestModal';
+import {
+  buildProviderConnectivityBatchTarget,
+  runProviderConnectivityBatch,
+} from '@/features/coding/shared/providerConnectivity/batchTest';
+import { getEnabledCustomProviderBatchCandidates } from '@/features/coding/shared/providerConnectivity/batchTestFilters';
+import type { ProviderConnectivityStatusItem } from '@/components/common/ProviderCard/types';
 import { useSettingsStore } from '@/stores';
 import {
   applyKimiOfficialAccount,
@@ -103,7 +114,7 @@ import KimiDeviceAuthModal from '../components/KimiDeviceAuthModal';
 import KimiPluginsPanel from '../components/KimiPluginsPanel';
 import KimiProviderCard from '../components/KimiProviderCard';
 import KimiProviderFormModal from '../components/KimiProviderFormModal';
-import { extractKimiBaseUrl } from '../utils/settingsConfig';
+import { extractKimiBaseUrl, KIMI_OFFICIAL_DEFAULT_MODEL_KEY } from '../utils/settingsConfig';
 import {
   buildKimiProviderSavePlan,
   shouldReengageKimiGatewayOnSave,
@@ -118,7 +129,7 @@ const { Link, Text, Title } = Typography;
 const KIMI_OFFICIAL_PROVIDER_TEMPLATE: KimiProviderInput = {
   name: 'Kimi Official',
   category: 'official',
-  settingsConfig: '{\n  "auth": { "API_KEY": "" },\n  "defaultModelKey": "kimi-code/k3",\n  "providerConfigs": {}\n}',
+  settingsConfig: `{\n  "auth": { "API_KEY": "" },\n  "defaultModelKey": "${KIMI_OFFICIAL_DEFAULT_MODEL_KEY}",\n  "providerConfigs": {}\n}`,
   sortIndex: 0,
 };
 
@@ -141,6 +152,11 @@ const KimiPage: React.FC = () => {
   const [sessionManagerExpandNonce, setSessionManagerExpandNonce] = React.useState(0);
   const [providerModalOpen, setProviderModalOpen] = React.useState(false);
   const [editingProvider, setEditingProvider] = React.useState<KimiProvider | null>(null);
+  const [isCopyMode, setIsCopyMode] = React.useState(false);
+  const [connectivityInfo, setConnectivityInfo] = React.useState<ProviderConnectivityInfo | null>(null);
+  const [connectivityModalOpen, setConnectivityModalOpen] = React.useState(false);
+  const [connectivityStatuses, setConnectivityStatuses] = React.useState<Record<string, ProviderConnectivityStatusItem>>({});
+  const [batchTestingProviders, setBatchTestingProviders] = React.useState(false);
   const [commonConfigModalOpen, setCommonConfigModalOpen] = React.useState(false);
   const [deviceAuthSession, setDeviceAuthSession] = React.useState<KimiDeviceAuthStartResult | null>(null);
   const [settingsModalOpen, setSettingsModalOpen] = React.useState(false);
@@ -194,6 +210,15 @@ const KimiPage: React.FC = () => {
       setOfficialAccounts(accountList);
       setCommonConfig(nextCommonConfig);
       setAppliedProviderId(providerList.find((provider) => provider.isApplied)?.id ?? '');
+      // Drop statuses of providers that no longer exist so a delete/reload
+      // cannot leave stale badges behind.
+      setConnectivityStatuses((previous) => {
+        const liveIds = new Set(providerList.map((provider) => provider.id));
+        const pruned = Object.fromEntries(
+          Object.entries(previous).filter(([id]) => liveIds.has(id)),
+        );
+        return Object.keys(pruned).length === Object.keys(previous).length ? previous : pruned;
+      });
       // Takeover eligibility depends on the provider rows (proxyable
       // candidates), so re-read it with the list; otherwise a stale error
       // status keeps the gateway proxy button hidden after the underlying
@@ -247,16 +272,29 @@ const KimiPage: React.FC = () => {
 
   const handleAddProvider = () => {
     setEditingProvider(null);
+    setIsCopyMode(false);
     setProviderModalOpen(true);
   };
 
   const handleEditProvider = (provider: KimiProvider) => {
     setEditingProvider(provider);
+    setIsCopyMode(false);
+    setProviderModalOpen(true);
+  };
+
+  const handleCopyProvider = (provider: KimiProvider) => {
+    setEditingProvider({
+      ...provider,
+      id: `${provider.id}_copy`,
+      name: `${provider.name}_copy`,
+      isApplied: false,
+    });
+    setIsCopyMode(true);
     setProviderModalOpen(true);
   };
 
   const handleSaveProvider = async (values: KimiProviderInput) => {
-    const plan = buildKimiProviderSavePlan(editingProvider, values);
+    const plan = buildKimiProviderSavePlan(editingProvider, values, { isCopy: isCopyMode });
     const gatewayModeBeforeSave = gatewayCliStatus?.mode;
     const shouldReengageGatewayProxy = shouldReengageKimiGatewayOnSave(editingProvider, gatewayModeBeforeSave);
 
@@ -294,6 +332,7 @@ const KimiPage: React.FC = () => {
     message.success(t('kimi.saveSuccess'));
     setProviderModalOpen(false);
     setEditingProvider(null);
+    setIsCopyMode(false);
     await loadConfig(true);
     await refreshTrayMenu();
   };
@@ -367,6 +406,82 @@ const KimiPage: React.FC = () => {
     });
   };
 
+  const handleTestProvider = (provider: KimiProvider) => {
+    if (provider.category === 'official') {
+      message.info(t('kimi.provider.officialConnectivityHint'));
+      return;
+    }
+    setConnectivityInfo(buildKimiProviderConnectivityInfo(provider));
+    setConnectivityModalOpen(true);
+  };
+
+  const handleBatchTestProviders = React.useCallback(async () => {
+    if (providers.length === 0) {
+      return;
+    }
+
+    const officialProviders = providers.filter((provider) => provider.category === 'official');
+    const testableProviders = getEnabledCustomProviderBatchCandidates(providers);
+
+    if (officialProviders.length > 0) {
+      message.info(t('kimi.provider.officialBatchSkipped', { count: officialProviders.length }));
+    }
+
+    if (testableProviders.length === 0) {
+      setConnectivityStatuses({});
+      return;
+    }
+
+    const targets = testableProviders.map((provider) => (
+      buildProviderConnectivityBatchTarget(buildKimiProviderConnectivityInfo(provider), {
+        requireBaseUrl: false,
+        requireApiKey: true,
+        errorMessages: {
+          missingBaseUrl: t('common.baseUrlMissing'),
+          missingApiKey: t('common.apiKeyMissing'),
+          missingModel: t('common.modelMissing'),
+        },
+      })
+    ));
+
+    setConnectivityStatuses(
+      Object.fromEntries(
+        testableProviders.map((provider) => [
+          provider.id,
+          { status: 'running' as const },
+        ]),
+      ),
+    );
+    setBatchTestingProviders(true);
+
+    try {
+      await runProviderConnectivityBatch(targets, (providerId, status) => {
+        const nextStatus = status.status === 'success'
+          ? {
+              ...status,
+              tooltipMessage: status.totalMs !== undefined
+                ? t('common.connectivityBatchSuccessWithTiming', {
+                    model: status.modelId || t('common.notSet'),
+                    totalMs: status.totalMs,
+                  })
+                : t('common.connectivityBatchSuccess', {
+                    model: status.modelId || t('common.notSet'),
+                  }),
+            }
+          : status;
+        setConnectivityStatuses((previousStatuses) => ({
+          ...previousStatuses,
+          [providerId]: nextStatus,
+        }));
+      });
+    } catch (error) {
+      console.error('Failed to batch test Kimi providers:', error);
+      message.error(t('common.error'));
+    } finally {
+      setBatchTestingProviders(false);
+    }
+  }, [providers, t]);
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -407,7 +522,11 @@ const KimiPage: React.FC = () => {
   };
 
   const handleStartOfficialAccountAuth = async () => {
-    let officialProvider = providers.find((p) => p.category === 'official');
+    // The `__local__` projection is not a real DB row — the backend cannot
+    // resolve it as an official provider, so only look at persisted rows.
+    let officialProvider = providers.find(
+      (p) => p.category === 'official' && p.id !== KIMI_LOCAL_PROVIDER_ID,
+    );
     if (!officialProvider) {
       try {
         const newProvider = await createKimiProvider({ ...KIMI_OFFICIAL_PROVIDER_TEMPLATE });
@@ -588,6 +707,19 @@ const KimiPage: React.FC = () => {
                     type="link"
                     size="small"
                     style={{ fontSize: 12 }}
+                    icon={<ThunderboltOutlined />}
+                    loading={batchTestingProviders}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleBatchTestProviders();
+                    }}
+                  >
+                    {t('common.batchTest')}
+                  </Button>
+                  <Button
+                    type="link"
+                    size="small"
+                    style={{ fontSize: 12 }}
                     icon={<AppstoreOutlined />}
                     onClick={(event) => {
                       event.stopPropagation();
@@ -662,6 +794,9 @@ const KimiPage: React.FC = () => {
                               onDelete={(value) => void handleDeleteProvider(value)}
                               onApply={(value) => void handleApplyProvider(value)}
                               onToggleDisabled={handleToggleDisabled}
+                              onTest={handleTestProvider}
+                              onCopy={handleCopyProvider}
+                              connectivityStatus={connectivityStatuses[provider.id]}
                             />
                           ))}
                         </div>
@@ -804,8 +939,16 @@ const KimiPage: React.FC = () => {
         onCancel={() => {
           setProviderModalOpen(false);
           setEditingProvider(null);
+          setIsCopyMode(false);
         }}
         onSubmit={handleSaveProvider}
+      />
+
+      <ProviderConnectivityTestModal
+        open={connectivityModalOpen}
+        connectivityInfo={connectivityInfo}
+        gatewayCliKey="kimi"
+        onCancel={() => setConnectivityModalOpen(false)}
       />
 
       <KimiCommonConfigModal

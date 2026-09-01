@@ -41,8 +41,23 @@ import {
   parseKimiSettingsConfig,
   buildKimiSettingsConfig,
   CUSTOM_KIMI_PROVIDER_KEY,
+  KIMI_OFFICIAL_DEFAULT_MODEL_ID,
+  KIMI_OFFICIAL_DEFAULT_MODEL_KEY,
+  KIMI_OFFICIAL_DEFAULT_MODEL_MAX_CONTEXT_SIZE,
 } from '../utils/settingsConfig';
 import styles from './KimiProviderFormModal.module.less';
+
+/**
+ * Default catalog entry for a newly created provider: the current official
+ * model also serves as the default for custom Kimi relays. The CLI
+ * hard-requires a positive max_context_size on every projected model.
+ */
+const DEFAULT_NEW_PROVIDER_CATALOG_MODEL: KimiCatalogModel = {
+  key: KIMI_OFFICIAL_DEFAULT_MODEL_KEY,
+  model: KIMI_OFFICIAL_DEFAULT_MODEL_ID,
+  provider: CUSTOM_KIMI_PROVIDER_KEY,
+  maxContextSize: KIMI_OFFICIAL_DEFAULT_MODEL_MAX_CONTEXT_SIZE,
+};
 
 interface KimiProviderFormModalProps {
   open: boolean;
@@ -135,15 +150,7 @@ const KimiProviderFormModal: React.FC<KimiProviderFormModalProps> = ({
       });
     } else {
       setCategory('custom');
-      setCatalogModels([
-        {
-          key: 'kimi-code/k3',
-          model: 'k3',
-          provider: CUSTOM_KIMI_PROVIDER_KEY,
-          // Official K3 context size; keeps the projected config.toml valid.
-          maxContextSize: 1048576,
-        },
-      ]);
+      setCatalogModels([{ ...DEFAULT_NEW_PROVIDER_CATALOG_MODEL }]);
       setRawObject({});
       setRawJson('');
       setProviderKey(CUSTOM_KIMI_PROVIDER_KEY);
@@ -157,7 +164,7 @@ const KimiProviderFormModal: React.FC<KimiProviderFormModalProps> = ({
         notes: '',
         apiKey: '',
         baseUrl: '',
-        defaultModelKey: 'kimi-code/k3',
+        defaultModelKey: DEFAULT_NEW_PROVIDER_CATALOG_MODEL.key,
       });
     }
     setAdvancedExpanded(false);
@@ -230,7 +237,7 @@ const KimiProviderFormModal: React.FC<KimiProviderFormModalProps> = ({
       model: `model-${nextIndex}`,
       provider: providerKey || CUSTOM_KIMI_PROVIDER_KEY,
       // Kimi CLI hard-requires a positive max_context_size per model.
-      maxContextSize: 262144,
+      maxContextSize: KIMI_OFFICIAL_DEFAULT_MODEL_MAX_CONTEXT_SIZE,
     };
     const nextModels = [...catalogModels, newModel];
     setCatalogModels(nextModels);
@@ -428,7 +435,7 @@ const KimiProviderFormModal: React.FC<KimiProviderFormModalProps> = ({
         <Input
           size="small"
           value={record.key}
-          placeholder="e.g. kimi-code/k3"
+          placeholder="e.g. kimi-code/kimi-for-coding"
           onChange={(e) => handleUpdateModel(index, 'key', e.target.value)}
         />
       ),
@@ -447,7 +454,7 @@ const KimiProviderFormModal: React.FC<KimiProviderFormModalProps> = ({
         <Input
           size="small"
           value={record.model}
-          placeholder="e.g. k3"
+          placeholder="e.g. kimi-for-coding"
           onChange={(e) => handleUpdateModel(index, 'model', e.target.value)}
         />
       ),
