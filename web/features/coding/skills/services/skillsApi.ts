@@ -5,10 +5,23 @@ import type {
   InstallResult,
   SyncResult,
   UpdateResult,
+  UpdateAllResult,
+  AutoUpdateConfig,
   GitSkillCandidate,
   OnboardingPlan,
   SkillRepo,
   CustomTool,
+  SkillGroupRecord,
+  SkillInventoryPreview,
+  SkillViewMode,
+  CentralRepoPathStatus,
+  CentralRepoPathPreview,
+  ApplyCentralRepoPathOptions,
+  ApplyCentralRepoPathResult,
+  CentralRepoScan,
+  AdoptCentralSkillsResult,
+  DeleteManagedSkillOptions,
+  SkillDocument,
 } from '../types';
 
 // Tool Status
@@ -25,6 +38,48 @@ export const setCentralRepoPath = async (path: string): Promise<string> => {
   return invoke<string>('skills_set_central_repo_path', { path });
 };
 
+export const getDefaultCentralRepoPath = async (): Promise<string> => {
+  return invoke<string>('skills_get_default_central_repo_path');
+};
+
+export const getCentralRepoPathStatus = async (): Promise<CentralRepoPathStatus> => {
+  return invoke<CentralRepoPathStatus>('skills_get_central_repo_path_status');
+};
+
+export const previewCentralRepoPath = async (path: string): Promise<CentralRepoPathPreview> => {
+  return invoke<CentralRepoPathPreview>('skills_preview_central_repo_path', { path });
+};
+
+export const applyCentralRepoPathChange = async (
+  path: string,
+  options: ApplyCentralRepoPathOptions,
+): Promise<ApplyCentralRepoPathResult> => {
+  return invoke<ApplyCentralRepoPathResult>('skills_apply_central_repo_path_change', {
+    path,
+    options,
+  });
+};
+
+export const scanCentralRepo = async (): Promise<CentralRepoScan> => {
+  return invoke<CentralRepoScan>('skills_scan_central_repo');
+};
+
+export const adoptCentralRepoSkills = async (
+  relativePaths: string[],
+): Promise<AdoptCentralSkillsResult> => {
+  return invoke<AdoptCentralSkillsResult>('skills_adopt_central_repo_skills', { relativePaths });
+};
+
+export const repairCentralRepoSkill = async (
+  skillId: string,
+  relativePath: string,
+): Promise<AdoptCentralSkillsResult> => {
+  return invoke<AdoptCentralSkillsResult>('skills_repair_central_repo_skill', {
+    skillId,
+    relativePath,
+  });
+};
+
 // Managed Skills
 export const getManagedSkills = async (): Promise<ManagedSkill[]> => {
   return invoke<ManagedSkill[]>('skills_get_managed_skills');
@@ -36,6 +91,18 @@ export const installLocalSkill = async (
   overwrite?: boolean
 ): Promise<InstallResult> => {
   return invoke<InstallResult>('skills_install_local', { sourcePath, overwrite });
+};
+
+export const listLocalSkills = async (sourcePath: string): Promise<GitSkillCandidate[]> => {
+  return invoke<GitSkillCandidate[]>('skills_list_local_skills', { sourcePath });
+};
+
+export const installLocalSelection = async (
+  sourcePath: string,
+  subpath: string,
+  overwrite?: boolean
+): Promise<InstallResult> => {
+  return invoke<InstallResult>('skills_install_local_selection', { sourcePath, subpath, overwrite });
 };
 
 export const installGitSkill = async (
@@ -88,8 +155,107 @@ export const updateManagedSkill = async (skillId: string): Promise<UpdateResult>
   return invoke<UpdateResult>('skills_update_managed', { skillId });
 };
 
-export const deleteManagedSkill = async (skillId: string): Promise<void> => {
-  return invoke('skills_delete_managed', { skillId });
+export const updateAllSkills = async (): Promise<UpdateAllResult> => {
+  return invoke<UpdateAllResult>('skills_update_all');
+};
+
+export const getAutoUpdate = async (): Promise<AutoUpdateConfig> => {
+  return invoke<AutoUpdateConfig>('skills_get_auto_update');
+};
+
+export const setAutoUpdate = async (config: AutoUpdateConfig): Promise<AutoUpdateConfig> => {
+  return invoke<AutoUpdateConfig>('skills_set_auto_update', { config });
+};
+
+export const previewAutoUpdateSchedule = async (
+  schedule: string,
+  count?: number,
+): Promise<string[]> => {
+  return invoke<string[]>('skills_preview_auto_update_schedule', { schedule, count });
+};
+
+export const deleteManagedSkill = async (
+  skillId: string,
+  options?: DeleteManagedSkillOptions,
+): Promise<void> => {
+  return invoke('skills_delete_managed', { skillId, options });
+};
+
+export const updateSkillMetadata = async (
+  skillId: string,
+  groupId: string | null,
+  userNote: string | null,
+  tags?: string[],
+): Promise<void> => {
+  // Backend tri-state: undefined keeps existing tags, array overwrites the list.
+  const payload: Record<string, unknown> = { skillId, groupId, userNote };
+  if (typeof tags !== 'undefined') {
+    payload.tags = tags;
+  }
+  return invoke('skills_update_metadata', payload);
+};
+
+export const batchUpdateSkillGroup = async (
+  skillIds: string[],
+  groupId: string | null,
+): Promise<void> => {
+  return invoke('skills_batch_update_group', { skillIds, groupId });
+};
+
+export const getSkillGroups = async (): Promise<SkillGroupRecord[]> => {
+  return invoke<SkillGroupRecord[]>('skills_get_groups');
+};
+
+export const saveSkillGroup = async (
+  name: string,
+  note: string | null,
+  sortIndex: number,
+  id?: string,
+): Promise<string> => {
+  return invoke<string>('skills_save_group', { id, name, note, sortIndex });
+};
+
+export const deleteSkillGroup = async (groupId: string): Promise<void> => {
+  return invoke('skills_delete_group', { groupId });
+};
+
+export const setSkillManagementEnabled = async (
+  skillId: string,
+  enabled: boolean,
+): Promise<string[]> => {
+  return invoke<string[]>('skills_set_management_enabled', { skillId, enabled });
+};
+
+export const exportSkillInventory = async (): Promise<string> => {
+  return invoke<string>('skills_export_inventory');
+};
+
+export const exportSkillInventoryFile = async (): Promise<string> => {
+  return invoke<string>('skills_export_inventory_file');
+};
+
+export const previewSkillInventoryImport = async (
+  inventoryJson: string,
+): Promise<SkillInventoryPreview> => {
+  return invoke<SkillInventoryPreview>('skills_preview_inventory_import', { inventoryJson });
+};
+
+export const previewSkillInventoryImportFile = async (
+  filePath: string,
+): Promise<SkillInventoryPreview> => {
+  return invoke<SkillInventoryPreview>('skills_preview_inventory_import_file', { filePath });
+};
+
+export const applySkillInventoryImport = async (
+  inventoryJson: string,
+): Promise<SkillInventoryPreview> => {
+  return invoke<SkillInventoryPreview>('skills_apply_inventory_import', { inventoryJson });
+};
+
+export const applySkillInventoryImportFile = async (
+  filePath: string,
+): Promise<SkillInventoryPreview> => {
+  return invoke<SkillInventoryPreview>('skills_apply_inventory_import_file', { filePath });
 };
 
 // Onboarding
@@ -134,6 +300,14 @@ export const setPreferredTools = async (tools: string[]): Promise<void> => {
   return invoke('skills_set_preferred_tools', { tools });
 };
 
+export const getLimitAddMoreToPreferredTools = async (): Promise<boolean> => {
+  return invoke<boolean>('skills_get_limit_add_more_to_preferred_tools');
+};
+
+export const setLimitAddMoreToPreferredTools = async (enabled: boolean): Promise<void> => {
+  return invoke('skills_set_limit_add_more_to_preferred_tools', { enabled });
+};
+
 // Show Skills in Tray
 export const getShowSkillsInTray = async (): Promise<boolean> => {
   return invoke<boolean>('skills_get_show_in_tray');
@@ -141,6 +315,15 @@ export const getShowSkillsInTray = async (): Promise<boolean> => {
 
 export const setShowSkillsInTray = async (enabled: boolean): Promise<void> => {
   return invoke('skills_set_show_in_tray', { enabled });
+};
+
+// Default View Mode
+export const getDefaultViewMode = async (): Promise<SkillViewMode> => {
+  return invoke<SkillViewMode>('skills_get_default_view_mode');
+};
+
+export const setDefaultViewMode = async (mode: SkillViewMode): Promise<void> => {
+  return invoke('skills_set_default_view_mode', { mode });
 };
 
 // Skill Repos
@@ -171,6 +354,7 @@ export const addCustomTool = async (
   relativeSkillsDir: string,
   relativeDetectDir: string,
   forceCopy?: boolean,
+  iconUrl?: string,
 ): Promise<void> => {
   return invoke('skills_add_custom_tool', {
     key,
@@ -178,6 +362,7 @@ export const addCustomTool = async (
     relativeSkillsDir,
     relativeDetectDir,
     forceCopy,
+    iconUrl,
   });
 };
 
@@ -196,4 +381,9 @@ export const createCustomToolPath = async (relativeSkillsDir: string): Promise<v
 // Reorder Skills
 export const reorderSkills = async (ids: string[]): Promise<void> => {
   return invoke('skills_reorder', { ids });
+};
+
+// Skill documents (detail panel preview)
+export const getSkillDocuments = async (skillId: string): Promise<SkillDocument[]> => {
+  return invoke<SkillDocument[]>('skills_get_skill_documents', { skillId });
 };

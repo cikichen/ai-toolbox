@@ -3,14 +3,25 @@
 //! This module provides MCP (Model Context Protocol) server management functionality.
 //! It allows users to configure and sync MCP servers across multiple AI coding tools.
 
-pub mod types;
 pub mod adapter;
-pub mod mcp_store;
-pub mod config_sync;
-pub mod format_configs;
-pub mod opencode_path;
-pub mod commands;
-pub mod tray_support;
 pub mod command_normalize;
+pub mod commands;
+pub mod config_sync;
+pub mod cordis_patch;
+pub mod format_configs;
+pub mod hermes_mcp;
+pub mod mcp_store;
+pub mod opencode_path;
+pub mod package_version;
+pub mod tray_support;
+pub mod types;
+pub mod yaml_sync;
 
 pub use commands::*;
+
+pub(crate) fn mcp_tool_display_name(tool_key: &str, fallback: &str) -> String {
+    match tool_key {
+        "github_copilot" => "GitHub Copilot (VSCode)".to_string(),
+        _ => fallback.to_string(),
+    }
+}

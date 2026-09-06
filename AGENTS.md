@@ -6,12 +6,131 @@ This document provides essential information for AI coding agents working on thi
 
 与用户的所有对话必须使用**中文**，包括问题澄清、方案说明、进度反馈和结果总结。代码注释和 commit message 仍使用英文。
 
+## Module Documentation
+
+主要功能模块可以在自身目录下放置 `AGENTS.md`，用于记录该模块的 `Source of Truth`、设计决策、关键流程、易错点和最小验证。修改模块代码前，如果目标目录或更近的父目录存在模块级 `AGENTS.md`，必须先阅读。
+
+### Hard Rules
+
+1. 修改任何模块目录下的文件前，若该模块目录或更近的父目录存在 `AGENTS.md`，必须先读，再设计或实现。
+2. 当一次改动引入新的非显而易见设计决策、修复未来高概率复发的问题、或重构跨文件关键流程时，应在同一任务内同步更新对应模块的 `AGENTS.md`。
+3. 根 `AGENTS.md` 只保留全局规则。模块专属内容应下沉到对应模块目录下的 `AGENTS.md`。
+4. 模块级 `AGENTS.md` 只写高价值信息：`Source of Truth`、`Why`、`关键流程`、`Gotchas`、`最小验证`。不要写文件清单、类型定义、API 清单、数据库字段表、或可被代码直接证明的事实。
+5. 当根与模块 `AGENTS.md` 冲突时，以作用域更近、语义更具体的文档为准。
+6. 新增模块级 `AGENTS.md` 时，需在本节索引中同一任务内补上入口。
+7. 模块级 `AGENTS.md` 建设处于迁移期时，根 `AGENTS.md` 中已有的高价值信息只能补充重组，不能因为下沉而删弱；确认模块文档已完整覆盖前，不要移除根中的对应规则。
+8. 后续开发中，只要遇到值得长期沉淀的知识、用户反复强调的约束、或已经复发/高风险复发的坑点，必须在同一任务内及时写回对应模块的 `AGENTS.md`，不能等“下次再整理”。
+9. 如果某条经验已经上升为跨模块通用规则、全局架构约束、或多个模块都会反复踩到的铁律，应同步写回根 `AGENTS.md`，而不是只埋在单个模块文档里。
+10. 数据库相关经验默认按全局规则处理，优先写回根 `AGENTS.md`；只有某条数据库约束严格局限于单一模块时，才在对应模块 `AGENTS.md` 补充模块特有语义。
+11. 仓库内用于给 agent 阅读的模块文档 `AGENTS.md` 不是应用运行时资源；本地开发 watcher 和类似热重载链路应尽量忽略它们，避免把文档编辑误当成代码改动。
+12. 不要把上一条误用到产品运行时 prompt 文件上。当前仓库里的 OpenCode / Codex 运行时 prompt 文件名就是 `AGENTS.md`，Claude Code 运行时 prompt 文件名是 `CLAUDE.md`；它们属于真实业务数据，备份、恢复、WSL/SSH 同步和页面交互都依赖这些文件，不能按“仅 agent 文档”排除。
+13. 修改 `web/**` 中任何可见 UI、样式、布局、组件视觉、交互密度、空态、图标、颜色、字号、间距或弹窗表单前，必须先完整阅读根目录 `DESIGN.md`。没有读取 `DESIGN.md` 就不得设计方案、不得写前端 UI 代码、不得声称遵循项目设计系统。
+
+### Template
+
+- `docs/module-agents-template.md`：模块级 `AGENTS.md` 模板。新增模块文档时先复制，再删除不适用小节。
+
+### Index
+
+| 模块目录 | 说明 |
+|---------|------|
+| `tauri/src/coding/` | Coding 域共享规则：runtime location、事件驱动托盘、WSL Direct、跨工具 CLI/路径语义 |
+| `tauri/src/coding/auth_refresh/` | 官方账号 OAuth 共享调度：启动首次 + 周期 ensure_fresh（Grok/Codex/Gemini） |
+| `tauri/src/coding/claude_code/` | Claude Code 后端配置、prompt、plugin、MCP 与 WSL 同步约束 |
+| `tauri/src/coding/codex/` | Codex 后端配置、auth/config.toml、prompt、plugin 与 WSL 同步约束 |
+| `tauri/src/coding/claude_desktop/` | Claude Desktop 3P profile 配置（deploymentMode+configLibrary+_meta）、Direct 应用、快照回滚与恢复官方；网关接管由 proxy_gateway 的 GatewayCliKey::ClaudeDesktop 驱动 |
+| `tauri/src/coding/hermes/` | Hermes Agent 运行时 config.yaml 的 custom_providers/模型/MCP 可视化与同步 |
+| `tauri/src/coding/grok/` | Grok CLI 后端 provider、config/auth、官方账号、prompt、plugin 与同步约束 |
+| `tauri/src/coding/kimi/` | Kimi Code CLI 后端 provider、config/credentials、官方账号、prompt 与同步约束 |
+| `tauri/src/coding/gemini_cli/` | Gemini CLI 后端配置、env/settings、prompt、usage、tray 与 WSL/SSH/备份同步约束 |
+| `tauri/src/coding/mcp/` | MCP Server 后端存储、工具配置同步、导入导出与 WSL 联动 |
+| `tauri/src/coding/open_code/` | OpenCode 后端配置文件、provider、prompt、tray 与 WSL 同步约束 |
+| `tauri/src/coding/open_claw/` | OpenClaw 后端配置文件与 WSL 同步约束 |
+| `tauri/src/coding/oh_my_openagent/` | Oh My OpenAgent 后端配置、临时本地态、应用链路与 OpenCode WSL 联动 |
+| `tauri/src/coding/oh_my_opencode_slim/` | Oh My OpenCode Slim 后端配置、临时本地态、应用链路与 OpenCode WSL 联动 |
+| `tauri/src/coding/oh_my_pi/` | Oh My Pi 运行时根目录、models.yml provider、config.yml 设置与本地 MCP/Skills 路径边界 |
+| `tauri/src/coding/proxy_gateway/` | 本机代理网关、CLI 接管 manifest、配置备份恢复与模型级健康/日志文件 |
+| `tauri/src/coding/proxy_gateway/transformer/` | 网关协议转换独立模块：Anthropic/OpenAI Chat/OpenAI Responses/Gemini Native JSON 与 SSE 互转 |
+| `tauri/src/coding/session_manager/` | 会话浏览、详情、重命名、导入导出与运行时路径解析 |
+| `tauri/src/coding/skills/` | Skills 中央仓库、导入发现、同步、托盘和 WSL/SSH 相关链路 |
+| `tauri/src/coding/tools/` | Skills/MCP 共用工具适配、检测与自定义工具存储 |
+| `tauri/src/coding/wsl/` | WSL 同步配置、自动同步监听、WSL Direct 状态消费 |
+| `tauri/src/coding/ssh/` | SSH 连接、文件映射、手动同步、MCP/Skills 远端同步 |
+| `tauri/resources/` | 编译期嵌入的模型默认数据资源：`preset_models.json`/`models.dev.json` 的来源、顺序语义与缓存边界 |
+| `web/features/coding/claudecode/` | Claude Code 前端页面、根目录配置、provider 与 prompt 交互 |
+| `web/features/coding/claudedesktop/` | Claude Desktop 前端页面、provider/模型映射与通用配置交互（复用 claudecode 样式与网关接管按钮） |
+| `web/features/coding/hermes/` | Hermes 前端页面、custom_providers 与模型设置交互（复用 pi 样式） |
+| `web/features/coding/codex/` | Codex 前端页面、根目录配置、provider 与 prompt 交互 |
+| `web/features/coding/grok/` | Grok CLI 前端页面、根目录配置、provider、官方账号、plugin、prompt 与 session 交互 |
+| `web/features/coding/geminicli/` | Gemini CLI 前端页面、根目录配置、provider、prompt、usage 与 session 交互 |
+| `web/features/coding/kimi/` | Kimi Code CLI 前端页面、根目录配置、provider、官方账号、prompt 与通用配置交互 |
+| `web/features/coding/gateway/` | Gateway 前端页面、统计/请求/设置 Tab、顶部入口与 visibleTabs 可见性 |
+| `web/features/coding/image/` | Image 前端页面、工作台、渠道管理、历史与结果交互 |
+| `web/features/coding/mcp/` | MCP 前端页面、服务器管理、导入流程与工具同步交互 |
+| `web/features/coding/opencode/` | OpenCode 前端页面、配置路径、provider、prompt 与模型刷新交互 |
+| `web/features/coding/openclaw/` | OpenClaw 前端页面、配置路径、provider 与配置文件交互 |
+| `web/features/coding/shared/` | coding 共享前端语义：根目录弹窗、全局 prompt、favorite provider、会话面板、连通性测试 |
+| `web/features/coding/skills/` | Skills 前端页面、中央仓库视角、分组展示与批量同步交互 |
+| `web/features/shared/deepLink/` | `aitoolbox://` 深链接前端两侧：导入确认弹窗与分享链接生成（URL 格式事实源在后端 `deeplink/parser.rs`） |
+| `web/features/settings/` | WSL/SSH 设置页、同步入口、moduleStatuses 消费和 UI 边界 |
+| `web/components/common/` | 共享编辑器与基础交互组件的性能和正确性约束 |
+| `tauri/src/settings/backup/` | 备份恢复、WebDAV、自动备份与恢复后续链路 |
+| `tauri/src/coding/image/` | Image 后端渠道配置、任务、资产落盘、图片 API 调用与备份联动 |
+
+后续新增模块级 `AGENTS.md` 时，继续在此表追加，不在根文档其他位置零散登记。
+
+## Gateway 协议转换维护入口
+
+Gateway 协议转换采用双文档维护：
+
+- `docs/gateway-protocol-conversion.md` 是架构主文档，负责协议转换架构、统一 IR、SSE 生命周期、响应分类、runtime pipeline、side store、参考项目同步流程和 baseline commit。
+- `docs/gateway-provider-compatibility.md` 是 provider/channel 兼容细节文档，负责通用兼容点、逐渠道入参/出参兼容、默认行为、开关、触发条件、源码位置和测试位置。
+
+修改以下内容前，必须先完整阅读 `docs/gateway-protocol-conversion.md`，再阅读目标目录最近的模块级 `AGENTS.md` 和当前源码/测试：
+
+- `tauri/src/coding/proxy_gateway/transformer/**` 的协议转换、统一 IR、JSON/SSE/error 语义；
+- `tauri/src/coding/proxy_gateway/runtime/**` 的 source/target route、响应分类、pipeline、side store、failover 或 fixture；
+- 协议直通/转换判定、参考项目同步、baseline 或吸收结论。
+
+如果修改 provider profile、target protocol、body/header/path/auth、stream filter、rectifier、同协议直通兼容、Codex Chat reasoning、图片/多模态策略、prompt cache、default max tokens、xAI native Responses 或其它 provider/channel wire 兼容，还必须同时完整阅读 `docs/gateway-provider-compatibility.md`。
+
+完成代码或测试修改后，必须在同一任务内按职责更新对应文档；跨架构和渠道边界的改动要同时更新两份文档。文档更新不能留到后续任务。文档与源码或测试冲突时，以当前源码和测试为最终事实源，并立即修正文档。
+
+参考项目固定使用仓库根目录的相对兄弟路径，不得写死任何机器绝对路径：
+
+- `../cc-switch`：渠道/provider 兼容边界补充参考；
+- `../axonhub`：统一 IR、转换生命周期、SSE/Responses 终态和 pipeline 的主架构参考。
+
+执行参考项目同步时，先读取架构主文档中的上一次 baseline commit，再检查同级目录是否存在。目录不存在时，按文档记录的远端地址和目标分支 clone 到同级目录；目录存在时先检查工作树，保留用户未提交改动，不得 reset、checkout 覆盖或清理无关文件。`git fetch` 只更新 remote-tracking ref，可以在工作树脏时执行；只有工作树干净且当前 checkout 分支就是文档指定目标分支时，才允许 fast-forward 到 remote-tracking ref。其它情况直接基于 fetch 后的 remote-tracking ref 分析，不能为了更新 baseline 改写用户工作树。只分析 `baseline..<remote-tracking-ref>` 的增量，并在吸收完成后把参考项目 commit、增量范围、吸收/不吸收结论、AI Toolbox 实现位置和回归测试位置写回架构主文档；如果吸收内容改变 provider/channel 兼容事实，还必须同步更新 `docs/gateway-provider-compatibility.md`。
+
+协议直通只补充已证明的渠道/provider wire 兼容点；涉及协议转换时，先按文档确定 AxonHub 主架构和 AI Toolbox 当前职责边界，再吸收 cc-switch 的具体渠道兼容行为，不逐行搬运参考项目实现，也不把数据库、鉴权、URL、executor 或跨请求状态下沉到 transformer。
+
+工具结果媒体属于协议转换边界时，必须保持“有媒体才改写、无媒体沿用旧表示”的不变量：Chat tool message 不能承载原生图片时，把识别出的图片移到同一工具批次之后的 synthetic user turn；Responses 使用 `input_image`，Anthropic 使用原生 `image` block，Gemini 按 2.x/3.x 支持的 `functionResponse` 形态输出。媒体识别和目标协议映射必须以架构主文档、当前源码和回归测试为准，不能只复制参考项目的 helper。
+
+## Design System
+
+- 根目录 `DESIGN.md` 是 AI Toolbox 的视觉设计系统 Source of Truth，给 AI coding agents 阅读，不是应用运行时资源。
+- 任何前端 UI 相关任务都必须先读 `DESIGN.md`，再读目标模块 `AGENTS.md`，最后再设计或实现。只读模块 `AGENTS.md`、只看现有代码、或凭通用审美直接改 UI，都不合格。
+- 如果无法读取 `DESIGN.md`，必须先停下来说明阻塞；不能继续设计 UI、不能写样式、不能用“保持现有风格”作为替代。
+- `AGENTS.md` 负责工程规则、模块边界、行为语义和验证要求；`DESIGN.md` 负责视觉调性、设计 token、组件形态、布局密度和 Do / Don't。
+- 当 `DESIGN.md` 与模块级 `AGENTS.md` 冲突时，以更具体的模块行为约束为准；颜色、密度、圆角、层级和组件视觉默认继续遵循 `DESIGN.md`。
+- 本地开发 watcher、热重载、备份、恢复、WSL/SSH 同步和产品运行时 prompt 链路不要把根目录 `DESIGN.md` 当成业务数据处理。
+
+### How To Use `DESIGN.md`
+
+1. **读取顺序**：涉及 `web/**` 可见 UI 时，先完整阅读根目录 `DESIGN.md`，再阅读目标目录最近的模块级 `AGENTS.md`，最后阅读相关实现文件。
+2. **方案阶段**：UI 方案必须显式映射到 `DESIGN.md` 中的调性、布局密度、颜色/token、字体层级、组件形态和 Do / Don't；不能只写“参考现有风格”。
+3. **实现阶段**：颜色、边框、阴影、圆角、间距、状态色和主题适配优先使用 `DESIGN.md` 指向的 `web/App.css` CSS 变量和 Ant Design token；不要在 feature 代码里新增一套局部视觉系统。
+4. **冲突处理**：如果 `DESIGN.md` 与模块级 `AGENTS.md` 或现有业务语义冲突，先保留更具体的模块行为约束，并在结果说明中指出视觉规则如何取舍；不要静默覆盖模块语义。
+5. **验收检查**：完成 UI 改动后，至少自查亮色、暗色、system theme、长文本、空态、加载态、hover/active/disabled/selected 状态，以及是否出现卡片套卡片、硬编码颜色或布局跳动。
+6. **维护校验**：修改 `DESIGN.md` 本身时，必须运行 `pnpm design:lint`。该命令封装 Google `@google/design.md` CLI 的 `designmd lint DESIGN.md`，用于检查 DESIGN.md 格式、frontmatter token 和可被工具识别的设计规范问题。仅修改业务 UI 代码时不强制运行它，除非同时改了 `DESIGN.md`。
+
 ## Project Overview
 
 AI Toolbox is a cross-platform desktop application built with:
-- **Frontend**: React 19 + TypeScript 5 + Ant Design 5 + Vite 7
+- **Frontend**: React 19 + TypeScript 5 + Ant Design 6 + Vite 7
 - **Backend**: Tauri 2.x + Rust
-- **Database**: SurrealDB 2.x (embedded SurrealKV)
+- **Database**: SQLite JSONB primary store; SurrealDB is only used for one-time legacy import
 - **Package Manager**: pnpm
 
 ## Directory Structure
@@ -55,6 +174,9 @@ pnpm build
 
 # Type check
 pnpm tsc --noEmit
+
+# Lint the agent-readable design system
+pnpm design:lint
 ```
 
 ### Tauri (Full App)
@@ -83,14 +205,14 @@ cd tauri && cargo fmt
 cd tauri && cargo clippy
 ```
 
-### Testing (Not yet configured)
+### Testing
 
 ```bash
-# Frontend tests (when configured)
+# Frontend tests
 pnpm test
 
 # Run single test file
-pnpm test -- path/to/test.ts
+node --test web/test/path/to/test.test.ts
 
 # Rust tests
 cd tauri && cargo test
@@ -99,9 +221,49 @@ cd tauri && cargo test
 cd tauri && cargo test test_name
 ```
 
+### Test Execution Rules
+
+- 对跨模块、跨层、会影响“保存/应用/同步/恢复/导入导出/配置落盘”的**大功能迭代**，不要只跑针对性测试；在交付前必须补跑当前仓库可用的全量测试集合。
+- 当前仓库前端测试统一通过 `pnpm test` 执行；该脚本会发现并运行 `web/test/**` 下的 `.test.ts` / `.spec.ts` 文件。
+- 前端测试文件必须放在 `web/test/` 下，并镜像对应功能目录结构；不要把 `.test.ts` 文件继续与实现文件并排放在 `web/features/**`、`web/components/**` 等源码目录里。
+  - 例如：`web/features/coding/opencode/components/foo.ts` 对应测试应放在 `web/test/features/coding/opencode/components/foo.test.ts`
+- Rust 测试保持分层约定：
+  - 依赖模块私有实现的单元测试，继续放在 `tauri/src/**` 的 `#[cfg(test)]` / `#[test]` 中
+  - 面向公开行为或黑盒回归的集成测试，放在 `tauri/tests/**`，并按功能镜像组织目录与 fixtures
+- Windows 上 Rust 集成测试二进制也需要 common-controls v6 manifest；`tauri/build.rs` 会给 test targets 注入该 manifest，避免 `tauri-plugin-dialog` / `TaskDialogIndirect` 在 `cargo test` 启动阶段弹出入口点错误。单元测试还会在 `cfg(test)` 下避免链接 dialog 插件本身。不要移除这两处处理，除非同时验证 `cargo test` 不再弹系统错误框。
+- 当前仓库全量校验的最小集合是：
+  - `pnpm test`
+  - `cd tauri && cargo test`
+  - `pnpm exec tsc --noEmit`
+- 发版相关 GitHub Actions 仍必须跑同一套全量测试闸门；为缩短整体耗时，打包 job 可以与测试 job 并行，但发布收尾、更新元数据或对外宣布可用必须依赖测试与打包全部成功。
+- GitHub Actions cache 有分支/tag 作用域隔离。不同 release tag 之间不能互相恢复缓存；发版 workflow 不要使用 Rust target cache，即使是 restore-only，也避免旧缓存恢复失败直接阻断打包。
+- 如果本轮改动直接影响前端构建入口、路由、公共组件、i18n 资源、Vite/TS 配置，且成本可接受，还应额外跑：
+  - `pnpm build`
+- 如果全量测试中存在**与本轮改动无关的既有失败**，不要跳过不报；需要在结果总结里明确写出：
+  - 跑了哪些命令
+  - 哪些通过
+  - 哪些失败
+  - 失败是否为本轮新增
+  - 失败定位到的文件或测试名
+- 如果本轮只改一个非常局部的点，但用户明确要求“全量测试”或“完整验证”，仍然按上面的全量集合执行，而不是自行降级为 smoke test。
+- macOS 本地全量 `cargo test` 有两个已知环境失败，不是代码回归：`tray::tests::skills_section_*` 会因 muda 要求 `Menu`/`MenuChild` 只能在主线程创建而 panic（CI/Linux 不受影响）；另外 `coding::codex::official_accounts::tests::browser_oauth_callback_rejects_invalid_state` 在全量高并行下偶发 flaky，单测重跑可通过。判断是否为既有失败时，用 `git worktree` 检出干净 HEAD 单跑同一测试对比，不要直接归因为本轮改动。
+- 涉及真实 CLI 的 session 导入导出往返测试（如 opencode round trip）在 macOS 上会遇到 `/var` -> `/private/var` symlink realpath 差异；断言前必须用 `normalize_test_path` + `ai-toolbox-session-manager-` marker 对 `path`/`directory` 等临时目录字段做归一化，不能直接比较原始绝对路径。
+- Windows 本地 `cargo test` 的 doctest 段偶发 `error[E0460]: found possibly newer version of crate 'windows'`（可伴随 `memory allocation of ... failed`、`failed to mmap ... os error 1455` / `页面文件太小`）：rustdoc 加载到损坏/半写状态的 rlib 元数据所致，常见诱因是 ① 并发构建写同一 target（其它 `cargo run`/`cargo build` 与测试共用 `tauri/target`）；② 本机或沙箱存在进程级 commit 配额时，默认高并行度的全量 `cargo test` 会让 rustdoc mmap 整个依赖图超限（物理内存再空闲也会报 1455）。自愈顺序：先 `cargo clean -p windows && cargo test --doc`（只重编 windows 相关产物，约 1-2 分钟）；若全量仍在 doctest 段复现 mmap/E0460，改用 `cargo test --jobs 2`（限并行后已验证稳定通过）或错开其它 cargo 构建进程。另一个 Windows 特有失败是 `failed to remove file target\debug\ai-toolbox.exe`：exe 被正在运行的进程锁定（如其它 `cargo run` 启动的应用），等该进程退出后重试即可。若全量 `cargo test` 仅 doctest 段失败而其余套件全过，应先按上述自愈流程处理，不要误判为本轮代码回归。还有一个 Windows lib 单元测试二进制的入口点失败：`exit code: 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND)`，表现为测试二进制启动即崩、`dumpbin /imports` 显示静态导入与可用 baseline 完全一致、但 `RT_MANIFEST`（type 24）资源缺失 → common-controls v6 未激活 → 被链接进来的 `tauri-plugin-dialog` 的 `TaskDialogIndirect` 在 comctl32 v5 中无法解析。`tauri/build.rs` 的 `embed_windows_test_manifest` 本应经 `/MANIFEST:EMBED /MANIFESTINPUT:<OUT_DIR>/ai-toolbox-test.manifest` 注入该资源；全量 `cargo clean` 后的全新构建偶发不嵌入、而增量构建稳定嵌入（manifest 文件与 `cargo:rustc-link-arg-tests` 参数均存在却仍不嵌入，疑似 MSVC `link.exe` 在全新链接时的 arg 顺序或本机安全软件干扰）。判别与自愈：用 `git worktree` 检出干净 HEAD 单跑同一 `cargo test --lib` 对比——若 baseline 通过而本轮失败、且二进制确缺 `RT_MANIFEST`，先 `touch tauri/build.rs` 强制 build script 重跑、再增量 `cargo test --lib`（已验证通过）；不要把这种 fresh-build manifest 缺失误判为源码回归——影响测试二进制的 `#[cfg(not(test))]` 分支不参与测试编译，逻辑上不可能改变测试二进制链接图。
+- 新增或修复高价值回归时，应优先补**最贴近用户路径**的自动化用例；不要只补实现细节测试而漏掉“表单提交 -> 持久化 -> 再读取”这类关键往返语义。
+
 ## Code Style Guidelines
 
 ### TypeScript/React
+
+#### Ant Design 6 Notes
+
+- Ant Design 官方中文组件文档入口优先使用 `https://ant.design/components/<component>-cn`；本仓库当前可参考的新组件入口包括 `https://ant.design/components/border-beam-cn`。
+- `BorderBeam` 是 Ant Design 6.4.0 起提供的装饰性边框流光组件，用于强调少量关键容器或高亮状态；不要用它替代普通卡片、表单、Modal section 或高密度列表里的常规 `border` 样式。
+- 使用 `BorderBeam` 前必须先确认交互价值：如果只是普通信息分组，继续使用 `border: 1px solid var(--color-border)` 和现有 section/card 样式；如果用于长期动画效果，还要考虑 `prefers-reduced-motion` 或等效降级。
+- `https://ant.design/components/_util-cn` 不是视觉组件页，主要记录公开 TypeScript 工具类型：`GetRef`、`GetProps`、`GetProp`。当需要抽取 antd 组件的 ref、props 或单个 prop 类型时，优先从 `antd` 导入这些类型，不要引用 `antd/es/**/_util` 内部路径，也不要手写重复类型。
+- `ConfigProvider` 的全局配置入口已经在 `web/app/providers.tsx`，当前负责 `locale`、亮暗主题 `algorithm` 和 `colorPrimary`。新增全局 antd 配置时优先集中改这里，不要在业务页面随手套第二层全局 `ConfigProvider`。
+- `ConfigProvider` 的 `theme.components`、组件默认配置、`componentSize`、`variant`、`warning`、`getPopupContainer` 等能力只有在出现跨页面重复需求时才全局化；单个页面的视觉差异仍应局部处理，避免全局副作用。
+- 静态 `Modal` / `message` / `notification` 默认拿不到 React context。当前仓库优先使用 `<App>` + `App.useApp()`；只有无法进入 React 组件树的静态调用，才考虑 `ConfigProvider.config({ holderRender })` 这类全局静态方法配置。
 
 #### Imports Order
 1. React and React-related imports
@@ -160,7 +322,7 @@ export default ComponentName;
 
 #### Zustand Stores
 
-Use Zustand without persistence middleware - all data must go through the service layer to SurrealDB:
+Use Zustand without persistence middleware - all data must go through the service layer to the backend database:
 
 ```typescript
 interface SettingsState {
@@ -184,7 +346,7 @@ export const useSettingsStore = create<SettingsState>()((set) => ({
 }));
 ```
 
-**Never use persist middleware** - all persistent data must be stored in SurrealDB via Tauri commands.
+**Never use persist middleware** - all persistent data must be stored in the backend database via Tauri commands.
 
 #### Path Aliases
 Use `@/` for imports from `web/` directory:
@@ -214,68 +376,76 @@ fn command_name(param: &str) -> Result<ReturnType, String> {
 - Use `thiserror` for custom errors
 - Return `Result<T, String>` for Tauri commands
 - Use `?` operator for error propagation
+- Startup database compatibility errors must not fall through to `panic!`. In particular, when SQLite `user_version` is newer than the current `TARGET_SCHEMA_VERSION`, show a clear blocking error dialog and exit instead of trying to downgrade or crashing.
+
+#### HTTP / TLS Compatibility
+
+- 后端发起 HTTPS 请求时，默认优先复用仓库里的全局 `http_client`，不要在业务模块里随手 new 一个默认 `reqwest::Client`。
+- 当前仓库的全局 `http_client` 需要显式使用 `rustls` TLS 后端；不要回退到 Windows Schannel / native-tls 默认行为。
+- 原因不是“风格统一”，而是实战兼容性：某些机器上 `reqwest + Schannel` 会在 TLS 建连阶段直接报 `SEC_E_NO_CREDENTIALS` / “安全包中没有可用的凭证”，表现为浏览器、Node、curl 正常，但 Rust `send()` 在真正发出业务请求前就失败。
+- 如果新增特殊 HTTP client（自定义 timeout、禁压缩、直连、HTTP/1 only 等），也必须在同一 builder 链路里显式保留 `use_rustls_tls()`，不要只复制 timeout / proxy / compression 配置而漏掉 TLS 后端。
+
+#### Linux AppImage WebView Compatibility
+
+- 新版 Fedora/Arch/CachyOS 等发行版上，AppImage 内置的 Wayland/EGL/GBM 相关库可能与宿主 Mesa/Wayland ABI 冲突，导致 WebKitGTK webview 白屏或 EGL 初始化崩溃；这不是前端资源缺失，也不应只靠升级 Tauri 来判断解决。
+- AppImage + Wayland 的启动级兼容处理必须发生在 Tauri/WebKitGTK 初始化之前；优先用系统 `libwayland-client.so.0` 做一次性 `LD_PRELOAD` re-exec，再继续走 WebKitGTK GPU/DMABuf fallback level。
+- 系统 `libwayland-client.so.0` 搜索路径必须覆盖常见 x86_64 和 aarch64 Debian/Ubuntu multiarch 路径，不能只写 `/usr/lib64` 或 x86_64 专用路径。
+- 不要覆盖用户显式设置的 `LD_PRELOAD`，并且必须有 sentinel 环境变量防止重启循环；`AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND=1` 应禁用这类启动兼容处理。
+- Linux 发版如果新增或调整 AppImage 兼容策略，应同时确认 release workflow 的 Linux 产物覆盖 Fedora 用户可安装的 `rpm`，而不是只发布 `deb` 和 `AppImage`。
+- WebKitGTK 2.50+ 的 Skia 线程化渲染管线在 Wayland（尤其 AMD + KDE）上会引发滚动掉帧和「聚焦输入框冻结 UI」；应用版本对这类问题不可检测（界面能显示，watchdog 的 frontend-ready 超时/EGL 失败都不触发），只能靠预设级别规避（issue #301）。规避效果与 GPU 驱动强相关，呈分档态势：AMD 集显（Radeon 780M / radeonsi）下只有 `level 2` 即 `WEBKIT_DISABLE_GPU_PROCESS=1`（关 GPU 进程走软件合成）能消除冻结，`level 1 + WEBKIT_SKIA_GPU_PAINTING_THREADS=0` 干净环境仍卡死；Intel 集显（Iris Xe / iris）下 `level 0 + WEBKIT_SKIA_GPU_PAINTING_THREADS=0`（保留 GPU 进程、仅 Skia 单线程绘制）即可消除冻结且不牺牲 GPU 加速。即 `WEBKIT_SKIA_GPU_PAINTING_THREADS=0` 是有效的轻量规避，但仅对 Intel 路径完整修复，AMD 仍需 Level 2 兜底；固化时若按驱动分档（Intel 默认走 Skia 单线程、AMD 默认走 Level 2），可让 Intel 用户保留更流畅的 GPU 合成。同类先例：psysonic#342、tauri-apps/tauri#9088。
+- Release 构建下，Wayland 会话的所有安装方式（不只 AppImage）默认 min level 1（禁 DMABUF renderer）；watchdog 自动降级仍只覆盖白屏/崩溃类失败。
+- 持久化 level 文件（`wayland_webview_workaround_level`）是 JSON 记录，绑定写入时的 app 版本；版本不一致或旧版纯数字格式一律按默认处理。这样应用升级后自动重新探索级别，避免旧 WebKitGTK 回归触发的降级永久拖累新版本，也让系统 WebKitGTK 修复后能回到更高渲染路径。相关纯函数挂 `#[cfg(any(target_os = "linux", test))]` 以便在 Windows 上单测版本重置语义。
+
+#### Async Runtime Safety
+
+- **Never call `tauri::async_runtime::block_on()` or `tokio::runtime::Handle::block_on()` inside any async call chain.**
+  This includes Tauri commands, startup tasks spawned by `tauri::async_runtime::spawn`, event listeners, background sync tasks, and any helper that may be reached from those paths.
+- If a sync Rust helper needs database-backed or other async-derived data, do not hide the async query inside the sync helper. Provide a parallel `*_async` function and make async call sites use it directly.
+- When reviewing a sync helper that internally queries the database with `block_on`, treat it as **sync-boundary only**. Before reusing it, first verify whether the caller may run under Tokio/Tauri async runtime.
+- For path/config resolution utilities, prefer this rule:
+  sync callers use `*_sync` or pure sync helpers; async callers use `*_async`; do not mix them.
+- If you fix a high-value engineering pitfall that is likely to recur, you should also update this `AGENTS.md` in the same task so the rule becomes part of repo workflow guidance.
+- For cross-platform restore or backup flows that normalize on-disk directory names, do not only fix extracted file paths. Any persisted metadata still used by later sync, tray, WSL, or SSH flows, such as `skill.name` and `central_path`, must be normalized in the same task or a startup migration before those flows run.
+- When a settings/status API returns the primary config plus derived diagnostic metadata, do not let best-effort metadata resolution break the primary read path. For example, WSL/SSH `module_statuses`, tray visibility hints, or runtime-location summaries must degrade gracefully with logs instead of making the whole settings payload fail.
+
+#### Optional Field And Compatibility Rules
+
+- For optional config fields, do not use simple truthy checks like `if (values.someField) { ... }` when saving edited data. This collapses "user intentionally cleared the field" into "field was absent" and leaves stale values behind.
+- When a form edits persisted data that already allows partial optional structures, the form layer must not be stricter than the storage model unless a migration is handled in the same task.
+- Before adding paired validation such as "both filled or both empty", first verify backend types, existing imported data, restore flows, and edit flows. If stored data already permits one-sided values, blocking save in the form is a regression.
+- When removing or clearing provider-derived env/config keys, explicitly clean known keys before merging newly selected values. Do not assume omission in the new payload will delete old values automatically.
+- For tools whose runtime config file mixes AI Toolbox-managed fields with runtime-owned fields, rewrites must follow the same semantics as Claude Code settings writes: remove the previous AI Toolbox-managed fields first, then write the new managed fields. Do not preserve previous managed fields by default.
+- When a database update immediately reapplies managed configuration to runtime files, capture the previous database record before overwriting it and pass that snapshot into cleanup explicitly. Re-querying the applied row after `put`/`update` returns the new record, so removed model keys, renamed fields, and cleared sections cannot be identified and will remain stale on disk.
+- For third-party config nodes that AI Toolbox does not fully own, preserve unknown fields and legal schema shapes across read -> write round trips. If a field allows multiple valid forms such as `string | tuple`, `bool | object`, or `string | string[]`, do not normalize it to a narrower shape unless the task explicitly migrates user data and tests that migration.
+- In Claude Code `settings.json`, explicitly preserve runtime-owned top-level fields such as `enabledPlugins`, `extraKnownMarketplaces`, and `hooks` during provider/common-config rewrites. These fields are not the same thing as AI Toolbox-managed provider/common config.
+- For Claude plugin runtime JSON files such as `known_marketplaces.json`, never deserialize into a partial Rust struct and then serialize the whole file back. If AI Toolbox only owns one field like `autoUpdateEnabled`, patch that field in the raw JSON object and preserve all CLI-owned fields verbatim.
+- In Codex `config.toml`, explicitly preserve runtime-owned sections such as `mcp_servers`, `features`, and `plugins` during provider/common-config rewrites. These sections are not the same thing as AI Toolbox-managed provider/common config.
+- In Codex `auth.json`, do not full-overwrite runtime-owned OAuth fields when switching providers. AI Toolbox may manage `OPENAI_API_KEY`, but fields such as `auth_mode`, `tokens`, and `last_refresh` belong to Codex runtime login state and must be preserved unless the task explicitly migrates or clears them.
+
+### Modal Implementation Notes
+
+弹窗、分区、横向字段和卡片视觉规范统一写在根目录 `DESIGN.md`。这里仅保留会影响实现正确性的工程规则。
+
+- 普通 Ant Design `<Modal>` 居中由 `ConfigProvider` 和全局 `web/App.css` 处理；静态 `Modal.confirm/info/error/success/warning` 通过 `ConfigProvider.config({ holderRender })` 取得同一上下文。
+- 高弹窗必须依赖 `web/App.css` 的 viewport-safe modal 规则：`.ant-modal-wrap` 使用 `--ai-modal-viewport-block-gap` 和 `--ai-modal-viewport-inline-gap`，modal body 内部滚动。不要重新添加 per-modal `top` 偏移或一次性 max-height hack。
+- 真正全屏弹窗可通过 `rootClassName` 或 `wrapClassName` 将 `--ai-modal-viewport-block-gap` / `--ai-modal-viewport-inline-gap` 设为 `0px`，并明确接管内部滚动。
+- 弹窗内使用 `<Collapse>` 做 section 时，必须传 `bordered={false}` 或 `ghost`，否则 Ant Design CSS-in-JS 的默认白色 header/content 和边框会覆盖模块样式。
+- 自定义 collapse section 时，`.ant-collapse-content` 和 `.ant-collapse-content-box` 都需要显式设置 `background: transparent !important`，避免默认 `colorBgContainer` 破坏 section 背景。
+- 折叠内容不能只通过 `opacity`、`max-height` 或 `overflow` 视觉隐藏后继续保留可聚焦控件；收起态必须避免键盘焦点进入隐藏内容。
+- 复用现有 modal 表单模式时，保留 `<div className={styles.content}>` 和 `className={styles.form}` 这类已有结构，避免 alert、form item、输入框边距在同类弹窗中漂移。
 
 ### Styling
 
 - Use CSS Modules with Less (`.module.less`)
 - Class naming: camelCase in Less files
-- Use Ant Design's design tokens when possible
-
-```less
-.container {
-  display: flex;
-
-  &.active {
-    background: rgba(24, 144, 255, 0.1);
-  }
-}
-```
-
-### Form & Modal Layout
-
-**Modal forms should use horizontal (left-right) layout by default**, where labels are on the left and input fields are on the right. This provides better visual alignment and more efficient use of space.
-
-#### Layout Guidelines
-
-1. **Prefer Horizontal Layout**: Use Ant Design Form with `layout="horizontal"` for modal forms
-2. **Label Placement**: Labels should be right-aligned and placed on the left side of inputs
-3. **Consistent Label Width**: Use `labelCol` and `wrapperCol` to maintain consistent proportions
-
-#### Implementation Pattern
-
-```typescript
-// ✅ Recommended: Horizontal layout for modal forms
-<Form layout="horizontal" labelCol={{ span: 6 }} wrapperCol={{ span: 18 }}>
-  <Form.Item label={t('name')} name="name">
-    <Input />
-  </Form.Item>
-  <Form.Item label={t('description')} name="description">
-    <Input.TextArea />
-  </Form.Item>
-</Form>
-
-// ❌ Avoid: Vertical layout in modals (unless space is very limited)
-<Form layout="vertical">
-  <Form.Item label={t('name')} name="name">
-    <Input />
-  </Form.Item>
-</Form>
-```
-
-#### When to Use Vertical Layout
-
-Use vertical layout (`layout="vertical"`) only in these cases:
-- Very narrow containers where horizontal layout would be cramped
-- Forms with very long labels that don't fit well horizontally
-- Single-field quick input forms
+- Use CSS variables and Ant Design tokens defined by `DESIGN.md`; do not hardcode colors, shadows, radius, spacing, or one-off visual systems in business components.
+- Keep visual rules in `DESIGN.md` unless the rule is specifically about implementation mechanics, data semantics, or module ownership.
 
 ### Theme System (Dark Mode)
 
-**IMPORTANT: The application supports full dark mode / light mode / system theme switching. ALL UI colors must use theme variables or Ant Design tokens - NEVER hardcode color values.**
+AI Toolbox supports light, dark, and system theme. Visual token usage is defined in `DESIGN.md`; this section only documents the implementation architecture and non-negotiable engineering constraints.
 
 #### Theme Architecture
-
-The app uses a multi-layer theming system:
 
 1. **Theme Store** (`web/stores/themeStore.ts`):
    - Manages theme mode: `'light'`, `'dark'`, or `'system'`
@@ -291,103 +461,12 @@ The app uses a multi-layer theming system:
    - Defines theme-aware CSS variables
    - All custom variables automatically switch when `data-theme` attribute changes
 
-#### Available CSS Variables
+#### Theme Rules
 
-**Background Colors:**
-- `--color-bg-base` - Base background color
-- `--color-bg-container` - Container background
-- `--color-bg-layout` - Layout background
-- `--color-bg-elevated` - Elevated surface (dropdowns, modals)
-- `--color-bg-hover` - Hover state background
-- `--color-bg-selected` - Selected state background
-
-**Text Colors:**
-- `--color-text-primary` - Primary text (high emphasis)
-- `--color-text-secondary` - Secondary text (medium emphasis)
-- `--color-text-tertiary` - Tertiary text (low emphasis)
-
-**Border Colors:**
-- `--color-border` - Default border color
-- `--color-border-secondary` - Secondary border (higher contrast)
-- `--color-border-card` - Card border
-
-**Other:**
-- `--color-shadow` - Primary shadow
-- `--color-shadow-secondary` - Secondary shadow
-- `--color-scrollbar` - Scrollbar color
-
-#### Usage Guidelines
-
-**DO:**
-```less
-// ✅ Use CSS variables
-.container {
-  background: var(--color-bg-container);
-  color: var(--color-text-primary);
-  border: 1px solid var(--color-border);
-}
-
-// ✅ Use Ant Design tokens (via ConfigProvider)
-.container {
-  color: #1890ff; // OK for brand colors managed by Ant Design
-}
-
-// ✅ Dark mode specific overrides
-.icon {
-  opacity: 0.7;
-
-  :global([data-theme="dark"]) & {
-    filter: invert(1);
-  }
-}
-```
-
-**DON'T:**
-```less
-// ❌ Never hardcode colors
-.container {
-  background: #ffffff; // Wrong! Use var(--color-bg-container)
-  color: rgba(0, 0, 0, 0.88); // Wrong! Use var(--color-text-primary)
-}
-
-// ❌ Don't use media queries for theme
-@media (prefers-color-scheme: dark) { // Wrong! Use [data-theme="dark"]
-  .container { ... }
-}
-```
-
-#### Dark Mode Patterns
-
-**Pattern 1: CSS Variables (Recommended)**
-```less
-.myComponent {
-  background: var(--color-bg-container);
-  color: var(--color-text-primary);
-}
-// Automatically adapts to theme changes
-```
-
-**Pattern 2: Attribute Selector Overrides**
-```less
-.myComponent {
-  background-color: rgba(255, 255, 255, 0.2);
-
-  :global([data-theme="dark"]) & {
-    background-color: rgba(20, 20, 20, 0.2);
-  }
-}
-```
-
-**Pattern 3: Image/Icon Filters**
-```less
-.icon {
-  // Default: black icon on light background
-
-  :global([data-theme="dark"]) & {
-    filter: invert(1); // Inverts to white icon
-  }
-}
-```
+- UI colors, borders, shadows, radius and spacing must use `DESIGN.md` tokens, `web/App.css` CSS variables, or Ant Design tokens. Never hardcode light-only or dark-only values in business components.
+- Theme-specific overrides must use `[data-theme="dark"]` / `[data-theme="light"]` selectors. Do not use `@media (prefers-color-scheme: dark)` for app theme styling, because the app supports an explicit user-selected theme mode.
+- Inline styles are acceptable only when the component API requires them; values must still come from CSS variables or Ant Design tokens.
+- Images and icons that assume a light background must be checked in dark mode and adjusted through existing icon assets, tokenized colors, or scoped filters.
 
 #### Accessing Theme in TypeScript
 
@@ -399,40 +478,28 @@ const MyComponent = () => {
   // mode: 'light' | 'dark' | 'system'
   // resolvedTheme: 'light' | 'dark' (computed value)
 
-  // Use resolvedTheme for conditional rendering
-  const iconColor = resolvedTheme === 'dark' ? '#fff' : '#000';
+  // Prefer CSS variables for colors; use resolvedTheme only when rendering logic differs.
 };
 ```
 
 #### Testing Theme Support
 
-When implementing new components or features:
-
-1. **Test both themes**: Switch between light and dark mode in Settings
-2. **Test system theme**: Set to "System" and toggle OS theme
-3. **Check all states**: Hover, active, disabled, selected
-4. **Verify readability**: Ensure text contrast meets accessibility standards
-5. **Review hardcoded colors**: Search for hex colors (`#`) in your styles
-
-#### Common Mistakes to Avoid
-
-1. **Hardcoding opacity values**: Use theme variables instead
-   - ❌ `rgba(0, 0, 0, 0.88)` → ✅ `var(--color-text-primary)`
-
-2. **Using media queries for theme**: Use `[data-theme]` attribute selector
-   - ❌ `@media (prefers-color-scheme: dark)` → ✅ `[data-theme="dark"]`
-
-3. **Inline styles with hardcoded colors**: Extract to CSS modules or use theme variables
-   - ❌ `<div style={{ color: '#000' }}>` → ✅ Use CSS class with var()
-
-4. **Forgetting images/icons**: Dark backgrounds require inverted icons
-   - Add `filter: invert(1)` for dark mode when needed
+When implementing new components or features, test light, dark, and system theme. Check hover, active, disabled, selected, loading, and empty states, and search for accidental hardcoded color literals in changed UI files.
 
 ### Internationalization
 
 - All user-facing text must use i18next
 - Translation keys in `web/i18n/locales/`
 - Use nested keys: `modules.daily`, `settings.language`
+- Before adding, updating, deleting, checking, or looking up translation keys, use `scripts/i18n-keys.mjs` instead of manually reading or editing the full locale JSON files.
+  - `pnpm i18n:check` verifies statically used keys exist in every locale and locale key sets stay aligned.
+  - `pnpm i18n:set-key <key> --zh-CN "中文" --en-US "English" --write` adds a key to every locale; use `--allow-overwrite` only when intentionally replacing existing copy.
+  - `pnpm run` forwards arguments through a shell, so locale copy containing backticks (`` `AGENTS.md` ``) or `$` gets command-substituted and silently corrupted (e.g. `本地 \`AGENTS.md\` 文件` becomes `本地  文件`). When passing copy that contains backticks / `$`, call `node scripts/i18n-keys.mjs set-key ...` directly (or spawn it without a shell) instead of `pnpm i18n:set-key`, then verify the stored value.
+  - `pnpm i18n:find-text <text>` finds keys by translated copy.
+  - `pnpm i18n:find-key <key-or-prefix>` shows locale values and static usage locations.
+  - `pnpm i18n:prune --prefix <key-prefix> --write` removes high-confidence unused keys only inside the explicit prefix; do not run broad prune without a prefix.
+- Do not patch `web/i18n/locales/*.json` directly for ordinary add/update/delete work. If `scripts/i18n-keys.mjs` cannot perform the needed i18n edit, extend the script first in the same task, then use the script command and run `pnpm i18n:check`.
+- `pnpm test` includes the i18n key coverage test. If it fails, fix missing or mismatched locale keys rather than suppressing the check.
 
 ```typescript
 const { t } = useTranslation();
@@ -467,26 +534,114 @@ features/
 ## Important Notes
 
 1. **Strict TypeScript**: `noUnusedLocals` and `noUnusedParameters` are enabled
-2. **SurrealDB**: Uses embedded SurrealKV engine, data stored locally
+2. **Database**: Uses embedded SQLite JSONB as the primary local database; SurrealDB is legacy import-only state for users upgrading from old versions
 3. **i18n**: Supports `zh-CN` and `en-US`
-4. **Theme**: Full dark mode / light mode / system theme support implemented (see Theme System section in Code Style Guidelines)
+4. **Theme**: Full dark mode / light mode / system theme support implemented; visual token rules live in `DESIGN.md`, and implementation mechanics are summarized in the Theme System section above
 5. **Dev Server**: Runs on `http://127.0.0.1:5173`
+
+## SQLite JSONB Database Notes
+
+- 主数据库是 SQLite JSONB。新增或改造的持久化路径必须直接读写 `SqliteDbState`，禁止新增 SurrealDB-only 或 SurrealDB 双写路径。
+- SQLite 表结构统一遵循 `id + data(JSONB) + created_at + updated_at`，业务字段放在 JSONB `data` 中；新增/删除普通业务字段不需要 schema migration，adapter 负责默认值与兼容读取。
+- 启动阶段必须先检测旧库迁移状态，再打开 SQLite。只有旧 `{app_data_dir}/database` 存在且需要导入时，才临时打开 SurrealDB 执行一次性全量导入。
+- 打开 SQLite 文件后必须先用 `PRAGMA user_version` 做只读兼容检查；如果版本高于当前 `TARGET_SCHEMA_VERSION`，立即显示阻塞错误并退出，不要继续设置 WAL、跑 health probe、seed 数据或迁移。
+- 对真实文件数据库执行 schema 升级前，必须先创建迁移前 SQLite 快照；快照失败时应阻断升级，避免在没有回退点的情况下修改用户数据库。
+- 旧 SurrealDB 目录在导入、计数校验和完成标记成功前绝不能删除。完成标记必须在归档旧目录前写入；如果归档中途崩溃，下次启动应进入 `NeedsLegacyArchive` 而不是清理已导入的 SQLite。导入完成后压缩为 `{app_data_dir}/database.migrated.zip` 永久保留，并删除旧目录。
+- 迁移失败不能写完成标记；不完整 SQLite 文件需要清理，下次启动重试。连续 3 次失败后应向用户展示 `migration.log` 路径。
+- 备份恢复以 SQLite 单文件和 `db_manifest.json` 为准。旧 SurrealDB 备份只能作为恢复输入，恢复时导入 SQLite；新备份不要再包含旧 SurrealDB 快照作为事实源。
+- 跨表状态切换（如 applied flag）必须在 SQLite 事务或 helper 组合内完成；单表 applied 切换优先用 `db_update_applied_status`，不能在业务层逐条 `db_patch_where_bool` 后再单独 patch 目标记录。
+- 少数独立物理表（如 Gateway `model_pricing`）使用官方默认数据补齐时，必须优先保护用户已有行；默认 seed / 远端同步只能用 `INSERT OR IGNORE` 这类增量插入语义，不能覆盖用户自定义值。
+
+## Skills / WSL / SSH Quick Notes
+
+迁移期说明：本节原有规则继续保留，不能弱化。实际修改代码时，还应同时阅读模块级文档：
+- `tauri/src/coding/skills/AGENTS.md`
+- `tauri/src/coding/wsl/AGENTS.md`
+- `tauri/src/coding/ssh/AGENTS.md`
+- `web/features/settings/AGENTS.md`
+
+- Skills 的**唯一源目录**是中央仓库 `central_repo_path`。不要把 Claude/Codex/OpenCode/OpenClaw 当前运行时的 skills 目录当作同步源；这些目录只是目标目录或运行时消费目录。
+- `skills_sync_to_tool` 的职责是：把中央仓库内容同步到工具运行时目录。这个运行时目录可能是普通本机路径，也可能因为模块配置目录位于 WSL 而解析成 `\\\\wsl.localhost\\...` UNC 路径。
+- WSL `skills` 自动同步和 SSH `skills` 自动同步都不是复用文件映射。它们各自有独立链路，但**源端仍然是中央仓库**，不是工具当前目录。
+- WSL 直连模块要特别区分“源目录”和“目标目录”：
+  - 源目录仍是中央仓库。
+  - 工具目标目录可能已经是 WSL 运行时目录。
+  - UI 中为了可读性把路径显示成 WSL/UNC 形式，并不代表同步链路改成了从该显示路径取源。
+- 处理 Skills 的 WSL 自动同步时，不要把“当前运行时路径不是 WSL UNC”误判成“没有 WSL 目标目录”。
+  - 对 Claude/Codex/OpenCode/OpenClaw 这 4 个内置工具，如果当前运行时路径是本机 Windows 默认/自定义路径，WSL skills 目标仍应回退到各自默认 Linux 目录，如 `~/.claude/skills`、`~/.codex/skills`、`~/.config/opencode/skills`、`~/.openclaw/skills`。
+  - 只有真正的 WSL Direct 场景，才应优先根据 UNC 运行时路径动态解析目标目录。
+- 排查 “更新 Skill 后哪里没同步” 时，优先按这三个层次拆分：
+  - 中央仓库内容是否已更新。
+  - 本地工具运行时目录是否因为路径变化触发了重新同步。
+  - `skills-changed` 后的 WSL/SSH 后续链路是否执行，以及它们各自写入的是哪个远端目标目录。
+- 工具 skills 目录不能通过真实路径解析成中央仓库自身或其子目录。同步前必须按 symlink 解析后的路径拒绝 `source == target`、target 在 source 内、source 在 target 内；否则当 `~/.tool/skills` 父目录被 symlink 到中央仓库时，同步某个 Skill 会把中央源删掉或写成 self symlink。
+
+## 4 Tabs WSL Direct Notes
+
+迁移期说明：本节原有规则继续保留，不能弱化。实际修改这 4 个 tab 或设置页联动时，还应同时阅读模块级文档：
+- `tauri/src/coding/AGENTS.md`
+- `tauri/src/coding/wsl/AGENTS.md`
+- `tauri/src/coding/ssh/AGENTS.md`
+- `web/features/coding/shared/AGENTS.md`
+- `web/features/settings/AGENTS.md`
+
+- 适用范围：OpenCode、Claude Code、Codex、OpenClaw 这 4 个配置页。
+- 先区分两个概念：
+  - `source` 表示当前配置路径来自哪里，取值是 `custom` / `env` / `shell` / `default`。
+  - `is_wsl_direct` 表示当前**生效路径**是否是 `\\\\wsl.localhost\\...` 这类 WSL UNC 路径。
+  - 这两个维度彼此独立。最常见的组合就是 `source=custom` 且 `is_wsl_direct=true`。
+- 4 个 tab 的“自定义配置”并不完全同类：
+  - OpenCode、OpenClaw 保存的是**配置文件路径**。
+  - Claude Code、Codex 保存的是**配置根目录**，后续再在该目录下派生 `settings.json`、`config.toml`、`CLAUDE.md`、`AGENTS.md`、`skills` 等路径。
+- 后端对这 4 个 tab 的 WSL 判定统一走 `runtime_location`：
+  - 先按各模块自己的优先级解析“当前生效路径”。
+  - 如果该路径能被解析为 WSL UNC 路径，就标记为 `WslDirect`，并产出 `distro`、`linux_path`、`linux_user_root` 等元数据。
+  - 前端和 WSL/SSH 设置页消费的 `moduleStatuses` 就来自这一步，而不是直接看页面上的 `pathInfo.source`。
+- 当前生效路径的优先级规则如下：
+  - OpenCode：应用内 `config_path` > 环境变量 `OPENCODE_CONFIG` > shell 配置 > 默认配置文件路径。
+  - Claude Code：应用内 `root_dir` > 环境变量 `CLAUDE_CONFIG_DIR` > shell 配置 > 默认根目录。
+  - Codex：应用内 `root_dir` > 环境变量 `CODEX_HOME` > shell 配置 > 默认根目录。
+  - OpenClaw：应用内 `config_path` > 默认配置文件路径。
+- 一旦 4 个 tab 的生效路径是 WSL UNC，后续派生路径都会跟着切换到同一份 WSL 运行时位置：
+  - OpenCode/OpenClaw 这类“文件路径模块”会基于该配置文件所在位置继续推导 prompt、plugins、skills 等目录。
+  - Claude/Codex 这类“根目录模块”会在该根目录下继续推导配置文件、prompt、auth、skills 路径。
+  - `get_tool_skills_path_async` 也会基于这个运行时位置，把 4 个内置工具的 skills 目标解析成对应的 WSL UNC 路径。
+- 前端页面当前的展示逻辑也要单独理解：
+  - 4 个 tab 顶部路径行显示的 tag 只反映 `source`，不会单独显示一个 “WSL” tag。
+  - 所以“绿色 custom tag + 完整 `\\\\wsl.localhost\\...` 路径”是当前预期，不代表状态丢失。
+  - Claude/Codex 的通用 `RootDirectoryModal`、OpenCode 的 `ConfigPathModal`、OpenClaw 的 `OpenClawConfigPathModal` 打开时，只会把 `source === custom` 的当前值回填到输入框。
+- WSL/SSH 设置页对这份状态的消费也不同：
+  - WSL Sync 设置页会读取 `moduleStatuses`，把 `is_wsl_direct` 的模块 tab 置灰并显示 tooltip，同时手动 WSL 同步时也会把这些模块加入 `skipModules`。
+  - SSH Sync 设置页当前不会禁用这些模块；它只会用 `moduleStatuses` 把左侧“本地路径”改写成完整 UNC 显示，真正同步仍走后端动态解析。
+- 和这 4 个 tab 联动时最容易误判的点：
+  - 不要把 `source === custom` 当成 “一定是 WSL”。
+  - 也不要把 `moduleStatuses.is_wsl_direct` 反推成 “一定来自应用内自定义路径”，因为它也可能来自 env 或 shell。
+  - 排查问题时要分开看“页面展示的 source/path”“runtime_location 的 WSL 判定”“WSL/SSH 设置页消费到的 moduleStatuses”，这三层不是同一个状态对象。
+- **CLI 调用规则必须单独遵守**：
+- 对 OpenCode、Claude Code、Codex、OpenClaw 这 4 个 tab，只要后端需要调用对应工具 CLI，禁止直接假设 `Command::new("<tool>")` 总能工作。
+  - 必须先通过对应的 `runtime_location::*_runtime_location_async` 解析当前运行时。
+  - 如果运行时是本机路径，才直接调用本机 CLI。
+  - 如果运行时是 `WslDirect`，必须改成 `wsl -d <distro> --exec ...` 执行，并把传给 CLI 的配置路径、数据路径、导入导出文件路径、工作目录等参数转换成 Linux 路径。
+  - 纯文件读写可以继续直接访问 `\\\\wsl.localhost\\...` UNC 路径；但“文件 I/O 可用”不代表“CLI 也可以直接吃 UNC 路径”。
+  - 新增 CLI 能力时，要同时检查这 4 个 tab 是否存在同类调用点，避免只在当前模块修补。
+  - 对 Claude Code、Codex、OpenCode、OpenClaw 这类用户自行安装的 CLI，不要在 GUI 进程里直接依赖 `PATH` 做 `Command::new("<tool>")`。macOS 从 Dock/Finder/Spotlight 启动时常拿不到 shell PATH；新增 CLI 调用时，必须优先解析已知安装路径或显式配置路径，再回退到 PATH。
+  - 有 CLI 的 tab（opencode/claudecode/grok/pi/oh_my_pi/hermes/dsh/openclaw）的“更多选项”支持用户手动指定本机 CLI 路径；保存前会执行 `--version`/`-v`/`version` 校验，打开“更多选项”时每次重新探测并显示版本。本机 CLI 解析统一经 `tauri/src/coding/cli_resolver.rs` 的手动覆盖注册表优先使用该路径（文件不存在时回退自动发现）。改动 CLI 调用时不要绕过该注册表直接 `Command::new("<tool>")`。
 
 ## Data Storage Architecture
 
-**IMPORTANT**: All data storage and retrieval must go through the service layer API and interact directly with the backend database (SurrealDB). This is a local embedded database with very fast performance.
+**IMPORTANT**: All data storage and retrieval must go through the service layer API and interact directly with the backend SQLite JSONB database. SurrealDB is only a legacy import source during startup migration.
 
 ### DO NOT use localStorage
 
 - **Never** use `localStorage` or `zustand/persist` for data that needs to be persisted
 - **Never** sync data from localStorage to database - this pattern is not allowed
-- All persistent data must be stored directly in SurrealDB via Tauri commands
+- All persistent data must be stored directly in the backend database via Tauri commands
 
 ### Correct Data Flow
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐     ┌──────────────┐
-│  Component  │ ──► │  Service Layer   │ ──► │  Tauri Command  │ ──► │  SurrealDB   │
+│  Component  │ ──► │  Service Layer   │ ──► │  Tauri Command  │ ──► │ SQLite JSONB │
 │  (React)    │ ◄── │  (web/services/) │ ◄── │  (Rust)         │ ◄── │  (Database)  │
 └─────────────┘     └──────────────────┘     └─────────────────┘     └──────────────┘
 ```
@@ -510,7 +665,7 @@ export const saveSettings = async (settings: AppSettings): Promise<void> => {
 
 ### Backend Command Pattern
 
-All Tauri commands interacting with SurrealDB must follow the **Adapter Pattern** and use **Raw SQL** to ensure backward compatibility and avoid versioning issues.
+All Tauri commands interacting with persisted JSON records must follow the **Adapter Pattern**. Production persistence paths should use `SqliteDbState` plus `db_helpers`/JSONB helpers; raw SurrealQL belongs only in the legacy import/migration modules.
 
 #### 1. Database Naming Convention
 - **Database Fields**: Must use `snake_case`.
@@ -541,146 +696,38 @@ pub fn to_db_value(settings: &AppSettings) -> Value {
 }
 ```
 
-#### 3. Persistence Pattern (Updates & ID Handling)
-To avoid SurrealDB versioning conflicts (`Invalid revision` errors) and deserialization failures (`invalid type: map`):
+#### 3. Persistence Pattern (SQLite JSONB)
+主数据库读写必须直接走 SQLite：
 
-1.  **Reads**: Handle the `Thing` ID type explicitly.
-    *   **Best Practice**: Use **`type::string(id)`** in your query to convert the ID to a string before returning to Rust.
-    *   **Why**: SurrealDB's default `id` is a `Thing` object (e.g., `{ tb: "table", id: "id" }`). Direct deserialization into a `String` field in Rust will fail. Explicit conversion ensures compatibility.
-    *   **Code**: `SELECT *, type::string(id) as id FROM table:id`
-    *   **IMPORTANT**: The converted ID includes the table prefix (e.g., `"claude_provider:abc123"`). When passing this ID to the frontend or using it in subsequent operations, **you must strip the table prefix** (e.g., `"abc123"`) in the adapter layer before returning to business logic.
-    *   **Use Common Utility**: Always use the `db_id` module for ID handling:
-        ```rust
-        // In adapter.rs
-        use crate::coding::db_id::db_extract_id;
-
-        pub fn from_db_value_provider(value: Value) -> ClaudeCodeProvider {
-            let id = db_extract_id(&value);
-            // ...
-        }
-        ```
-    *   **Available Functions** (`crate::coding::db_id`):
-        *   `db_extract_id(record: &Value) -> String` - Extract and clean ID from a record
-        *   `db_extract_id_opt(record: &Value) -> Option<String>` - Same but returns Option
-        *   `db_clean_id(raw_id: &str) -> String` - Clean a raw ID string
-        *   `db_build_id(table: &str, id: &str) -> String` - Build a record ID string
-        *   `db_record_id(table: &str, id: &str) -> String` - Build backtick-escaped record reference for queries (e.g., `` table:`id` ``)
-        *   `db_new_id() -> String` - Generate a new record ID (UUID v4, no hyphens)
-
-2.  **Record ID Reference in Queries**: Use `db_record_id()` to build backtick-escaped record references.
-    *   **Problem**: `type::thing('table', $id)` behavior changed across SurrealDB versions (e.g., 2.4 → 2.6), causing "not found" errors even for existing records.
-    *   **Solution**: Use `db_record_id(table, id)` which generates `` table:`id` `` format. Backtick-escaped IDs are treated as literal strings regardless of content, avoiding version-specific parsing issues.
-    *   **NEVER** use `type::thing()` in any query. Always use `db_record_id()` instead.
-    *   **Code**:
-        ```rust
-        use crate::coding::db_id::db_record_id;
-
-        // SELECT by ID
-        let record_id = db_record_id("claude_provider", &id);
-        db.query(&format!("SELECT *, type::string(id) as id FROM {} LIMIT 1", record_id))
-
-        // UPDATE by ID
-        let record_id = db_record_id("mcp_server", &server_id);
-        db.query(&format!("UPDATE {} SET enabled = $enabled", record_id))
-            .bind(("enabled", true))
-
-        // DELETE by ID
-        let record_id = db_record_id("mcp_server", server_id);
-        db.query(&format!("DELETE {}", record_id))
-        ```
-    *   **Applies to**: All queries that target a specific record by ID:
-        *   `SELECT ... FROM {record_id}`
-        *   `UPDATE {record_id} SET ...` or `UPDATE {record_id} CONTENT $data`
-        *   `DELETE {record_id}`
-        *   `CREATE {record_id} CONTENT $data`
-        *   `UPSERT {record_id} CONTENT $data` or `UPSERT {record_id} SET ...`
-
-3.  **Record ID Generation**: Prefer SurrealDB auto-generated IDs. When manual IDs are needed, use `db_new_id()`.
-    *   **Preferred**: Let SurrealDB auto-generate IDs via `CREATE table CONTENT $data` (no ID specified). This is how `claude_provider`, `codex_provider`, `oh_my_opencode_config`, etc. work.
-    *   **When manual IDs are needed** (e.g., MCP servers, skills): Use the shared `db_new_id()` function which generates UUID v4 without hyphens.
-    *   **NEVER** call `uuid::Uuid::new_v4()` directly in store/command files. Always use `db_new_id()` from the `db_id` module.
-    *   **Code**:
-        ```rust
-        use crate::coding::db_id::{db_record_id, db_new_id};
-
-        // Create with manual ID
-        let id = db_new_id();
-        let record_id = db_record_id("mcp_server", &id);
-        db.query(&format!("CREATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-        ```
-
-4.  **Updates**: Use **Blind Writes (Overwrite)** to bypass version checks.
-    *   **Avoid**: Do NOT send the `version` or `revision` field back to the database in the `CONTENT` block. This triggers optimistic currency control checks which often fail.
-    *   **Avoid**: Do NOT include the `id` field in the `CONTENT` block. It can cause type conflicts.
-    *   **Pattern 1 (Update by ID)**: Use `db_record_id()` to target a specific record:
-        ```rust
-        let record_id = db_record_id("claude_provider", &id);
-        db.query(&format!("UPDATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-        ```
-    *   **Pattern 2 (Create or Update)**: Use `UPSERT` with `db_record_id()` for singleton or known-ID records:
-        ```rust
-        let record_id = db_record_id("settings", "app");
-        db.query(&format!("UPSERT {} CONTENT $data", record_id))
-            .bind(("data", payload))
-        ```
-        Or use hardcoded backtick format for fixed singleton IDs: `UPSERT settings:\`app\` CONTENT $data`
-    *   **Pattern 3 (Single Field)**: `UPDATE {record_id} SET field = $value`
-    *   **Pattern 4 (Batch by condition)**: `UPDATE table SET field = $value WHERE condition = true` (no ID targeting needed)
-
-5.  **SurrealDB Wrapper Characters**: Handled automatically by `db_extract_id()` / `db_clean_id()`. No manual handling needed — these functions strip table prefixes and `⟨⟩` wrappers transparently.
+- 普通记录优先使用 `SqliteDbState` + `db_helpers::{db_get, db_list, db_put, db_create, db_delete}`。
+- 单例记录使用固定 ID，例如 `settings/app`、`*_common_config/common`、`*_global_config/global`。
+- 写入 `data` 前仍然走 adapter，把业务结构转为 `serde_json::Value`；读取后由 adapter 补默认值。
+- SQLite helper 返回的 `Value` 已注入干净字符串 `id`，不要再按 SurrealDB `Thing` 或 `table:id` 处理。
+- 新建普通记录优先用 `db_create(conn, DbTable::X, &payload)`；需要手动 ID 时使用 `db_new_id()`，单例记录使用固定 ID。
+- 局部更新用 `db_patch_fields`；批量谓词更新若影响互斥状态必须包在 `db_transaction` 或使用专用 helper。需要原子更新多张表时用 `db_transaction`。
+- 表名必须来自 `DbTable` 或经过 identifier 校验，不要拼接未经校验的外部输入。
+- 旧 SurrealDB 查询规则只允许存在于 `tauri/src/db/surreal_import.rs` 和 `tauri/src/db_migration/`，用于读取老用户旧库并导入 SQLite。业务模块、Tauri command、store、tray、backup、WSL/SSH 同步路径都不能新增 SurrealQL。
 
 ```rust
-// commands.rs
 #[tauri::command]
-pub async fn get_settings(state: tauri::State<'_, DbState>) -> Result<AppSettings, String> {
-    let db = state.0.lock().await;
-
-    // CRITICAL: Convert `Thing` ID to string to match Rust struct types
-    // This avoids "invalid type: map, expected a string" errors
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM settings:`app` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query settings: {}", e))?;
-
-    let records: Vec<serde_json::Value> = result.take(0).map_err(|e| e.to_string())?;
-
-    if let Some(record) = records.first() {
-        Ok(adapter::from_db_value(record.clone()))
-    } else {
-        Ok(AppSettings::default())
-    }
+pub async fn get_settings(
+    state: tauri::State<'_, SqliteDbState>,
+) -> Result<AppSettings, String> {
+    settings::store::load_settings_from_sqlite_state(&state)
 }
 
 #[tauri::command]
 pub async fn save_settings(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     settings: AppSettings,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-
-    // Serialize settings but EXCLUDE sensitive system fields
-    // Ensure `adapter::to_clean_payload` removes 'id' and 'version'/'revision'
-    let json_payload = adapter::to_clean_payload(&settings);
-
-    // CRITICAL for Updates:
-    // 1. Use CONTENT with a clean payload (no version = no lock check).
-    // 2. ID is used in the query target with native format, NOT in the content.
-    // 3. Use UPSERT for singleton records to handle both create and update:
-    //    UPSERT settings:`app` CONTENT $data
-    db.query("UPSERT settings:`app` CONTENT $data")
-        .bind(("data", json_payload)) // Clean data without ID/Version
-        .await
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
-
-    Ok(())
+    settings::store::save_settings_to_sqlite_state(&state, &settings)
 }
 ```
 
 ### Benefits of Direct Database Access
 
-1. **Performance**: SurrealDB with SurrealKV engine is embedded and extremely fast
+1. **Performance**: SQLite JSONB is embedded, single-file, and fast for this app's local data scale
 2. **Consistency**: Single source of truth for all data
 3. **Backup**: Database files can be backed up/restored as a whole
 4. **No Sync Issues**: Avoids complex synchronization between localStorage and database
@@ -711,7 +758,7 @@ All modules should implement an internal function `apply_config_internal` that h
 ```rust
 // commands.rs
 pub async fn apply_config_internal<R: tauri::Runtime>(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: &tauri::AppHandle<R>,
     config: ModuleConfig,
     from_tray: bool,
@@ -737,7 +784,7 @@ The Tauri command called by the frontend passes `from_tray: false`:
 ```rust
 #[tauri::command]
 pub async fn save_module_config(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
     config: ModuleConfig,
 ) -> Result<(), String> {
@@ -755,14 +802,13 @@ pub async fn apply_module_selection<R: Runtime>(
     app: &AppHandle<R>,
     selection_id: &str,
 ) -> Result<(), String> {
-    let state = app.state::<DbState>();
-    let db = state.0.lock().await;
+    let state = app.state::<SqliteDbState>();
 
     // Build config from selection
-    let config = build_config_from_selection(&db, selection_id)?;
+    let config = build_config_from_selection(&state, selection_id)?;
 
     // Apply with from_tray: true
-    super::commands::apply_config_internal(&db, app, config, true).await?;
+    super::commands::apply_config_internal(&state, app, config, true).await?;
 
     Ok(())
 }
@@ -910,42 +956,43 @@ web/
 
 ---
 
+## Lightweight Mode
+
+Lightweight mode (modeled after cc-switch) destroys the main WebView window to release frontend memory while the Rust backend (tray, gateway, schedulers) keeps running. Core implementation lives in `tauri/src/lightweight.rs`; the window builder is `build_main_window` in `tauri/src/lib.rs`.
+
+- **Silent-failure rule (highest recurrence risk)**: whenever adding a new backend entry point that needs the main window (new tray menu item, event callback, deep-link handler, second-instance action, protocol handler, etc.), it MUST handle lightweight mode first: if `lightweight::is_lightweight_mode()`, call `exit_lightweight_mode` to rebuild the window before touching it. A bare `if let Some(window) = app.get_webview_window("main")` silently does nothing while in lightweight mode — same failure class as the Tab/Page-Key allowlist omissions. Current covered entry points: tray "show" item, tray lightweight toggle, single-instance callback, macOS `RunEvent::Reopen`, deep-link `focus_main_window`.
+- **ExitRequested semantics**: the run loop prevents exit only when `code.is_none() && is_lightweight_mode()` (Tauri reports "no alive window" after `destroy()` as an automatic `ExitRequested` with no code). Do NOT widen this to all `code: None` events — `minimize_to_tray_on_close=false` still means "close window exits the app".
+- Settings: `start_lightweight` (destroy the never-shown window at startup; no geometry is saved for invisible windows) and `lightweight_on_close` (CloseRequested destroys instead of hiding; only effective while `minimize_to_tray_on_close` is true, mirrored by the frontend `disabled` state). The tray `CheckMenuItem` checked state follows `is_lightweight_mode()` via full menu rebuilds.
+- Window geometry is kept in memory (`SAVED_GEOMETRY`, logical units converted from physical pixels) for the lightweight-mode lifetime only; app restart intentionally falls back to the default 1200×800 centered window (no window-state plugin).
+- The last active coding tab IS restored on both window rebuild (lightweight-mode exit) and app restart: `AppSettings.current_sub_tab` is persisted on every tab click (`appStore.setCurrentSubTab`) and consumed by MainLayout's redirect effect via `resolveInitialTabPath` in `web/app/routeMatching.ts`. Even though `currentSubTab` looks write-only inside `appStore`, it is load-bearing — do not remove it. Cold-boot detection is route-based ("pathname matches no entry in `PAGE_ROUTES`"), because the main window always boots at `/index.html` (`WebviewUrl::default()` = `App("index.html")`), NOT `/`; gating restore on `location.pathname === '/'` silently never fires (this bug shipped once). A saved key that is hidden or no longer visible falls back to the first visible tab.
+
+---
+
 ## OpenCode Configuration Format
+
+迁移期说明：本节原有规则继续保留，不能弱化。实际修改 OpenCode 配置、tray 或页面交互时，还应同时阅读模块级文档：
+- `tauri/src/coding/open_code/AGENTS.md`
+- `web/features/coding/opencode/AGENTS.md`
 
 ### Model Selection
 
-OpenCode uses `provider_id/model_id` format for model configuration:
+- OpenCode 的 `model` / `small_model` 都使用 `provider_id/model_id` 格式，例如 `openai/gpt-4o`。
+- tray 选择模型时，必须沿用同一格式写回配置；不能在 tray 或页面层把它降成裸 `model_id`。
+- tray 改动属于真实配置写入，不是纯展示切换；它会发出 `config-changed` 的 `"tray"` payload，并触发前端 reload。
+- 具体 tray 展示、过滤和选中态细节见：
+  - `tauri/src/coding/open_code/AGENTS.md`
+  - `web/features/coding/opencode/AGENTS.md`
 
-```typescript
-// Main model: provider_id/model_id
-config.model = Some("openai/gpt-4o");
+### Provider Import Semantics
 
-// Small model: provider_id/model_id
-config.small_model = Some("qwen/qwen3");
-```
-
-### Tray Menu Structure
-
-The tray menu displays models with checkmarks:
-
-```
-──── OpenCode 模型 ────
-主模型 (gpt-4o)
-├── OpenAI / gpt-4o ✓
-├── OpenAI / gpt-4o-mini
-├── Qwen / qwen3 ✓
-└── ...
-小模型 (qwen3)
-├── OpenAI / gpt-4o-mini
-├── Qwen / qwen3 ✓
-└── ...
-```
-
-When a user selects a model from the tray menu:
-1. Parse `provider_id/model_id` from item ID
-2. Update config with new selection
-3. Emit `config-changed` event with `"tray"` payload
-4. Frontend reloads page to reflect changes
+- 详细 Why / Gotcha / 历史语义已迁到：
+  - `tauri/src/coding/open_code/AGENTS.md`
+  - `web/features/coding/opencode/AGENTS.md`
+  - `web/features/coding/shared/AGENTS.md`
+- 根文档只保留关键事实：
+  - `favorite provider` / `导入我使用过的供应商` 不是 OpenCode 当前配置的镜像。
+  - 它的产品语义是“使用过的供应商历史库 + 诊断缓存”。
+  - 需要读取“当前 OpenCode provider”时，应直接读当前配置文件，而不是复用 favorite provider 库。
 
 ---
 
@@ -957,7 +1004,7 @@ All HTTP requests in the Rust backend MUST use the unified `http_client` module 
 
 ```rust
 use crate::http_client;
-use crate::db::DbState;
+use crate::db::SqliteDbState;
 
 // Standard request (30s timeout, auto proxy)
 let client = http_client::client(&state).await?;
@@ -994,3 +1041,25 @@ let proxy_url = http_client::get_proxy_from_settings(&state).await?;
 - `tauri/src/coding/open_code/models_api.rs` - Provider model fetching
 - `tauri/src/skills/installer.rs` - Git operations proxy
 - `tauri/src/skills/commands.rs` - Git operations proxy
+
+## Tab / Page-Key Allowlist Rules
+
+Several places hardcode a list of tab or page/module keys. Adding a new tab without updating every such list causes the new tab's feature to **silently fail** (no error, no log): the stored value is dropped on read, or the new module is force-pushed into a skip set. This has recurred twice and is a cross-module rule.
+
+- Recurrence 1 (sidebar show/hide): `tauri/src/settings/adapter.rs` `get_sidebar_hidden_by_page` used a 7-key allowlist; new tabs (claudedesktop/hermes/dsh/oh_my_pi) were dropped on every `get_settings`, so the "hide sidebar" toggle reset after restart. Fix: read every boolean key in the stored map instead of an allowlist.
+- Recurrence 2 (WSL/SSH file sync): `web/features/settings/hooks/useWSLSync.ts` / `useSSHSync.ts` `TAB_TO_MODULE` only had 7 entries; new tabs mapped to `undefined`, were dropped by `.filter(Boolean)`, and were force-pushed into `skipModules` — their config files were silently never synced to the remote. Fix: map every coding tab in `TAB_TO_MODULE` and keep `ALL_CODING_MODULES`/`ALL_MODULE_KEYS` complete.
+
+### Authority Sources
+
+Two distinct key sets — do not conflate:
+
+- Sidebar-only (12 keys, coding tools only): `SIDEBAR_PAGE_KEYS` in `web/services/settingsApi.ts`, mirrored by `default_sidebar_hidden_by_page` in `tauri/src/settings/types.rs`. Order: opencode, claudecode, claudedesktop, codex, grok, geminicli, kimi, openclaw, pi, oh_my_pi, hermes, dsh.
+- visible_tabs full set (includes non-coding tools like gateway/image/ssh/wsl): `CURRENT_DEFAULT_VISIBLE_TABS` in `tauri/src/settings/adapter.rs`, mirrored by `AppSettings::default().visible_tabs` in `tauri/src/settings/types.rs` and by `defaultSettings.visible_tabs` in `web/services/settingsApi.ts`.
+
+### When Adding or Changing a Tab
+
+- Update the relevant authority source **and every downstream list**. Lists to re-check (grep the tab key string repo-wide, this list is not exhaustive): `web/constants/modules.tsx` `MODULES` subTabs（侧边栏显示的唯一入口——`visible_tabs` 里有但 `MODULES` 没有时 tab 会静默不显示，本次 kimi 集成即踩到此坑）, `web/features/settings/pages/GeneralSettingsPage.tsx` `CODING_TABS`（设置页模块显隐/排序管理列表，漏了会在设置里静默消失，kimi 再次踩到）, `tauri/src/settings/types.rs` `AppSettings::default()` (visible_tabs + default_sidebar_hidden_by_page), `tauri/src/coding/runtime_location.rs` `MODULE_KEYS`, `tauri/src/coding/reapply_applied_runtime.rs` `ALL_WSL_FILE_MODULES`, `tauri/src/settings/backup/utils.rs` `ALWAYS_BACKUP_CLI_TOOLS`/`OPTIONAL_BACKUP_CLI_TOOLS`, `tauri/src/tray.rs` section builders, frontend `useWSLSync.ts`/`useSSHSync.ts`/`*SyncModal.tsx` `TAB_TO_MODULE`/`MODULE_TO_TAB`/`ALL_*`, `FileMappingModal`/`SSHFileMappingModal` module dropdowns, and the Gateway frontend CLI lists（`GatewayStatisticsView.tsx` `cliOptions`、`GatewayRequestsView.tsx` 请求筛选、`ModelPricingModal.tsx` `pricingCliKeys`、`GatewaySettingsPanel.tsx` `CLI_OPTIONS`、`shared/gateway/providerProfiles.ts` `normalizeGatewayProviderTool`——kimi 集成时统计页筛选/定价弹窗/normalize 三处漏注册，统计页看不到 kimi），以及 Gateway 后端 usage 读路径映射（`usage_stats.rs` 的 `cli_key_from_app_type` 和 `load_provider_names`——漏注册会让该 CLI 已落库的请求行在列表/统计查询里被静默丢弃，kimi 再次踩到）。
+- A new default-visible tab must update `CURRENT_DEFAULT_VISIBLE_TABS` (full-replace migration baseline) plus `AppSettings::default().visible_tabs` in `tauri/src/settings/types.rs` and the frontend mirror `defaultSettings.visible_tabs` in `web/services/settingsApi.ts` (reused by `web/stores/settingsStore.ts`), plus the `visible_tabs_*` migration test expectations. Custom-order users are intentionally **not** force-inserted newly added tabs (see the comment in `adapter.rs`); they surface new tabs only through the full-replace baseline.
+- Regression tests for this class of bug must assert that a newly added key round-trips its stored value through the full read path, not just that the default is present.
+- Do not silently truncate coverage. If a list intentionally excludes some keys (e.g. a historical `PRE_*` migration baseline snapshot, or a tool that has no MCP config), leave a comment saying so.
+- Whether an unregistered `runtime_location` module is a bug depends on intent: hermes/dsh document "not yet registered, path resolution is self-contained in commands.rs, known future work" in their AGENTS.md — that is by-design, not an allowlist miss. A tab whose config dir is user-customizable to a WSL UNC path needs runtime_location; a fixed-path GUI-config tool (e.g. claudedesktop) may not.

@@ -21,6 +21,9 @@ pub struct CustomTool {
     /// Force copy mode for skills sync (instead of symlink)
     #[serde(default)]
     pub force_copy: bool,
+    /// Optional brand icon for UI display (http(s) image URL)
+    #[serde(default)]
+    pub icon_url: Option<String>,
 }
 
 /// Convert from shared CustomTool to skills CustomTool
@@ -33,6 +36,7 @@ impl From<tools::CustomTool> for CustomTool {
             relative_detect_dir: tool.relative_detect_dir.unwrap_or_default(),
             created_at: tool.created_at,
             force_copy: tool.force_copy,
+            icon_url: tool.icon_url,
         }
     }
 }
@@ -46,6 +50,7 @@ impl From<&CustomTool> for tools::CustomTool {
             relative_skills_dir: Some(tool.relative_skills_dir.clone()),
             relative_detect_dir: Some(tool.relative_detect_dir.clone()),
             force_copy: tool.force_copy,
+            icon_url: tool.icon_url.clone(),
             mcp_config_path: None,
             mcp_config_format: None,
             mcp_field: None,
@@ -54,70 +59,10 @@ impl From<&CustomTool> for tools::CustomTool {
     }
 }
 
-/// Tool ID enum for all supported AI coding tools
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolId {
-    Cursor,
-    ClaudeCode,
-    Codex,
-    OpenCode,
-    Antigravity,
-    Amp,
-    KiloCode,
-    RooCode,
-    Goose,
-    GeminiCli,
-    GithubCopilot,
-    OpenClaw,
-    Droid,
-    Windsurf,
-}
-
-impl ToolId {
-    pub fn as_key(&self) -> &'static str {
-        match self {
-            ToolId::Cursor => "cursor",
-            ToolId::ClaudeCode => "claude_code",
-            ToolId::Codex => "codex",
-            ToolId::OpenCode => "opencode",
-            ToolId::Antigravity => "antigravity",
-            ToolId::Amp => "amp",
-            ToolId::KiloCode => "kilo_code",
-            ToolId::RooCode => "roo_code",
-            ToolId::Goose => "goose",
-            ToolId::GeminiCli => "gemini_cli",
-            ToolId::GithubCopilot => "github_copilot",
-            ToolId::OpenClaw => "openclaw",
-            ToolId::Droid => "droid",
-            ToolId::Windsurf => "windsurf",
-        }
-    }
-
-    pub fn from_key(key: &str) -> Option<ToolId> {
-        match key {
-            "cursor" => Some(ToolId::Cursor),
-            "claude_code" => Some(ToolId::ClaudeCode),
-            "codex" => Some(ToolId::Codex),
-            "opencode" => Some(ToolId::OpenCode),
-            "antigravity" => Some(ToolId::Antigravity),
-            "amp" => Some(ToolId::Amp),
-            "kilo_code" => Some(ToolId::KiloCode),
-            "roo_code" => Some(ToolId::RooCode),
-            "goose" => Some(ToolId::Goose),
-            "gemini_cli" => Some(ToolId::GeminiCli),
-            "github_copilot" => Some(ToolId::GithubCopilot),
-            "openclaw" => Some(ToolId::OpenClaw),
-            "droid" => Some(ToolId::Droid),
-            "windsurf" => Some(ToolId::Windsurf),
-            _ => None,
-        }
-    }
-}
-
 /// Tool adapter with path information (legacy type for compatibility)
 #[derive(Clone, Debug)]
 pub struct ToolAdapter {
-    pub id: ToolId,
+    pub key: &'static str,
     pub display_name: &'static str,
     pub relative_skills_dir: &'static str,
     pub relative_detect_dir: &'static str,
@@ -128,13 +73,12 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
     BUILTIN_TOOLS
         .iter()
         .filter(|t| t.relative_skills_dir.is_some())
-        .filter_map(|t| {
-            let id = ToolId::from_key(t.key)?;
+        .filter_map(|tool| {
             Some(ToolAdapter {
-                id,
-                display_name: t.display_name,
-                relative_skills_dir: t.relative_skills_dir?,
-                relative_detect_dir: t.relative_detect_dir?,
+                key: tool.key,
+                display_name: tool.display_name,
+                relative_skills_dir: tool.relative_skills_dir?,
+                relative_detect_dir: tool.relative_detect_dir?,
             })
         })
         .collect()
@@ -144,7 +88,7 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
 pub fn adapter_by_key(key: &str) -> Option<ToolAdapter> {
     default_tool_adapters()
         .into_iter()
-        .find(|adapter| adapter.id.as_key() == key)
+        .find(|adapter| adapter.key == key)
 }
 
 /// Resolve default skills path for a tool
@@ -171,17 +115,20 @@ pub struct RuntimeToolAdapter {
     pub is_custom: bool,
     /// Force copy mode for skills sync (instead of symlink)
     pub force_copy: bool,
+    /// Optional brand icon for custom tools (http(s) image URL)
+    pub icon_url: Option<String>,
 }
 
 impl From<&ToolAdapter> for RuntimeToolAdapter {
     fn from(adapter: &ToolAdapter) -> Self {
         RuntimeToolAdapter {
-            key: adapter.id.as_key().to_string(),
+            key: adapter.key.to_string(),
             display_name: adapter.display_name.to_string(),
             relative_skills_dir: adapter.relative_skills_dir.to_string(),
             relative_detect_dir: adapter.relative_detect_dir.to_string(),
             is_custom: false,
             force_copy: false, // Built-in tools use default (cursor handled specially in sync logic)
+            icon_url: None,
         }
     }
 }
@@ -195,6 +142,7 @@ impl From<&CustomTool> for RuntimeToolAdapter {
             relative_detect_dir: tool.relative_detect_dir.clone(),
             is_custom: true,
             force_copy: tool.force_copy,
+            icon_url: tool.icon_url.clone(),
         }
     }
 }
@@ -214,7 +162,10 @@ pub fn get_all_tool_adapters(custom_tools: &[CustomTool]) -> Vec<RuntimeToolAdap
 }
 
 /// Find adapter by key (supports both built-in and custom)
-pub fn runtime_adapter_by_key(key: &str, custom_tools: &[CustomTool]) -> Option<RuntimeToolAdapter> {
+pub fn runtime_adapter_by_key(
+    key: &str,
+    custom_tools: &[CustomTool],
+) -> Option<RuntimeToolAdapter> {
     // Check built-in first
     if let Some(adapter) = adapter_by_key(key) {
         return Some(RuntimeToolAdapter::from(&adapter));
@@ -242,6 +193,51 @@ pub fn is_tool_installed(adapter: &RuntimeToolAdapter) -> Result<bool> {
     Ok(false)
 }
 
+pub fn is_tool_installed_with_state(
+    db: &crate::db::SqliteDbState,
+    adapter: &RuntimeToolAdapter,
+) -> Result<bool> {
+    if adapter.is_custom {
+        return Ok(true);
+    }
+
+    if let Some(builtin) = tools::builtin_tool_by_key(&adapter.key) {
+        let runtime_tool = tools::RuntimeTool::from(builtin);
+        return Ok(tools::is_tool_installed_with_db(db, &runtime_tool));
+    }
+
+    Ok(false)
+}
+
+pub async fn is_tool_installed_async(adapter: &RuntimeToolAdapter) -> Result<bool> {
+    if adapter.is_custom {
+        return Ok(true);
+    }
+
+    if let Some(builtin) = tools::builtin_tool_by_key(&adapter.key) {
+        let runtime_tool = tools::RuntimeTool::from(builtin);
+        return Ok(tools::is_tool_installed(&runtime_tool));
+    }
+
+    Ok(false)
+}
+
+pub async fn is_tool_installed_with_state_async(
+    db: &crate::db::SqliteDbState,
+    adapter: &RuntimeToolAdapter,
+) -> Result<bool> {
+    if adapter.is_custom {
+        return Ok(true);
+    }
+
+    if let Some(builtin) = tools::builtin_tool_by_key(&adapter.key) {
+        let runtime_tool = tools::RuntimeTool::from(builtin);
+        return Ok(tools::is_tool_installed_with_db_async(db, &runtime_tool).await);
+    }
+
+    Ok(false)
+}
+
 /// Resolve skills path for a runtime tool
 pub fn resolve_runtime_skills_path(adapter: &RuntimeToolAdapter) -> Result<PathBuf> {
     // Use path_utils to resolve (handles ~/  and %APPDATA%/ paths for both built-in and custom tools)
@@ -252,8 +248,46 @@ pub fn resolve_runtime_skills_path(adapter: &RuntimeToolAdapter) -> Result<PathB
     Ok(PathBuf::from(&adapter.relative_skills_dir))
 }
 
+pub fn resolve_runtime_skills_path_with_state(
+    db: &crate::db::SqliteDbState,
+    adapter: &RuntimeToolAdapter,
+) -> Result<PathBuf> {
+    if let Some(builtin) = tools::builtin_tool_by_key(&adapter.key) {
+        let runtime_tool = tools::RuntimeTool::from(builtin);
+        if let Some(path) = tools::resolve_skills_path_with_db(db, &runtime_tool) {
+            return Ok(path);
+        }
+    }
+    resolve_runtime_skills_path(adapter)
+}
+
+pub async fn resolve_runtime_skills_path_async(adapter: &RuntimeToolAdapter) -> Result<PathBuf> {
+    if let Some(resolved) = tools::path_utils::resolve_storage_path(&adapter.relative_skills_dir) {
+        return Ok(resolved);
+    }
+
+    Ok(PathBuf::from(&adapter.relative_skills_dir))
+}
+
+pub async fn resolve_runtime_skills_path_with_state_async(
+    db: &crate::db::SqliteDbState,
+    adapter: &RuntimeToolAdapter,
+) -> Result<PathBuf> {
+    if let Some(builtin) = tools::builtin_tool_by_key(&adapter.key) {
+        let runtime_tool = tools::RuntimeTool::from(builtin);
+        if let Some(path) = tools::resolve_skills_path_with_db_async(db, &runtime_tool).await {
+            return Ok(path);
+        }
+    }
+
+    resolve_runtime_skills_path_async(adapter).await
+}
+
 /// Scan a tool directory for skills
-pub fn scan_tool_dir(adapter: &ToolAdapter, dir: &Path) -> Result<Vec<super::types::DetectedSkill>> {
+pub fn scan_tool_dir(
+    adapter: &ToolAdapter,
+    dir: &Path,
+) -> Result<Vec<super::types::DetectedSkill>> {
     let mut results = Vec::new();
     if !dir.exists() {
         return Ok(results);
@@ -273,7 +307,7 @@ pub fn scan_tool_dir(adapter: &ToolAdapter, dir: &Path) -> Result<Vec<super::typ
 
         let name = entry.file_name().to_string_lossy().to_string();
         // Skip system directories
-        if adapter.id == ToolId::Codex && name == ".system" {
+        if adapter.key == "codex" && name == ".system" {
             continue;
         }
 
@@ -288,12 +322,13 @@ pub fn scan_tool_dir(adapter: &ToolAdapter, dir: &Path) -> Result<Vec<super::typ
         }
 
         results.push(super::types::DetectedSkill {
-            tool: adapter.id.as_key().to_string(),
+            tool: adapter.key.to_string(),
             tool_display: adapter.display_name.to_string(),
             name,
             path,
             is_link,
             link_target,
+            source_enabled_tools: Vec::new(),
         });
     }
 

@@ -2,52 +2,59 @@
 //!
 //! Syncs MCP server configurations to remote Linux server for all MCP-enabled tools:
 //! - Claude Code: directly edit ~/.claude.json mcpServers field
-//! - OpenCode/Codex: sync config files via file mappings
+//! - OpenCode/Codex/Gemini CLI/Pi: sync config files via file mappings
 
 use log::info;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
-use super::commands::resolve_dynamic_paths;
+use super::commands::resolve_dynamic_paths_with_db;
 use super::session::SshSession;
 use super::sync::{read_remote_file, sync_mappings, write_remote_file};
 use super::types::{SSHFileMapping, SyncProgress};
 use crate::coding::mcp::command_normalize;
 use crate::coding::mcp::mcp_store;
-use crate::DbState;
+use crate::coding::runtime_location;
+use crate::db::helpers::db_list;
+use crate::db::schema::DbTable;
+use crate::SqliteDbState;
 
 /// Get file mappings from database
-async fn get_file_mappings(state: &DbState) -> Result<Vec<SSHFileMapping>, String> {
-    let db = state.0.lock().await;
-
-    let mappings_result: Result<Vec<serde_json::Value>, _> = db
-        .query("SELECT *, type::string(id) as id FROM ssh_file_mapping ORDER BY module, name")
-        .await
-        .map_err(|e| format!("Failed to query SSH file mappings: {}", e))?
-        .take(0);
-
-    match mappings_result {
-        Ok(records) => Ok(records
-            .into_iter()
-            .map(super::adapter::mapping_from_db_value)
-            .collect()),
-        Err(_) => Ok(vec![]),
-    }
+async fn get_file_mappings(state: &SqliteDbState) -> Result<Vec<SSHFileMapping>, String> {
+    let db = state.db();
+    let mut records = db.with_conn(|conn| db_list(conn, DbTable::SshFileMapping, None))?;
+    records.sort_by(|a, b| {
+        let module_a = a.get("module").and_then(Value::as_str).unwrap_or_default();
+        let module_b = b.get("module").and_then(Value::as_str).unwrap_or_default();
+        let name_a = a.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name_b = b.get("name").and_then(Value::as_str).unwrap_or_default();
+        module_a.cmp(module_b).then_with(|| name_a.cmp(name_b))
+    });
+    Ok(records
+        .into_iter()
+        .map(super::adapter::mapping_from_db_value)
+        .collect())
 }
 
 /// Sync MCP configuration to SSH remote (called on mcp-changed event)
 pub async fn sync_mcp_to_ssh(
-    state: &DbState,
+    state: &SqliteDbState,
     session: &SshSession,
     app: AppHandle,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
+    let db = state.db();
     let config = super::commands::get_ssh_config_internal(&db, false).await?;
-    drop(db);
+    let _ = db;
 
     if !config.enabled {
+        info!("MCP SSH sync skipped because SSH sync is disabled");
         return Ok(());
     }
+
+    info!(
+        "MCP SSH sync start: sync_mcp={}, sync_skills={}, active_connection_id={}",
+        config.sync_mcp, config.sync_skills, config.active_connection_id
+    );
 
     // 收集所有错误
     let mut all_errors: Vec<String> = vec![];
@@ -61,6 +68,7 @@ pub async fn sync_mcp_to_ssh(
             current: 1,
             total: 2,
             message: "MCP 同步: Claude Code...".to_string(),
+            current_file: None,
         },
     );
 
@@ -70,8 +78,13 @@ pub async fn sync_mcp_to_ssh(
         .iter()
         .filter(|s| s.enabled_tools.contains(&"claude_code".to_string()))
         .collect();
+    info!(
+        "MCP SSH sync server summary: total_servers={}, claude_servers={}",
+        servers.len(),
+        claude_servers.len()
+    );
 
-    if let Err(e) = sync_mcp_to_ssh_claude(session, &claude_servers).await {
+    if let Err(e) = sync_mcp_to_ssh_claude(state, session, &claude_servers).await {
         log::warn!("Skipped claude.json MCP sync: {}", e);
         all_errors.push(format!("Claude Code: {}", e));
         let _ = app.emit(
@@ -83,37 +96,57 @@ pub async fn sync_mcp_to_ssh(
         );
     }
 
-    // Emit progress for OpenCode/Codex
+    // Emit progress for OpenCode/Codex/Gemini CLI
     let _ = app.emit(
         "ssh-sync-progress",
         SyncProgress {
             phase: "mcp".to_string(),
-            current_item: "OpenCode/Codex MCP".to_string(),
+            current_item: "OpenCode/Codex/Gemini CLI MCP".to_string(),
             current: 2,
             total: 2,
-            message: "MCP 同步: OpenCode/Codex...".to_string(),
+            message: "MCP 同步: OpenCode/Codex/Gemini CLI...".to_string(),
+            current_file: None,
         },
     );
 
-    // 2. OpenCode/Codex: sync config files via file mappings
+    // 2. OpenCode/Codex/Gemini CLI: sync config files via file mappings
     match get_file_mappings(state).await {
         Ok(file_mappings) => {
-            let mcp_modules = ["opencode", "codex"];
             let mcp_mappings: Vec<_> = file_mappings
                 .into_iter()
-                .filter(|m| m.enabled && mcp_modules.contains(&m.module.as_str()))
+                .filter(|m| m.enabled && is_mapped_mcp_config_file(&m.id))
                 .collect();
+            info!(
+                "MCP SSH sync file mapping summary: eligible_mappings={}",
+                mcp_mappings.len()
+            );
 
             if !mcp_mappings.is_empty() {
-                let resolved = resolve_dynamic_paths(mcp_mappings);
+                let resolved = resolve_dynamic_paths_with_db(&state.db(), mcp_mappings).await;
+                for mapping in &resolved {
+                    log::trace!(
+                        "MCP SSH sync mapping resolved: id={}, name={}, module={}, local_path={}, remote_path={}",
+                        mapping.id,
+                        mapping.name,
+                        mapping.module,
+                        mapping.local_path,
+                        mapping.remote_path
+                    );
+                }
                 let result = sync_mappings(&resolved, session, None).await;
+                info!(
+                    "MCP SSH sync file mapping result: synced_files={}, skipped_files={}, errors={}",
+                    result.synced_files.len(),
+                    result.skipped_files.len(),
+                    result.errors.len()
+                );
                 if !result.errors.is_empty() {
                     let msg = result.errors.join("; ");
                     log::warn!("MCP file mapping sync errors: {}", msg);
-                    all_errors.push(format!("OpenCode/Codex: {}", msg));
+                    all_errors.push(format!("OpenCode/Codex/Gemini CLI: {}", msg));
                     let _ = app.emit(
                         "ssh-sync-warning",
-                        format!("OpenCode/Codex 配置同步部分失败：{}", msg),
+                        format!("OpenCode/Codex/Gemini CLI 配置同步部分失败：{}", msg),
                     );
                 }
 
@@ -125,14 +158,16 @@ pub async fn sync_mcp_to_ssh(
                     .collect();
                 for mapping in &resolved {
                     if mapping.enabled
-                        && is_mcp_config_file(&mapping.id)
+                        && is_mapped_mcp_config_file(&mapping.id)
                         && synced_paths.contains(&mapping.remote_path)
                     {
                         if let Err(e) = strip_cmd_c_from_remote_mcp_file(
                             session,
                             &mapping.remote_path,
                             &mapping.module,
-                        ).await {
+                        )
+                        .await
+                        {
                             log::warn!(
                                 "Failed to strip cmd /c from {}: {}",
                                 mapping.remote_path,
@@ -141,21 +176,26 @@ pub async fn sync_mcp_to_ssh(
                         }
                     }
                 }
+            } else {
+                info!(
+                    "MCP SSH sync found no enabled OpenCode/Codex/Gemini CLI file mappings to sync"
+                );
             }
         }
         Err(e) => {
-            log::warn!("Skipped OpenCode/Codex MCP sync: {}", e);
-            all_errors.push(format!("OpenCode/Codex: {}", e));
+            log::warn!("Skipped OpenCode/Codex/Gemini CLI MCP sync: {}", e);
+            all_errors.push(format!("OpenCode/Codex/Gemini CLI: {}", e));
             let _ = app.emit(
                 "ssh-sync-warning",
-                format!("OpenCode/Codex MCP 同步已跳过：{}", e),
+                format!("OpenCode/Codex/Gemini CLI MCP 同步已跳过：{}", e),
             );
         }
     }
 
     info!(
-        "MCP SSH sync completed: {} servers synced to claude_code",
-        claude_servers.len()
+        "MCP SSH sync completed: claude_servers={}, errors={}",
+        claude_servers.len(),
+        all_errors.len()
     );
 
     if !all_errors.is_empty() {
@@ -169,13 +209,25 @@ pub async fn sync_mcp_to_ssh(
 
 /// Sync MCP servers to remote Claude Code ~/.claude.json
 async fn sync_mcp_to_ssh_claude(
+    state: &SqliteDbState,
     session: &SshSession,
     servers: &[&crate::coding::mcp::types::McpServer],
 ) -> Result<(), String> {
-    let config_path = "~/.claude.json";
+    let db = state.db();
+    let config_path = runtime_location::get_claude_wsl_claude_json_path_async(&db).await;
+    log::trace!(
+        "MCP SSH sync writing Claude remote config: path={}, server_count={}",
+        config_path,
+        servers.len()
+    );
 
     // Read existing remote config
-    let existing_content = read_remote_file(session, config_path).await?;
+    let existing_content = read_remote_file(session, config_path.as_str()).await?;
+    log::trace!(
+        "MCP SSH sync read Claude remote config: path={}, existing_bytes={}",
+        config_path,
+        existing_content.len()
+    );
 
     // Parse JSON, update mcpServers field
     let mut config: Value = if existing_content.trim().is_empty() {
@@ -201,7 +253,13 @@ async fn sync_mcp_to_ssh_claude(
     // Write back
     let content = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    write_remote_file(session, config_path, &content).await?;
+    write_remote_file(session, config_path.as_str(), &content).await?;
+    log::trace!(
+        "MCP SSH sync wrote Claude remote config successfully: path={}, written_bytes={}, server_count={}",
+        config_path,
+        content.len(),
+        servers.len()
+    );
 
     Ok(())
 }
@@ -230,11 +288,7 @@ fn build_standard_server_config(server: &crate::coding::mcp::types::McpServer) -
             });
 
             if let Some(env_val) = env {
-                if env_val.is_object()
-                    && !env_val
-                        .as_object()
-                        .map(|o| o.is_empty())
-                        .unwrap_or(true)
+                if env_val.is_object() && !env_val.as_object().map(|o| o.is_empty()).unwrap_or(true)
                 {
                     result["env"] = env_val;
                 }
@@ -273,11 +327,21 @@ fn build_standard_server_config(server: &crate::coding::mcp::types::McpServer) -
     }
 }
 
-/// Check if a file mapping ID corresponds to an MCP config file
-fn is_mcp_config_file(mapping_id: &str) -> bool {
+/// Check whether a file mapping is part of the MCP-specific sync path.
+/// Claude Code is handled by direct ~/.claude.json writes, not file mappings.
+fn is_mapped_mcp_config_file(mapping_id: &str) -> bool {
     matches!(
         mapping_id,
-        "opencode-main" | "opencode-oh-my" | "codex-config"
+        "opencode-main"
+            | "opencode-oh-my"
+            | "codex-config"
+            | "grok-config"
+            | "geminicli-settings"
+            | "pi-mcp"
+            | "omp-mcp"
+            | "hermes-config"
+            | "dsh-mcp"
+            | "claude-desktop-config"
     )
 }
 
@@ -292,15 +356,27 @@ async fn strip_cmd_c_from_remote_mcp_file(
         return Ok(());
     }
 
+    // SSH target is an independent Linux box (no /mnt, no Windows exes), so
+    // commands are left unchanged — only the cmd /c wrapper is stripped.
+    let identity = |s: &str| s.to_string();
+
     let processed = match module {
-        "opencode" => command_normalize::process_opencode_json(&content, false)?,
+        "opencode" => command_normalize::process_opencode_json(&content, false, &identity)?,
         "codex" => {
             if remote_path.ends_with(".toml") {
-                command_normalize::process_codex_toml(&content, false)?
+                command_normalize::process_codex_toml(&content, false, &identity)?
             } else {
                 return Ok(());
             }
         }
+        "geminicli" | "pi" | "oh_my_pi" | "claude_desktop" => {
+            command_normalize::process_claude_json(&content, false, &identity)?
+        }
+        // Hermes mcp_servers lives in YAML; dsh uses the cordis patch DSL
+        // (also YAML). Both carry `cmd /c` on Windows and need it stripped
+        // for the Linux SSH target.
+        "hermes" => command_normalize::process_hermes_yaml_mcp_servers(&content, &identity)?,
+        "dsh" => command_normalize::process_cordis_patch_yaml(&content, &identity)?,
         _ => return Ok(()),
     };
 
@@ -310,4 +386,33 @@ async fn strip_cmd_c_from_remote_mcp_file(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_mapped_mcp_config_file;
+
+    #[test]
+    fn recognizes_gemini_cli_settings_as_mcp_config_file() {
+        assert!(is_mapped_mcp_config_file("geminicli-settings"));
+    }
+
+    #[test]
+    fn recognizes_pi_mcp_as_mcp_config_file() {
+        assert!(is_mapped_mcp_config_file("pi-mcp"));
+    }
+
+    #[test]
+    fn excludes_gemini_cli_non_mcp_file_mappings() {
+        assert!(!is_mapped_mcp_config_file("geminicli-env"));
+        assert!(!is_mapped_mcp_config_file("geminicli-prompt"));
+        assert!(!is_mapped_mcp_config_file("geminicli-oauth"));
+    }
+
+    #[test]
+    fn excludes_pi_non_mcp_file_mappings() {
+        assert!(!is_mapped_mcp_config_file("pi-settings"));
+        assert!(!is_mapped_mcp_config_file("pi-auth"));
+        assert!(!is_mapped_mcp_config_file("pi-prompt"));
+    }
 }

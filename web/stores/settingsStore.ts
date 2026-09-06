@@ -1,12 +1,22 @@
 import { create } from 'zustand';
 import {
+  defaultSettings,
   getSettings,
   saveSettings,
+  saveManualCliPath,
   setAutoLaunch,
   type AppSettings,
+  type ProxyMode,
   type WebDAVConfig,
   type S3Config,
+  type BackupCustomEntry,
+  type BackupFileFilterRule,
+  type SidebarPageKey,
+  type SidebarHiddenByPage,
+  normalizeSidebarHiddenByPage,
 } from '@/services';
+import { setCodexPreserveOfficialAuthOnSwitch as setCodexPreserveOfficialAuthOnSwitchApi } from '@/services/codexApi';
+import { buildLaunchOnStartupSettings } from './settingsStoreUtils';
 
 // Re-export types for convenience (using camelCase for frontend)
 export interface WebDAVConfigFE {
@@ -38,6 +48,10 @@ interface SettingsState {
   localBackupPath: string;
   webdav: WebDAVConfigFE;
   lastBackupTime: string | null;
+  backupImageAssetsEnabled: boolean;
+  backupCliConfigFilesEnabled: boolean;
+  backupCustomEntries: BackupCustomEntry[];
+  backupFileFilterRules: BackupFileFilterRule[];
 
   // S3 storage settings
   s3: S3ConfigFE;
@@ -46,8 +60,11 @@ interface SettingsState {
   launchOnStartup: boolean;
   minimizeToTrayOnClose: boolean;
   startMinimized: boolean;
+  startLightweight: boolean;
+  lightweightOnClose: boolean;
 
   // Proxy settings
+  proxyMode: ProxyMode;
   proxyUrl: string;
 
   // Auto backup settings
@@ -62,18 +79,46 @@ interface SettingsState {
   // Tab visibility settings
   visibleTabs: string[];
 
+  // Sidebar visibility settings
+  sidebarHiddenByPage: SidebarHiddenByPage;
+
+  // OpenCode options
+  opencodeAllowClearAppliedOhMyConfig: boolean;
+  opencodeUseLegacyOhMyConfig: boolean;
+  opencodeOmoUpgradeConfirmed: boolean;
+  opencodeDualWriteReasoningVariant: boolean;
+
+  // Codex options
+  codexPreserveOfficialAuthOnSwitch: boolean;
+  codexUnifiedSessionHistoryEnabled: boolean;
+
+  // Claude Code options
+  claudeCliLaunchFullAccess: boolean;
+  /** Windows terminal preference for the Claude CLI launch: 'cmd' | 'powershell' | 'wt'. */
+  preferredTerminal: string | null;
+
+  // Manual CLI paths by command name (e.g. opencode, claude, grok, pi, omp, hermes, dsh, openclaw)
+  cliManualPaths: Record<string, string>;
+
   // Actions
   initSettings: () => Promise<void>;
   setBackupSettings: (config: {
     backupType: 'local' | 'webdav';
     localBackupPath?: string;
     webdav?: Partial<WebDAVConfigFE>;
+    backupImageAssetsEnabled?: boolean;
+    backupCliConfigFilesEnabled?: boolean;
+    backupCustomEntries?: BackupCustomEntry[];
+    backupFileFilterRules?: BackupFileFilterRule[];
   }) => Promise<void>;
   setS3: (config: Partial<S3ConfigFE>) => Promise<void>;
   setLastBackupTime: (time: string | null) => Promise<void>;
   setLaunchOnStartup: (enabled: boolean) => Promise<void>;
   setMinimizeToTrayOnClose: (enabled: boolean) => Promise<void>;
   setStartMinimized: (enabled: boolean) => Promise<void>;
+  setStartLightweight: (enabled: boolean) => Promise<void>;
+  setLightweightOnClose: (enabled: boolean) => Promise<void>;
+  setProxyMode: (mode: ProxyMode) => Promise<void>;
   setProxyUrl: (url: string) => Promise<void>;
   setAutoBackupSettings: (config: {
     enabled: boolean;
@@ -83,6 +128,16 @@ interface SettingsState {
   setLastAutoBackupTime: (time: string) => void;
   setAutoCheckUpdate: (enabled: boolean) => Promise<void>;
   setVisibleTabs: (tabs: string[]) => Promise<void>;
+  setSidebarHidden: (page: SidebarPageKey, hidden: boolean) => Promise<void>;
+  setOpencodeAllowClearAppliedOhMyConfig: (enabled: boolean) => Promise<void>;
+  setOpencodeUseLegacyOhMyConfig: (enabled: boolean) => Promise<void>;
+  setOpencodeOmoUpgradeConfirmed: (confirmed: boolean) => Promise<void>;
+  setOpencodeDualWriteReasoningVariant: (enabled: boolean) => Promise<void>;
+  setCodexPreserveOfficialAuthOnSwitch: (enabled: boolean) => Promise<void>;
+  setCodexUnifiedSessionHistoryEnabled: (enabled: boolean) => void;
+  setClaudeCliLaunchFullAccess: (enabled: boolean) => Promise<void>;
+  setPreferredTerminal: (terminal: string) => Promise<void>;
+  setManualCliPath: (commandName: string, path: string) => Promise<string>;
 }
 
 // Convert backend snake_case to frontend camelCase
@@ -152,16 +207,33 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   webdav: defaultWebDAV,
   s3: defaultS3,
   lastBackupTime: null,
+  backupImageAssetsEnabled: true,
+  backupCliConfigFilesEnabled: true,
+  backupCustomEntries: [],
+  backupFileFilterRules: [],
   launchOnStartup: true,
   minimizeToTrayOnClose: true,
   startMinimized: false,
+  startLightweight: false,
+  lightweightOnClose: false,
+  proxyMode: 'system',
   proxyUrl: '',
   autoBackupEnabled: false,
   autoBackupIntervalDays: 7,
   autoBackupMaxKeep: 10,
   lastAutoBackupTime: null,
   autoCheckUpdate: true,
-  visibleTabs: ['opencode', 'claudecode', 'codex', 'openclaw', 'ssh', 'wsl'],
+  visibleTabs: defaultSettings.visible_tabs,
+  sidebarHiddenByPage: normalizeSidebarHiddenByPage(),
+  opencodeAllowClearAppliedOhMyConfig: false,
+  opencodeUseLegacyOhMyConfig: false,
+  opencodeOmoUpgradeConfirmed: false,
+  opencodeDualWriteReasoningVariant: false,
+  codexPreserveOfficialAuthOnSwitch: false,
+  codexUnifiedSessionHistoryEnabled: false,
+  claudeCliLaunchFullAccess: false,
+  preferredTerminal: null,
+  cliManualPaths: {},
 
   initSettings: async () => {
     if (get().isInitialized) return;
@@ -175,16 +247,33 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
         webdav: toFrontendWebDAV(settings.webdav),
         s3: toFrontendS3(settings.s3),
         lastBackupTime: settings.last_backup_time,
+        backupImageAssetsEnabled: settings.backup_image_assets_enabled ?? true,
+        backupCliConfigFilesEnabled: settings.backup_cli_config_files_enabled ?? true,
+        backupCustomEntries: settings.backup_custom_entries ?? [],
+        backupFileFilterRules: settings.backup_file_filter_rules ?? [],
         launchOnStartup: settings.launch_on_startup,
         minimizeToTrayOnClose: settings.minimize_to_tray_on_close,
         startMinimized: settings.start_minimized ?? false,
+        startLightweight: settings.start_lightweight ?? false,
+        lightweightOnClose: settings.lightweight_on_close ?? false,
+        proxyMode: settings.proxy_mode ?? 'system',
         proxyUrl: settings.proxy_url || '',
         autoBackupEnabled: settings.auto_backup_enabled ?? false,
         autoBackupIntervalDays: settings.auto_backup_interval_days ?? 7,
         autoBackupMaxKeep: settings.auto_backup_max_keep ?? 10,
         lastAutoBackupTime: settings.last_auto_backup_time ?? null,
         autoCheckUpdate: settings.auto_check_update ?? true,
-        visibleTabs: settings.visible_tabs ?? ['opencode', 'claudecode', 'codex', 'openclaw', 'ssh', 'wsl'],
+        visibleTabs: settings.visible_tabs ?? defaultSettings.visible_tabs,
+        sidebarHiddenByPage: normalizeSidebarHiddenByPage(settings.sidebar_hidden_by_page),
+        opencodeAllowClearAppliedOhMyConfig: settings.opencode_allow_clear_applied_oh_my_config ?? false,
+        opencodeUseLegacyOhMyConfig: settings.opencode_use_legacy_oh_my_config ?? false,
+        opencodeOmoUpgradeConfirmed: settings.opencode_omo_upgrade_confirmed ?? false,
+        opencodeDualWriteReasoningVariant: settings.opencode_dual_write_reasoning_variant ?? false,
+        codexPreserveOfficialAuthOnSwitch: settings.codex_preserve_official_auth_on_switch ?? false,
+        codexUnifiedSessionHistoryEnabled: settings.codex_unified_session_history_enabled ?? false,
+        claudeCliLaunchFullAccess: settings.claude_cli_launch_full_access ?? false,
+        preferredTerminal: settings.preferred_terminal ?? null,
+        cliManualPaths: settings.cli_manual_paths ?? {},
         isInitialized: true,
       });
     } catch (error) {
@@ -196,26 +285,51 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
 
   setBackupSettings: async (config) => {
     const state = get();
+    const newBackupType = config.backupType ?? state.backupType;
     const newWebdav = config.webdav
       ? { ...state.webdav, ...config.webdav }
       : state.webdav;
     const newLocalPath = config.localBackupPath ?? state.localBackupPath;
+    const newBackupImageAssetsEnabled =
+      config.backupImageAssetsEnabled ?? state.backupImageAssetsEnabled;
+    const newBackupCliConfigFilesEnabled =
+      config.backupCliConfigFilesEnabled ?? state.backupCliConfigFilesEnabled;
+    const newBackupCustomEntries = config.backupCustomEntries ?? state.backupCustomEntries;
+    const newBackupFileFilterRules = config.backupFileFilterRules ?? state.backupFileFilterRules;
 
     set({
-      backupType: config.backupType,
+      backupType: newBackupType,
       localBackupPath: newLocalPath,
       webdav: newWebdav,
+      backupImageAssetsEnabled: newBackupImageAssetsEnabled,
+      backupCliConfigFilesEnabled: newBackupCliConfigFilesEnabled,
+      backupCustomEntries: newBackupCustomEntries,
+      backupFileFilterRules: newBackupFileFilterRules,
     });
 
     // Get current settings and update
     const currentSettings = await getSettings();
     const newSettings: AppSettings = {
       ...currentSettings,
-      backup_type: config.backupType,
+      backup_type: newBackupType,
       local_backup_path: newLocalPath,
       webdav: toBackendWebDAV(newWebdav),
+      backup_image_assets_enabled: newBackupImageAssetsEnabled,
+      backup_cli_config_files_enabled: newBackupCliConfigFilesEnabled,
+      backup_custom_entries: newBackupCustomEntries,
+      backup_file_filter_rules: newBackupFileFilterRules,
     };
     await saveSettings(newSettings);
+    const savedSettings = await getSettings();
+    set({
+      backupType: (savedSettings.backup_type as 'local' | 'webdav') || newBackupType,
+      localBackupPath: savedSettings.local_backup_path,
+      webdav: toFrontendWebDAV(savedSettings.webdav),
+      backupImageAssetsEnabled: savedSettings.backup_image_assets_enabled ?? true,
+      backupCliConfigFilesEnabled: savedSettings.backup_cli_config_files_enabled ?? true,
+      backupCustomEntries: savedSettings.backup_custom_entries ?? [],
+      backupFileFilterRules: savedSettings.backup_file_filter_rules ?? [],
+    });
   },
 
   setS3: async (config) => {
@@ -246,18 +360,18 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   },
 
   setLaunchOnStartup: async (enabled) => {
-    set({ launchOnStartup: enabled });
+    const currentStartMinimized = get().startMinimized;
+    set({
+      launchOnStartup: enabled,
+      startMinimized: enabled ? currentStartMinimized : false,
+    });
 
-    // Update system auto-launch
-    await setAutoLaunch(enabled);
-
-    // Update database
     const currentSettings = await getSettings();
-    const newSettings: AppSettings = {
-      ...currentSettings,
-      launch_on_startup: enabled,
-    };
-    await saveSettings(newSettings);
+    const updatedSettings = buildLaunchOnStartupSettings(currentSettings, enabled);
+    await saveSettings(updatedSettings);
+
+    // Apply the OS-level side effect after the preference is persisted.
+    await setAutoLaunch(enabled);
   },
 
   setMinimizeToTrayOnClose: async (enabled) => {
@@ -280,6 +394,42 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
     const newSettings: AppSettings = {
       ...currentSettings,
       start_minimized: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setStartLightweight: async (enabled) => {
+    set({ startLightweight: enabled });
+
+    // Update database
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      start_lightweight: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setLightweightOnClose: async (enabled) => {
+    set({ lightweightOnClose: enabled });
+
+    // Update database
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      lightweight_on_close: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setProxyMode: async (mode) => {
+    set({ proxyMode: mode });
+
+    // Update database
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      proxy_mode: mode,
     };
     await saveSettings(newSettings);
   },
@@ -339,5 +489,116 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
       visible_tabs: tabs,
     };
     await saveSettings(newSettings);
+  },
+
+  setSidebarHidden: async (page, hidden) => {
+    const currentVisibility = normalizeSidebarHiddenByPage(get().sidebarHiddenByPage);
+    const nextVisibility = {
+      ...currentVisibility,
+      [page]: hidden,
+    };
+
+    set({ sidebarHiddenByPage: nextVisibility });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      sidebar_hidden_by_page: normalizeSidebarHiddenByPage({
+        ...currentSettings.sidebar_hidden_by_page,
+        [page]: nextVisibility[page],
+      }),
+    };
+    await saveSettings(newSettings);
+  },
+
+  setOpencodeAllowClearAppliedOhMyConfig: async (enabled) => {
+    set({ opencodeAllowClearAppliedOhMyConfig: enabled });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      opencode_allow_clear_applied_oh_my_config: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setOpencodeUseLegacyOhMyConfig: async (enabled) => {
+    set({ opencodeUseLegacyOhMyConfig: enabled });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      opencode_use_legacy_oh_my_config: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setOpencodeOmoUpgradeConfirmed: async (confirmed) => {
+    set({ opencodeOmoUpgradeConfirmed: confirmed });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      opencode_omo_upgrade_confirmed: confirmed,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setOpencodeDualWriteReasoningVariant: async (enabled) => {
+    set({ opencodeDualWriteReasoningVariant: enabled });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      opencode_dual_write_reasoning_variant: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setCodexPreserveOfficialAuthOnSwitch: async (enabled) => {
+    // Persist + re-project the currently applied Codex provider via the dedicated
+    // backend command (direct apply, or restore → apply → re-engage under Gateway).
+    const result = await setCodexPreserveOfficialAuthOnSwitchApi(enabled);
+    set({ codexPreserveOfficialAuthOnSwitch: result.enabled });
+  },
+
+  setCodexUnifiedSessionHistoryEnabled: (enabled) => {
+    set({ codexUnifiedSessionHistoryEnabled: enabled });
+  },
+
+  setClaudeCliLaunchFullAccess: async (enabled) => {
+    set({ claudeCliLaunchFullAccess: enabled });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      claude_cli_launch_full_access: enabled,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setPreferredTerminal: async (terminal) => {
+    set({ preferredTerminal: terminal });
+
+    const currentSettings = await getSettings();
+    const newSettings: AppSettings = {
+      ...currentSettings,
+      preferred_terminal: terminal,
+    };
+    await saveSettings(newSettings);
+  },
+
+  setManualCliPath: async (commandName, path) => {
+    const version = await saveManualCliPath(commandName, path);
+
+    const currentSettings = await getSettings();
+    const cliManualPaths = { ...(currentSettings.cli_manual_paths ?? {}) };
+    if (path.trim()) {
+      cliManualPaths[commandName] = path.trim();
+    } else {
+      delete cliManualPaths[commandName];
+    }
+    set({ cliManualPaths });
+    return version;
   },
 }));

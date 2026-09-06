@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// WebDAV configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -23,6 +24,116 @@ pub struct S3Config {
     pub public_domain: String,
 }
 
+/// Custom file or directory included in backup archives
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupCustomEntryType {
+    File,
+    Directory,
+}
+
+impl Default for BackupCustomEntryType {
+    fn default() -> Self {
+        Self::File
+    }
+}
+
+/// User-defined local file/directory that should be included in backups
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct BackupCustomEntry {
+    pub id: String,
+    pub name: String,
+    pub source_path: String,
+    pub restore_path: Option<String>,
+    pub entry_type: BackupCustomEntryType,
+    pub enabled: bool,
+}
+
+/// Filter rule for excluding specific file paths from backup/restore
+///
+/// Controls whether a path from a specific tool should be excluded from
+/// the backup archive and skipped during restore.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupFileFilterRule {
+    /// Tool identifier: opencode, claude, codex, grok, openclaw, geminicli
+    pub tool: String,
+    /// File path for the tool. UI values use portable paths such as
+    /// "~/.codex/auth.json"; backup-internal relative paths are normalized when matching.
+    pub file_path: String,
+}
+
+/// Select option for file filter rules, derived from files that would
+/// currently be written under external-configs/<tool>/ in a backup archive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupFileFilterPathOption {
+    pub tool: String,
+    pub file_path: String,
+}
+
+impl Default for BackupFileFilterRule {
+    fn default() -> Self {
+        Self {
+            tool: String::new(),
+            file_path: String::new(),
+        }
+    }
+}
+
+/// Session-detail filter chip visibility persisted across app restarts.
+///
+/// Mirrors the frontend `SessionDetailWorkbench` role/content filters. All
+/// booleans are "visible" (true = show). Missing/None means "all visible".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDetailFilters {
+    pub role_filter: SessionRoleFilter,
+    pub content_filter: SessionContentFilter,
+}
+
+impl Default for SessionDetailFilters {
+    fn default() -> Self {
+        Self {
+            role_filter: SessionRoleFilter::default(),
+            content_filter: SessionContentFilter::default(),
+        }
+    }
+}
+
+/// Role-level visibility: user vs assistant messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRoleFilter {
+    pub user: bool,
+    pub assistant: bool,
+}
+
+impl Default for SessionRoleFilter {
+    fn default() -> Self {
+        Self {
+            user: true,
+            assistant: true,
+        }
+    }
+}
+
+/// Content-level visibility: text, thinking, tool calls, commands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionContentFilter {
+    pub text: bool,
+    pub thinking: bool,
+    pub tool_call: bool,
+    pub command: bool,
+}
+
+impl Default for SessionContentFilter {
+    fn default() -> Self {
+        Self {
+            text: true,
+            thinking: true,
+            tool_call: true,
+            command: true,
+        }
+    }
+}
+
 /// Application settings
 ///
 /// Note: This struct is no longer directly serialized to/from database.
@@ -37,12 +148,30 @@ pub struct AppSettings {
     pub webdav: WebDAVConfig,
     pub s3: S3Config,
     pub last_backup_time: Option<String>,
+    /// Include generated image files in backup zip (default: true)
+    pub backup_image_assets_enabled: bool,
+    /// Include optional (DB-backed) CLI runtime files under external-configs/ in backup zip
+    /// (Codex / Claude / Grok / Gemini CLI; default: true).
+    /// When false, those tools skip packaging/restore and re-apply from SQLite after restore.
+    /// OpenCode / OpenClaw / Pi are always packaged and restored (subject to file filter rules).
+    pub backup_cli_config_files_enabled: bool,
+    /// User-defined files/directories to include in backup zip
+    pub backup_custom_entries: Vec<BackupCustomEntry>,
     /// Launch on startup (default: true)
     pub launch_on_startup: bool,
     /// Minimize to tray on close instead of exiting (default: true)
     pub minimize_to_tray_on_close: bool,
     /// Start minimized to tray (default: false)
     pub start_minimized: bool,
+    /// Enter lightweight mode at startup: destroy the main window before it is
+    /// ever shown and keep only the tray/backend (default: false)
+    pub start_lightweight: bool,
+    /// Enter lightweight mode (destroy window, release WebView memory) instead
+    /// of just hiding it when the user closes the window (default: false).
+    /// Only effective while minimize_to_tray_on_close is true.
+    pub lightweight_on_close: bool,
+    /// Proxy mode for network requests: "direct", "custom", or "system" (default: "system")
+    pub proxy_mode: String,
     /// Proxy URL for network requests (e.g., http://user:pass@proxy.com:8080 or socks5://proxy.com:1080)
     pub proxy_url: String,
     /// Theme mode: "light", "dark", or "system" (default: "system")
@@ -59,6 +188,57 @@ pub struct AppSettings {
     pub auto_check_update: bool,
     /// Visible tabs in the tab bar (default: all tabs shown)
     pub visible_tabs: Vec<String>,
+    /// Sidebar hidden state by page
+    pub sidebar_hidden_by_page: HashMap<String, bool>,
+    /// Allow clearing OMO/OMOS applied runtime config from OpenCode page (default: false)
+    pub opencode_allow_clear_applied_oh_my_config: bool,
+    /// Write OMO config to the legacy flat file (~/.config/opencode/oh-my-openagent.jsonc)
+    /// instead of the unified ~/.omo/omo.jsonc ([opencode] block) format (default: false)
+    pub opencode_use_legacy_oh_my_config: bool,
+    /// Whether the user has already answered the one-time "has OMO been upgraded?"
+    /// confirmation shown on the first Oh My OpenAgent apply (default: false)
+    pub opencode_omo_upgrade_confirmed: bool,
+    /// Dual-write `variant` alongside canonical `reasoning` when saving OMO agent/category
+    /// configs. Works around upstream issue #6614 where the main agent loses effort when
+    /// delegating to subagents under the `reasoning` key. Off (default) keeps current behavior
+    /// (write `reasoning` only); on writes both fields with the same value. (default: false)
+    pub opencode_dual_write_reasoning_variant: bool,
+    /// Keep Codex official OAuth login when applying third-party providers (default: false)
+    pub codex_preserve_official_auth_on_switch: bool,
+    /// Let official Codex sessions use the shared custom history bucket (default: false)
+    pub codex_unified_session_history_enabled: bool,
+    /// Append --dangerously-skip-permissions when launching Claude provider CLI (default: false)
+    pub claude_cli_launch_full_access: bool,
+    /// Preferred terminal app used when launching the Claude provider CLI on
+    /// Windows. `None` or an unknown value falls back to `cmd` (system default).
+    /// Known values: `cmd`, `powershell`, `wt` (Windows Terminal), `gitbash`.
+    pub preferred_terminal: Option<String>,
+    /// File filter rules for backup/restore
+    pub backup_file_filter_rules: Vec<BackupFileFilterRule>,
+    /// User-specified manual CLI paths by command name (e.g. `claude`, `opencode`,
+    /// `grok`, `pi`, `omp`, `hermes`, `dsh`, `openclaw`). When present and the
+    /// file exists, CLI execution prefers these paths over auto-discovery.
+    pub cli_manual_paths: HashMap<String, String>,
+    /// Session-detail filter chip visibility, persisted across app restarts.
+    /// `None` means "no saved preference yet" (frontend defaults to all visible).
+    pub session_detail_filters: Option<SessionDetailFilters>,
+    /// Provider list sort mode per coding module (e.g. "kimi" -> "recent").
+    /// Mode values: "custom" (drag order), "recent", "created", "name".
+    pub provider_sort_modes: HashMap<String, String>,
+    /// Last-used timestamp (RFC3339) per provider, keyed by "<module_key>:<provider_id>".
+    /// Module keys follow the favorite-provider source convention
+    /// (opencode/claudecode/claudedesktop/codex/grok/geminicli/kimi/openclaw/pi/omp/hermes/dsh).
+    pub provider_last_used: HashMap<String, String>,
+}
+
+/// Combined read model for the provider list UI: per-module sort preference and
+/// the last-used timestamp map consumed by the "recently used" sort mode.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderListState {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sort_modes: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_used: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -72,9 +252,15 @@ impl Default for AppSettings {
             webdav: WebDAVConfig::default(),
             s3: S3Config::default(),
             last_backup_time: None,
+            backup_image_assets_enabled: true,
+            backup_cli_config_files_enabled: true,
+            backup_custom_entries: Vec::new(),
             launch_on_startup: true,
             minimize_to_tray_on_close: true,
             start_minimized: false,
+            start_lightweight: false,
+            lightweight_on_close: false,
+            proxy_mode: "system".to_string(),
             proxy_url: String::new(),
             theme: "system".to_string(),
             auto_backup_enabled: false,
@@ -85,11 +271,65 @@ impl Default for AppSettings {
             visible_tabs: vec![
                 "opencode".to_string(),
                 "claudecode".to_string(),
+                "claudedesktop".to_string(),
                 "codex".to_string(),
+                "grok".to_string(),
+                "geminicli".to_string(),
+                "kimi".to_string(),
                 "openclaw".to_string(),
+                "pi".to_string(),
+                "oh_my_pi".to_string(),
+                "hermes".to_string(),
+                "dsh".to_string(),
+                "gateway".to_string(),
+                "image".to_string(),
                 "ssh".to_string(),
                 "wsl".to_string(),
             ],
+            sidebar_hidden_by_page: default_sidebar_hidden_by_page(),
+            opencode_allow_clear_applied_oh_my_config: false,
+            opencode_use_legacy_oh_my_config: false,
+            opencode_omo_upgrade_confirmed: false,
+            opencode_dual_write_reasoning_variant: false,
+            codex_preserve_official_auth_on_switch: false,
+            codex_unified_session_history_enabled: false,
+            claude_cli_launch_full_access: false,
+            preferred_terminal: None,
+            backup_file_filter_rules: default_backup_file_filter_rules(),
+            cli_manual_paths: HashMap::new(),
+            session_detail_filters: None,
+            provider_sort_modes: HashMap::new(),
+            provider_last_used: HashMap::new(),
         }
     }
+}
+
+pub fn default_sidebar_hidden_by_page() -> HashMap<String, bool> {
+    // Keep this key set in sync with the frontend SIDEBAR_PAGE_KEYS list in
+    // web/services/settingsApi.ts. A missing key here means a brand-new
+    // database (no sidebar_hidden_by_page field yet) would not surface that
+    // page's default visible state. The reader in adapter.rs no longer drops
+    // keys outside this set, but the defaults still need to be complete.
+    HashMap::from([
+        ("opencode".to_string(), false),
+        ("claudecode".to_string(), false),
+        ("claudedesktop".to_string(), false),
+        ("codex".to_string(), false),
+        ("grok".to_string(), false),
+        ("geminicli".to_string(), false),
+        ("kimi".to_string(), false),
+        ("openclaw".to_string(), false),
+        ("pi".to_string(), false),
+        ("oh_my_pi".to_string(), false),
+        ("hermes".to_string(), false),
+        ("dsh".to_string(), false),
+    ])
+}
+
+/// Default filter rules for backup file filtering.
+///
+/// File filtering is a user-managed extension. New users should not receive
+/// implicit rules here.
+pub fn default_backup_file_filter_rules() -> Vec<BackupFileFilterRule> {
+    Vec::new()
 }

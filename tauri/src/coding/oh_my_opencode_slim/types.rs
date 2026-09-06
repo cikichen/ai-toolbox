@@ -9,6 +9,24 @@ pub struct ConfigPathInfo {
     pub source: String,
 }
 
+/// Fallback config for oh-my-opencode-slim
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OhMyOpenCodeSlimFallbackConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_on_empty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chains: Option<Value>,
+    #[serde(flatten)]
+    pub other_fields: std::collections::BTreeMap<String, Value>,
+}
+
 /// Input type for creating/updating Agents Profile (简化版)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +35,10 @@ pub struct OhMyOpenCodeSlimAgentsProfileInput {
     pub id: Option<String>, // Optional - will be generated if not provided
     pub name: String,
     pub agents: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub council: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<OhMyOpenCodeSlimFallbackConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_fields: Option<Value>,
 }
@@ -30,6 +52,10 @@ pub struct OhMyOpenCodeSlimAgentsProfile {
     pub is_applied: bool,
     pub is_disabled: bool,
     pub agents: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub council: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<OhMyOpenCodeSlimFallbackConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,6 +73,10 @@ pub struct OhMyOpenCodeSlimAgentsProfileContent {
     pub is_applied: bool,
     pub is_disabled: bool,
     pub agents: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub council: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<OhMyOpenCodeSlimFallbackConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +102,8 @@ pub struct OhMyOpenCodeSlimGlobalConfigInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>, // JSON, no specific structure
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub council: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub other_fields: Option<Value>,
 }
 
@@ -93,6 +125,8 @@ pub struct OhMyOpenCodeSlimGlobalConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>, // JSON, no specific structure
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub council: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub other_fields: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -113,6 +147,8 @@ pub struct OhMyOpenCodeSlimGlobalConfigContent {
     pub lsp: Option<Value>, // JSON, no specific structure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>, // JSON, no specific structure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub council: Option<Value>, // JSON, no specific structure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_fields: Option<Value>,
     pub updated_at: String,

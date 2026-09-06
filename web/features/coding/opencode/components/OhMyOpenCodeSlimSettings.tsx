@@ -18,7 +18,7 @@ import {
 import { restrictToVerticalAxis } from '@dnd-kit/modifiers';
 import type { OhMyOpenCodeSlimConfig, OhMyOpenCodeSlimGlobalConfig, OhMyOpenCodeSlimGlobalConfigInput } from '@/types/ohMyOpenCodeSlim';
 import OhMyOpenCodeSlimConfigCard from './OhMyOpenCodeSlimConfigCard';
-import OhMyOpenCodeSlimConfigModal, { OhMyOpenCodeSlimConfigFormValues } from './OhMyOpenCodeSlimConfigModal';
+import OhMyOpenCodeSlimConfigModal, { type OhMyOpenCodeSlimConfigFormValues } from './OhMyOpenCodeSlimConfigModal';
 import OhMyOpenCodeSlimGlobalConfigModal from './OhMyOpenCodeSlimGlobalConfigModal';
 import {
   listOhMyOpenCodeSlimConfigs,
@@ -31,6 +31,8 @@ import {
   getOhMyOpenCodeSlimGlobalConfig,
   saveOhMyOpenCodeSlimGlobalConfig,
   saveOhMyOpenCodeSlimLocalConfig,
+  getOhMyOpenCodeSlimConfigPathInfo,
+  clearOhMyOpenCodeSlimAppliedConfig,
 } from '@/services/ohMyOpenCodeSlimApi';
 import { openExternalUrl } from '@/services';
 import { refreshTrayMenu } from '@/services/appApi';
@@ -39,10 +41,14 @@ import { useRefreshStore } from '@/stores';
 const { Text, Link } = Typography;
 
 interface OhMyOpenCodeSlimSettingsProps {
-  modelOptions: { label: string; value: string }[];
+  modelOptions: Array<
+    | { label: string; value: string; disabled?: boolean }
+    | { label: string; options: { label: string; value: string; disabled?: boolean }[] }
+  >;
   /** Map of model ID to its variant keys */
   modelVariantsMap?: Record<string, string[]>;
   disabled?: boolean;
+  allowClearAppliedConfig?: boolean;
   onConfigApplied?: (config: OhMyOpenCodeSlimConfig) => void;
   onConfigUpdated?: () => void;
 }
@@ -51,6 +57,7 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
   modelOptions,
   modelVariantsMap = {},
   disabled = false,
+  allowClearAppliedConfig = false,
   onConfigApplied,
   onConfigUpdated,
 }) => {
@@ -74,11 +81,7 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
   );
 
   // Load configs on mount and when refresh key changes
-  React.useEffect(() => {
-    loadConfigs();
-  }, [omosConfigRefreshKey]);
-
-  const loadConfigs = async () => {
+  const loadConfigs = React.useCallback(async () => {
     setLoading(true);
     try {
       const data = await listOhMyOpenCodeSlimConfigs();
@@ -89,7 +92,14 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, [t]);
+
+  React.useEffect(() => {
+    // Biome exhaustive-deps: explicitly reference the refresh key
+    // so the dependency array is considered necessary.
+    void omosConfigRefreshKey;
+    void loadConfigs();
+  }, [omosConfigRefreshKey, loadConfigs]);
 
   const handleAddConfig = () => {
     setEditingConfig(null);
@@ -151,6 +161,41 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
     }
   };
 
+  const handleClearAppliedConfig = async (config: OhMyOpenCodeSlimConfig) => {
+    let configPath = '';
+    try {
+      const pathInfo = await getOhMyOpenCodeSlimConfigPathInfo();
+      configPath = pathInfo.path;
+    } catch (error) {
+      console.error('Failed to get Oh My OpenCode Slim config path:', error);
+    }
+
+    Modal.confirm({
+      title: t('opencode.ohMyOpenCode.clearAppliedConfirmTitle'),
+      content: t('opencode.ohMyOpenCode.clearAppliedConfirmContent', {
+        name: config.name,
+        path: configPath || t('common.unknown'),
+      }),
+      okText: t('opencode.ohMyOpenCode.clearAppliedConfirmOk'),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await clearOhMyOpenCodeSlimAppliedConfig(config.id);
+          message.success(t('opencode.ohMyOpenCode.clearAppliedSuccess'));
+          loadConfigs();
+          incrementOmosConfigRefresh();
+          await refreshTrayMenu();
+          if (onConfigUpdated) {
+            onConfigUpdated();
+          }
+        } catch (error) {
+          console.error('Failed to clear Oh My OpenCode Slim applied config:', error);
+          message.error(t('opencode.ohMyOpenCode.clearAppliedError'));
+        }
+      },
+    });
+  };
+
   const handleToggleDisabled = async (config: OhMyOpenCodeSlimConfig, isDisabled: boolean) => {
     try {
       await toggleOhMyOpenCodeSlimConfigDisabled(config.id, isDisabled);
@@ -206,6 +251,8 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
           config: {
             name: values.name,
             agents: values.agents,
+            council: values.council ?? null,
+            fallback: values.fallback ?? null,
             otherFields: values.otherFields,
           },
         });
@@ -216,6 +263,8 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
           name: values.name,
           isApplied: editingConfig?.isApplied, // 保留原有的 isApplied 状态
           agents: values.agents,
+          council: values.council ?? null,
+          fallback: values.fallback ?? null,
           otherFields: values.otherFields,
         };
 
@@ -276,13 +325,18 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
         incrementOmosConfigRefresh();
         await refreshTrayMenu();
       }
+      if (!isLocalConfig) {
+        incrementOmosConfigRefresh();
+        await refreshTrayMenu();
+      }
     } catch (error) {
       console.error('Failed to save global config:', error);
       message.error(t('common.error'));
     }
   };
 
-  const appliedConfig = configs.find((c) => c.isApplied);
+  // `__local__` is a local-file bridge; do not present it as a managed applied preset.
+  const appliedConfig = configs.find((c) => c.isApplied && c.id !== '__local__');
 
   const content = (
     <Spin spinning={loading}>
@@ -328,6 +382,8 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
                   onDelete={handleDeleteConfig}
                   onApply={handleApplyConfig}
                   onToggleDisabled={handleToggleDisabled}
+                  allowClearAppliedConfig={allowClearAppliedConfig}
+                  onClearAppliedConfig={handleClearAppliedConfig}
                 />
               ))}
             </div>
@@ -413,11 +469,11 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
         initialValues={
           editingConfig
             ? {
-                ...editingConfig,
-                // 复制模式下移除 id，避免意外使用原配置的 id
-                id: isCopyMode ? undefined : editingConfig.id,
-                name: isCopyMode ? `${editingConfig.name}_copy` : editingConfig.name,
-              }
+              ...editingConfig,
+              // 复制模式下移除 id，避免意外使用原配置的 id
+              id: isCopyMode ? undefined : editingConfig.id,
+              name: isCopyMode ? `${editingConfig.name}_copy` : editingConfig.name,
+            }
             : undefined
         }
         onCancel={() => {
@@ -432,6 +488,8 @@ const OhMyOpenCodeSlimSettings: React.FC<OhMyOpenCodeSlimSettingsProps> = ({
         open={globalModalOpen}
         isLocal={globalConfig?.id === '__local__'}
         initialConfig={globalConfig || undefined}
+        modelOptions={modelOptions}
+        modelVariantsMap={modelVariantsMap}
         onCancel={() => {
           setGlobalModalOpen(false);
           setGlobalConfig(null);

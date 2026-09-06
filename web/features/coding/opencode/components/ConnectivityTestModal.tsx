@@ -1,5 +1,5 @@
 import React from 'react';
-import { Modal, Form, Input, InputNumber, Button, Collapse, Table, Tag, Space, Tooltip, message, Switch, Typography, Row, Col, Checkbox, Popconfirm, type TableProps } from 'antd';
+import { Modal, Form, Input, InputNumber, Button, Collapse, Table, Tag, Space, Tooltip, message, Switch, Typography, Checkbox, Popconfirm, Select, type TableProps } from 'antd';
 import { CaretRightOutlined, SettingOutlined, InfoCircleOutlined, DeleteOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import JsonEditor from '@/components/common/JsonEditor';
@@ -9,7 +9,12 @@ import {
   type ConnectivityTestResult,
   type OpenCodeDiagnosticsConfig,
 } from '@/services/opencodeApi';
+import {
+  testGatewayProviderModelConnectivity,
+  type GatewayConnectivityTestRequest,
+} from '@/services/proxyGatewayApi';
 import type { OpenCodeProvider } from '@/types/opencode';
+import styles from './ConnectivityTestModal.module.less';
 
 
 interface ConnectivityTestModalProps {
@@ -19,9 +24,11 @@ interface ConnectivityTestModalProps {
   providerName: string;
   providerConfig: OpenCodeProvider;
   modelIds: string[];
+  removableModelIds?: string[];
   diagnostics?: OpenCodeDiagnosticsConfig;
   onSaveDiagnostics: (diagnostics: OpenCodeDiagnosticsConfig) => Promise<void>;
   onRemoveModels?: (modelIds: string[]) => Promise<void>;
+  gatewayRequest?: Pick<GatewayConnectivityTestRequest, 'cliKey' | 'providerId'>;
 }
 
 interface TestResult extends Partial<ConnectivityTestResult> {
@@ -41,12 +48,15 @@ const SUPPORTED_NPMS = [
 const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
   open,
   onCancel,
+  providerId,
   providerName,
   providerConfig,
   modelIds,
+  removableModelIds,
   diagnostics,
   onSaveDiagnostics,
   onRemoveModels,
+  gatewayRequest,
 }) => {
   const { t } = useTranslation();
   const [form] = Form.useForm();
@@ -66,9 +76,31 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
   // Details modal state
   const [detailsModalOpen, setDetailsModalOpen] = React.useState(false);
   const [selectedResult, setSelectedResult] = React.useState<TestResult | null>(null);
+  const [defaultTestModelId, setDefaultTestModelId] = React.useState<string | undefined>(undefined);
 
   // Track if modal was just opened (to avoid re-initializing on diagnostics change)
   const prevOpenRef = React.useRef(false);
+
+  const resolvedDefaultTestModelId = React.useMemo(() => {
+    if (diagnostics?.defaultTestModelId && modelIds.includes(diagnostics.defaultTestModelId)) {
+      return diagnostics.defaultTestModelId;
+    }
+
+    return undefined;
+  }, [diagnostics?.defaultTestModelId, modelIds]);
+
+  const persistDefaultTestModel = React.useCallback(async (nextDefaultTestModelId?: string) => {
+    await onSaveDiagnostics({
+      prompt: diagnostics?.prompt ?? form.getFieldValue('prompt') ?? 'say hi!',
+      defaultTestModelId: nextDefaultTestModelId,
+      ...(diagnostics?.temperature !== undefined ? { temperature: diagnostics.temperature } : {}),
+      ...(diagnostics?.maxTokens !== undefined ? { maxTokens: diagnostics.maxTokens } : {}),
+      ...(diagnostics?.maxOutputTokens !== undefined ? { maxOutputTokens: diagnostics.maxOutputTokens } : {}),
+      ...(diagnostics?.stream !== undefined ? { stream: diagnostics.stream } : {}),
+      ...(diagnostics?.headers ? { headers: diagnostics.headers } : {}),
+      ...(diagnostics?.body ? { body: diagnostics.body } : {}),
+    });
+  }, [onSaveDiagnostics, form, diagnostics]);
 
   // Initialize form with diagnostics prop - only when modal opens
   React.useEffect(() => {
@@ -83,7 +115,8 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
       setHeadersJson(diagnostics?.headers || {});
       setBodyJson(diagnostics?.body || {});
-      setSelectedModelIds([]); // 默认不勾选任何模型
+      setDefaultTestModelId(resolvedDefaultTestModelId);
+      setSelectedModelIds(resolvedDefaultTestModelId ? [resolvedDefaultTestModelId] : []);
 
       setResults(modelIds.map(id => ({
         key: id,
@@ -97,7 +130,19 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
       })));
     }
     prevOpenRef.current = open;
-  }, [open, diagnostics, modelIds, form]);
+  }, [open, diagnostics, modelIds, form, resolvedDefaultTestModelId]);
+
+  const handleDefaultTestModelChange = React.useCallback(async (modelId?: string) => {
+    setDefaultTestModelId(modelId);
+    setSelectedModelIds(modelId ? [modelId] : []);
+
+    try {
+      await persistDefaultTestModel(modelId);
+    } catch (error) {
+      console.error('Failed to save default test model:', error);
+      message.error(t('common.error'));
+    }
+  }, [persistDefaultTestModel, t]);
 
   const handleRunTest = async () => {
     // 检查是否选中了要测试的模型
@@ -158,6 +203,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
       const newDiagnostics: OpenCodeDiagnosticsConfig = {
         prompt: values.prompt,
+        defaultTestModelId,
         stream: values.stream,
         ...(values.temperature !== undefined ? { temperature: values.temperature } : {}),
         ...(values.maxTokens !== undefined
@@ -174,8 +220,12 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
       const baseRequest: ConnectivityTestRequest = {
         npm,
+        providerId,
         baseUrl: providerConfig.options?.baseURL || '',
         apiKey: providerConfig.options?.apiKey,
+        ...(providerConfig.options?.reasoningEffort
+          ? { reasoningEffort: String(providerConfig.options.reasoningEffort) }
+          : {}),
         prompt: values.prompt,
         stream: values.stream,
         ...(values.temperature !== undefined ? { temperature: values.temperature } : {}),
@@ -192,10 +242,18 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
       const failedModelIds: string[] = [];
       const promises = modelsToTest.map(async (modelId) => {
         try {
-          const response = await testProviderModelConnectivity({
-            ...baseRequest,
-            modelIds: [modelId],
-          });
+          const response = gatewayRequest
+            ? await testGatewayProviderModelConnectivity({
+                ...gatewayRequest,
+                prompt: values.prompt,
+                stream: values.stream,
+                modelIds: [modelId],
+                timeoutSecs: 30,
+              })
+            : await testProviderModelConnectivity({
+                ...baseRequest,
+                modelIds: [modelId],
+              });
 
           const result = response.results[0];
 
@@ -235,8 +293,12 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
       // 测试完成后处理勾选状态
       if (failedModelIds.length > 0) {
-        // 有失败的：自动选中失败的模型（用于删除）
-        setSelectedModelIds(failedModelIds);
+        // 有失败的：自动选中可删除的失败模型（用于删除）
+        setSelectedModelIds(
+          onRemoveModels
+            ? failedModelIds.filter((modelId) => (removableModelIds || modelIds).includes(modelId))
+            : failedModelIds,
+        );
       }
       // 没有失败的：保持用户的勾选状态不变
 
@@ -256,7 +318,15 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
   const handleRemoveModels = async () => {
     if (!onRemoveModels || selectedModelIds.length === 0) return;
 
-    const removedIds = [...selectedModelIds];
+    const removableSet = new Set(removableModelIds || modelIds);
+    const readonlyIds = selectedModelIds.filter((modelId) => !removableSet.has(modelId));
+    if (readonlyIds.length > 0) {
+      message.warning(t('opencode.connectivity.removeReadonlyHint', { count: readonlyIds.length }));
+      return;
+    }
+
+    const removedIds = selectedModelIds.filter((modelId) => removableSet.has(modelId));
+    if (removedIds.length === 0) return;
     setRemoving(true);
     try {
       await onRemoveModels(removedIds);
@@ -264,6 +334,8 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
       setResults(prev => prev.filter(r => !removedIds.includes(r.modelId)));
       setSelectedModelIds([]);
       message.success(t('opencode.connectivity.removeSuccess', { count: removedIds.length }));
+      // Removal completed the cleanup task — close the modal so users don't need an extra click.
+      onCancel();
     } catch {
       message.error(t('common.error'));
     } finally {
@@ -287,13 +359,42 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
     }
   };
 
-  const isAllSelected = modelIds.length > 0 && selectedModelIds.length === modelIds.length;
-  const isIndeterminate = selectedModelIds.length > 0 && selectedModelIds.length < modelIds.length;
-
   const hasFailedModels = results.some(r => r.status === 'error' || r.status === 'timeout');
   // 判断测试是否完成：有结果，且所有非 pending 状态的模型都不在 loading 状态
   const testedResults = results.filter(r => r.status !== 'pending');
   const isTestCompleted = testedResults.length > 0 && testedResults.every(r => !r.loading);
+  const isAllSelected = modelIds.length > 0 && selectedModelIds.length === modelIds.length;
+  const isIndeterminate = selectedModelIds.length > 0 && selectedModelIds.length < modelIds.length;
+  const runningCount = results.filter((result) => result.loading || result.status === 'running').length;
+  const successCount = results.filter((result) => result.status === 'success').length;
+  const failedCount = results.filter((result) => result.status === 'error' || result.status === 'timeout').length;
+  const pendingCount = results.filter((result) => result.status === 'pending').length;
+  const defaultModelOptions = modelIds.map((modelId) => ({
+    label: modelId,
+    value: modelId,
+  }));
+  const summaryItems = [
+    {
+      label: t('opencode.connectivity.selectedCount'),
+      value: selectedModelIds.length,
+    },
+    {
+      label: t('opencode.connectivity.running'),
+      value: runningCount,
+    },
+    {
+      label: t('opencode.connectivity.success'),
+      value: successCount,
+    },
+    {
+      label: t('opencode.connectivity.failed'),
+      value: failedCount,
+    },
+    {
+      label: t('opencode.connectivity.pending'),
+      value: pendingCount,
+    },
+  ];
 
   const columns: TableProps<TestResult>['columns'] = [
     // 统一的复选框列
@@ -362,7 +463,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
                 type="link"
                 size="small"
                 onClick={() => handleShowDetails(record)}
-                style={{ padding: 0, height: 'auto' }}
+                className={styles.detailsLink}
               >
                 {t('opencode.connectivity.requestDetails')}
               </Button>
@@ -378,6 +479,7 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
 
   return (
     <Modal
+      className={styles.modal}
       title={t('opencode.connectivity.title', { name: providerName })}
       open={open}
       onCancel={onCancel}
@@ -420,125 +522,204 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
       width={800}
       styles={{ body: { paddingBottom: 16 } }}
     >
-      <Form 
-        form={form} 
-        labelCol={{ span: 4 }}
-        wrapperCol={{ span: 20 }}
-      >
-        <Form.Item 
-          label={t('opencode.connectivity.prompt')} 
-          name="prompt" 
-          rules={[{ required: true }]}
-        >
-          <Input.TextArea rows={2} />
-        </Form.Item>
+      <div className={styles.content}>
+        <section className={styles.sectionCard}>
+          <div className={styles.sectionHeader}>
+            <div className={styles.sectionTitle}>{t('opencode.connectivity.configSection')}</div>
+            <Typography.Text className={styles.sectionHint}>
+              {t('opencode.connectivity.configSectionHint')}
+            </Typography.Text>
+          </div>
 
-        <Collapse 
-          ghost 
-          activeKey={advancedActive} 
-          onChange={setAdvancedActive}
-          items={[
-            {
-              key: 'advanced',
-              label: <Space><SettingOutlined /> {t('opencode.connectivity.moreParams')}</Space>,
-              children: (
-                <>
-                  <Row gutter={24} style={{ marginBottom: 16 }}>
-                    <Col span={8}>
-                      <Form.Item 
-                        label={t('opencode.connectivity.temperature')} 
-                        name="temperature" 
-                        style={{ marginBottom: 0 }}
-                        labelCol={{ span: 10 }}
-                        wrapperCol={{ span: 14 }}
-                      >
-                        <InputNumber min={0} max={2} step={0.1} style={{ width: '100%' }} />
-                      </Form.Item>
-                    </Col>
-                    <Col span={9}>
-                      <Form.Item 
-                        label={t('opencode.connectivity.maxTokens')} 
-                        name="maxTokens" 
-                        style={{ marginBottom: 0 }}
-                        labelCol={{ span: 11 }}
-                        wrapperCol={{ span: 13 }}
-                      >
-                        <InputNumber min={1} step={100} style={{ width: '100%' }} />
-                      </Form.Item>
-                    </Col>
-                    <Col span={7}>
-                      <Form.Item 
-                        label={t('opencode.connectivity.stream')} 
-                        name="stream" 
-                        valuePropName="checked" 
-                        style={{ marginBottom: 0 }}
-                        labelCol={{ span: 10 }}
-                        wrapperCol={{ span: 14 }}
-                      >
-                        <Switch />
-                      </Form.Item>
-                    </Col>
-                  </Row>
+          <Form
+            className={styles.form}
+            form={form}
+          >
+            <div className={`${styles.promptItem} ${styles.formFieldRow}`}>
+              <div className={styles.fieldLabel}>
+                {t('opencode.connectivity.prompt')}
+              </div>
+              <div className={styles.fieldContent}>
+                <Form.Item
+                  style={{ marginBottom: 0 }}
+                  name="prompt"
+                  rules={[{ required: true }]}
+                >
+                  <Input.TextArea className={styles.promptInput} rows={3} />
+                </Form.Item>
+              </div>
+            </div>
 
+            <div className={styles.defaultModelPanel}>
+              <div className={styles.formFieldRow}>
+                <div className={styles.fieldLabel}>
+                  {t('opencode.connectivity.defaultTestModel')}
+                </div>
+                <div className={styles.fieldContent}>
                   <Form.Item
-                    label={
-                      <span>
-                        {t('opencode.connectivity.customHeaders')}
-                        <Tooltip title={t('opencode.connectivity.customHeadersHint')}>
-                          <InfoCircleOutlined style={{ marginLeft: 3 }} />
-                        </Tooltip>
-                      </span>
-                    }
+                    className={styles.defaultModelItem}
+                    required
                   >
-                    <JsonEditor
-                      value={headersJson}
-                      onChange={(val, valid) => { setHeadersJson(val); setHeadersValid(valid); }}
-                      mode="text"
-                      height={150}
-                      placeholder="{}"
+                    <Select
+                      value={defaultTestModelId}
+                      options={defaultModelOptions}
+                      onChange={handleDefaultTestModelChange}
+                      allowClear
+                      placeholder={t('opencode.connectivity.defaultTestModelPlaceholder')}
                     />
                   </Form.Item>
+                  <Typography.Text className={styles.defaultModelHelp}>
+                    {t('opencode.connectivity.defaultTestModelHelp')}
+                  </Typography.Text>
+                </div>
+              </div>
+            </div>
 
-                  <Form.Item
-                    label={
-                      <span>
-                        {t('opencode.connectivity.customBody')}
-                        <Tooltip title={t('opencode.connectivity.customBodyHint')}>
-                          <InfoCircleOutlined style={{ marginLeft: 2 }} />
-                        </Tooltip>
-                      </span>
-                    }
-                  >
-                    <JsonEditor
-                      value={bodyJson}
-                      onChange={(val, valid) => { setBodyJson(val); setBodyValid(valid); }}
-                      mode="text"
-                      height={150}
-                      placeholder="{}"
-                    />
-                  </Form.Item>
-                </>
-              )
-            }
-          ]}
-        />
+            {!gatewayRequest ? <Collapse
+              className={styles.advancedCollapse}
+              ghost
+              activeKey={advancedActive}
+              onChange={setAdvancedActive}
+              items={[
+                {
+                  key: 'advanced',
+                  label: (
+                    <div className={styles.collapseLabel}>
+                      <div className={styles.collapseTitleRow}>
+                        <SettingOutlined className={styles.collapseIcon} />
+                        <div className={styles.collapseTitle}>{t('opencode.connectivity.moreParams')}</div>
+                        <Typography.Text className={styles.collapseHint}>
+                          {t('opencode.connectivity.moreParamsHint')}
+                        </Typography.Text>
+                      </div>
+                    </div>
+                  ),
+                  children: (
+                    <div className={styles.advancedContent}>
+                      <div className={styles.metricsRow}>
+                        <div className={styles.metricsGrid}>
+                          <div className={styles.metricCard}>
+                            <Typography.Text className={styles.metricLabel}>
+                              {t('opencode.connectivity.temperature')}
+                            </Typography.Text>
+                            <Form.Item
+                              name="temperature"
+                              style={{ marginBottom: 0 }}
+                            >
+                              <InputNumber min={0} max={2} step={0.1} style={{ width: '100%' }} />
+                            </Form.Item>
+                          </div>
+                          <div className={styles.metricCard}>
+                            <Typography.Text className={styles.metricLabel}>
+                              {t('opencode.connectivity.maxTokens')}
+                            </Typography.Text>
+                            <Form.Item
+                              name="maxTokens"
+                              style={{ marginBottom: 0 }}
+                            >
+                              <InputNumber min={1} step={100} style={{ width: '100%' }} />
+                            </Form.Item>
+                          </div>
+                          <div className={styles.metricCard}>
+                            <Typography.Text className={styles.metricLabel}>
+                              {t('opencode.connectivity.stream')}
+                            </Typography.Text>
+                            <Form.Item
+                              name="stream"
+                              valuePropName="checked"
+                              style={{ marginBottom: 0 }}
+                            >
+                              <Switch />
+                            </Form.Item>
+                          </div>
+                        </div>
+                      </div>
 
-        <Typography.Title level={5} style={{ marginTop: 16, marginBottom: 8 }}>
-          {t('opencode.connectivity.results')}
-        </Typography.Title>
-        <Table
-          dataSource={results}
-          columns={columns}
-          pagination={false}
-          size="small"
-          scroll={{ y: 300 }}
-        />
-        <Typography.Text type="secondary" style={{ fontSize: 12, marginTop: 8, display: 'block' }}>
-          {t('opencode.connectivity.disclaimer')}
-        </Typography.Text>
-      </Form>
+                      <div className={`${styles.jsonField} ${styles.jsonFieldRow}`}>
+                        <div className={styles.jsonLabel}>
+                          {t('opencode.connectivity.customHeaders')}
+                          <Tooltip title={t('opencode.connectivity.customHeadersHint')}>
+                            <InfoCircleOutlined className={styles.jsonLabelHint} />
+                          </Tooltip>
+                        </div>
+                        <div className={styles.jsonEditorWrap}>
+                          <Form.Item
+                            style={{ marginBottom: 0 }}
+                          >
+                            <JsonEditor
+                              value={headersJson}
+                              onChange={(val, valid) => { setHeadersJson(val); setHeadersValid(valid); }}
+                              mode="text"
+                              height={150}
+                              placeholder="{}"
+                            />
+                          </Form.Item>
+                        </div>
+                      </div>
+
+                      <div className={`${styles.jsonField} ${styles.jsonFieldRow}`}>
+                        <div className={styles.jsonLabel}>
+                          {t('opencode.connectivity.customBody')}
+                          <Tooltip title={t('opencode.connectivity.customBodyHint')}>
+                            <InfoCircleOutlined className={styles.jsonLabelHint} />
+                          </Tooltip>
+                        </div>
+                        <div className={styles.jsonEditorWrap}>
+                          <Form.Item
+                            style={{ marginBottom: 0 }}
+                          >
+                            <JsonEditor
+                              value={bodyJson}
+                              onChange={(val, valid) => { setBodyJson(val); setBodyValid(valid); }}
+                              mode="text"
+                              height={150}
+                              placeholder="{}"
+                            />
+                          </Form.Item>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                }
+              ]}
+            /> : null}
+          </Form>
+        </section>
+
+        <section className={styles.sectionCard}>
+          <div className={styles.sectionHeader}>
+            <div className={styles.sectionTitle}>{t('opencode.connectivity.results')}</div>
+            <Typography.Text className={styles.sectionHint}>
+              {t('opencode.connectivity.resultsHint')}
+            </Typography.Text>
+          </div>
+
+          <div className={styles.summaryGrid}>
+            {summaryItems.map((item) => (
+              <div key={item.label} className={styles.summaryCard}>
+                <Typography.Text className={styles.summaryLabel}>{item.label}</Typography.Text>
+                <Typography.Text className={styles.summaryValue}>{item.value}</Typography.Text>
+              </div>
+            ))}
+          </div>
+
+          <div className={styles.tableWrap}>
+            <Table
+              dataSource={results}
+              columns={columns}
+              pagination={false}
+              size="small"
+              scroll={{ y: 300 }}
+            />
+          </div>
+          <Typography.Text type="secondary" className={styles.disclaimer}>
+            {t('opencode.connectivity.disclaimer')}
+          </Typography.Text>
+        </section>
+      </div>
 
       <Modal
+        className={styles.detailsModal}
         title={t('opencode.connectivity.detailsTitle', { modelId: selectedResult?.modelId || '' })}
         open={detailsModalOpen}
         onCancel={() => setDetailsModalOpen(false)}
@@ -550,22 +731,24 @@ const ConnectivityTestModal: React.FC<ConnectivityTestModalProps> = ({
         width={800}
       >
         {selectedResult && (
-          <JsonEditor
-            value={{
-              request: {
-                url: selectedResult.requestUrl,
-                headers: selectedResult.requestHeaders,
-                body: selectedResult.requestBody,
-              },
-              response: {
-                headers: selectedResult.responseHeaders,
-                body: selectedResult.responseBody,
-              }
-            }}
-            readOnly={true}
-            height={500}
-            mode="text"
-          />
+          <div className={styles.detailsContent}>
+            <JsonEditor
+              value={{
+                request: {
+                  url: selectedResult.requestUrl,
+                  headers: selectedResult.requestHeaders,
+                  body: selectedResult.requestBody,
+                },
+                response: {
+                  headers: selectedResult.responseHeaders,
+                  body: selectedResult.responseBody,
+                }
+              }}
+              readOnly={true}
+              height={500}
+              mode="text"
+            />
+          </div>
         )}
       </Modal>
     </Modal>

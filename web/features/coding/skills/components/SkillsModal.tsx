@@ -1,6 +1,13 @@
 import React from 'react';
-import { Modal, Button, Space } from 'antd';
-import { PlusOutlined, UserOutlined, ImportOutlined } from '@ant-design/icons';
+import { Modal, Button, Space, Dropdown, MenuProps } from 'antd';
+import {
+  FileTextOutlined,
+  PlusOutlined,
+  TagsOutlined,
+  MoreOutlined,
+  SettingOutlined,
+  CloudDownloadOutlined,
+} from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useSkillsStore } from '../stores/skillsStore';
 import { useSkills } from '../hooks/useSkills';
@@ -11,6 +18,11 @@ import { ImportModal } from './modals/ImportModal';
 import { SkillsSettingsModal } from './modals/SkillsSettingsModal';
 import { DeleteConfirmModal } from './modals/DeleteConfirmModal';
 import { NewToolsModal } from './modals/NewToolsModal';
+import { SkillMetadataModal } from './modals/SkillMetadataModal';
+import { SkillGroupsModal } from './modals/SkillGroupsModal';
+import { SkillInventoryModal } from './modals/SkillInventoryModal';
+import { getSkillGroupOptions } from '../utils/skillGrouping';
+import type { ManagedSkill } from '../types';
 import { refreshTrayMenu } from '@/services/appApi';
 import styles from './SkillsModal.module.less';
 
@@ -31,6 +43,7 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({ open, onClose }) => {
     isSettingsModalOpen,
     setSettingsModalOpen,
     isNewToolsModalOpen,
+    groups,
     loading,
   } = useSkillsStore();
 
@@ -48,15 +61,19 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({ open, onClose }) => {
     skills,
     getAllTools,
     formatRelative,
-    getGithubInfo,
-    getSkillSourceLabel,
+    getRepoInfo,
     refresh,
   } = useSkills();
 
   const allTools = getAllTools();
+  const [metadataSkill, setMetadataSkill] = React.useState<ManagedSkill | null>(null);
+  const [groupsModalOpen, setGroupsModalOpen] = React.useState(false);
+  const [inventoryModalOpen, setInventoryModalOpen] = React.useState(false);
+  const groupOptions = React.useMemo(() => getSkillGroupOptions(groups), [groups]);
 
   const {
     actionLoading,
+    updatingSkillIds,
     deleteSkillId,
     setDeleteSkillId,
     skillToDelete,
@@ -65,7 +82,17 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({ open, onClose }) => {
     handleDelete,
     confirmDelete,
     handleDragEnd,
+    handleSetManagementEnabled,
   } = useSkillActions({ allTools });
+
+  const moreMenuItems: MenuProps['items'] = [
+    {
+      key: 'settings',
+      icon: <SettingOutlined />,
+      label: t('skills.settings'),
+      onClick: () => setSettingsModalOpen(true),
+    },
+  ];
 
   return (
     <>
@@ -87,16 +114,19 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({ open, onClose }) => {
             >
               {t('skills.newSkill')}
             </Button>
-            <Button icon={<ImportOutlined />} onClick={() => setImportModalOpen(true)}>
-              {t('skills.reviewImport')}
+            <Button icon={<CloudDownloadOutlined />} onClick={() => setImportModalOpen(true)}>
+              {t('skills.importExisting')}
+            </Button>
+            <Button icon={<TagsOutlined />} onClick={() => setGroupsModalOpen(true)}>
+              {t('skills.groups.manage')}
+            </Button>
+            <Button icon={<FileTextOutlined />} onClick={() => setInventoryModalOpen(true)}>
+              {t('skills.inventory.button')}
             </Button>
           </Space>
-          <Button
-            icon={<UserOutlined />}
-            onClick={() => setSettingsModalOpen(true)}
-          >
-            {t('skills.settings')}
-          </Button>
+          <Dropdown menu={{ items: moreMenuItems }} trigger={['click']}>
+            <Button icon={<MoreOutlined />} />
+          </Dropdown>
         </div>
 
         <div className={styles.content}>
@@ -104,12 +134,14 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({ open, onClose }) => {
             skills={skills}
             allTools={allTools}
             loading={loading || actionLoading}
-            getGithubInfo={getGithubInfo}
-            getSkillSourceLabel={getSkillSourceLabel}
+            updatingSkillIds={updatingSkillIds}
+            getRepoInfo={getRepoInfo}
             formatRelative={formatRelative}
             onUpdate={handleUpdate}
             onDelete={handleDelete}
             onToggleTool={handleToggleTool}
+            onEditMetadata={setMetadataSkill}
+            onSetManagementEnabled={handleSetManagementEnabled}
             onDragEnd={handleDragEnd}
           />
         </div>
@@ -157,6 +189,30 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({ open, onClose }) => {
 
       <NewToolsModal
         open={isNewToolsModalOpen}
+      />
+
+      <SkillMetadataModal
+        open={!!metadataSkill}
+        skill={metadataSkill}
+        groupOptions={groupOptions}
+        onClose={() => setMetadataSkill(null)}
+        onSuccess={() => {
+          setMetadataSkill(null);
+          refresh();
+        }}
+      />
+
+      <SkillGroupsModal
+        open={groupsModalOpen}
+        groups={groups}
+        onClose={() => setGroupsModalOpen(false)}
+        onSuccess={refresh}
+      />
+
+      <SkillInventoryModal
+        open={inventoryModalOpen}
+        onClose={() => setInventoryModalOpen(false)}
+        onSuccess={refresh}
       />
     </>
   );

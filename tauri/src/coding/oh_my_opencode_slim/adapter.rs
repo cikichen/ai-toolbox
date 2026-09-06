@@ -1,6 +1,9 @@
-use serde_json::{json, Value};
-use super::types::{OhMyOpenCodeSlimConfig, OhMyOpenCodeSlimConfigContent, OhMyOpenCodeSlimGlobalConfig, OhMyOpenCodeSlimGlobalConfigContent};
+use super::types::{
+    OhMyOpenCodeSlimConfig, OhMyOpenCodeSlimConfigContent, OhMyOpenCodeSlimFallbackConfig,
+    OhMyOpenCodeSlimGlobalConfig, OhMyOpenCodeSlimGlobalConfigContent,
+};
 use crate::coding::db_id::db_extract_id;
+use serde_json::{json, Map, Value};
 
 // ============================================================================
 // Helper Functions
@@ -67,6 +70,457 @@ pub fn clean_empty_values(value: &mut Value) {
     }
 }
 
+fn get_u64_compat(value: &Value, snake_key: &str, camel_key: &str) -> Option<u64> {
+    value
+        .get(snake_key)
+        .or_else(|| value.get(camel_key))
+        .and_then(|v| v.as_u64())
+}
+
+pub fn parse_fallback_config_value(value: &Value) -> Option<OhMyOpenCodeSlimFallbackConfig> {
+    let fallback_obj = value.as_object()?;
+    let mut other_fields = std::collections::BTreeMap::new();
+    for (key, raw_value) in fallback_obj {
+        if matches!(
+            key.as_str(),
+            "enabled"
+                | "timeout_ms"
+                | "timeoutMs"
+                | "retry_delay_ms"
+                | "retryDelayMs"
+                | "retry_on_empty"
+                | "retryOnEmpty"
+                | "chains"
+        ) {
+            continue;
+        }
+        other_fields.insert(key.clone(), raw_value.clone());
+    }
+
+    Some(OhMyOpenCodeSlimFallbackConfig {
+        enabled: fallback_obj.get("enabled").and_then(|v| v.as_bool()),
+        timeout_ms: get_u64_compat(value, "timeout_ms", "timeoutMs"),
+        retry_delay_ms: get_u64_compat(value, "retry_delay_ms", "retryDelayMs"),
+        retry_on_empty: value
+            .get("retry_on_empty")
+            .or_else(|| value.get("retryOnEmpty"))
+            .and_then(|v| v.as_bool()),
+        chains: value.get("chains").cloned(),
+        other_fields,
+    })
+}
+
+pub fn strip_legacy_fallback_models_from_agents(value: Value) -> Value {
+    match value {
+        Value::Object(mut agents_obj) => {
+            for agent_value in agents_obj.values_mut() {
+                if let Value::Object(agent_obj) = agent_value {
+                    agent_obj.remove("fallback_models");
+                }
+            }
+            Value::Object(agents_obj)
+        }
+        other => other,
+    }
+}
+
+/// Upstream oh-my-opencode-slim no longer honors council.master* fields.
+/// Strip them (and reserved preset key "master") from runtime council config.
+pub fn normalize_council_config(value: Value) -> Value {
+    let Value::Object(mut council_obj) = value else {
+        return value;
+    };
+
+    council_obj.remove("master");
+    council_obj.remove("master_timeout");
+    council_obj.remove("master_fallback");
+
+    if let Some(Value::Object(presets_obj)) = council_obj.get_mut("presets") {
+        for preset_value in presets_obj.values_mut() {
+            if let Value::Object(preset_obj) = preset_value {
+                preset_obj.remove("master");
+            }
+        }
+    }
+
+    Value::Object(council_obj)
+}
+
+/// Prefer agents.council; if missing, promote legacy council.master into agents.council.
+/// Legacy master_fallback entries are appended to the selected council model chain.
+pub fn migrate_legacy_council_master_into_agents(
+    agents: Option<Value>,
+    council: Option<&Value>,
+) -> Option<Value> {
+    let mut agents_obj = match agents {
+        Some(Value::Object(obj)) => obj,
+        Some(other) => return Some(other),
+        None => Map::new(),
+    };
+
+    let has_council_agent = agents_obj
+        .get("council")
+        .and_then(|value| value.as_object())
+        .map(|obj| !obj.is_empty())
+        .unwrap_or(false);
+
+    if !has_council_agent {
+        if let Some(master) = council
+            .and_then(|value| value.get("master"))
+            .filter(|value| value.is_object())
+        {
+            agents_obj.insert("council".to_string(), master.clone());
+        }
+    }
+
+    let fallback_entries = council
+        .and_then(|value| value.get("master_fallback"))
+        .map(model_entries_from_value)
+        .unwrap_or_default();
+    if !fallback_entries.is_empty() {
+        if let Some(council_agent) = agents_obj.get_mut("council").and_then(Value::as_object_mut) {
+            let mut model_entries = council_agent
+                .get("model")
+                .map(model_entries_from_value)
+                .unwrap_or_default();
+            let original_entry_count = model_entries.len();
+            append_unique_model_entries(&mut model_entries, fallback_entries);
+            if model_entries.len() > original_entry_count {
+                if let Some(model_value) = model_value_from_entries(model_entries) {
+                    council_agent.insert("model".to_string(), model_value);
+                }
+            }
+        }
+    }
+
+    if agents_obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(agents_obj))
+    }
+}
+
+/// Overlay profile agents onto base agents, but keep base agents.council when the
+/// profile does not define one. Global config may store synthesizer only under
+/// otherFields.agents.council after master was removed.
+pub fn merge_agents_preserving_council(base_agents: Option<Value>, overlay_agents: Value) -> Value {
+    let base_council = base_agents
+        .as_ref()
+        .and_then(|value| value.get("council"))
+        .cloned();
+
+    let mut merged = match overlay_agents {
+        Value::Object(obj) => obj,
+        other => return other,
+    };
+
+    let overlay_has_council = merged
+        .get("council")
+        .and_then(|value| value.as_object())
+        .map(|obj| !obj.is_empty())
+        .unwrap_or(false);
+
+    if !overlay_has_council {
+        if let Some(base_council) = base_council {
+            merged.insert("council".to_string(), base_council);
+        }
+    }
+
+    if let Some(base_obj) = base_agents.and_then(|value| match value {
+        Value::Object(obj) => Some(obj),
+        _ => None,
+    }) {
+        for (key, value) in base_obj {
+            if key == "council" {
+                continue;
+            }
+            merged.entry(key).or_insert(value);
+        }
+    }
+
+    Value::Object(merged)
+}
+
+fn model_entry_id(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(model_id) => {
+            let trimmed = model_id.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Value::Object(model_obj) => model_obj
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty()),
+        _ => None,
+    }
+}
+
+fn model_entries_from_value(value: &Value) -> Vec<Value> {
+    match value {
+        Value::String(_) | Value::Object(_) => model_entry_id(value)
+            .map(|_| value.clone())
+            .into_iter()
+            .collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter(|item| model_entry_id(item).is_some())
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn append_unique_model_entries(target: &mut Vec<Value>, entries: Vec<Value>) {
+    for entry in entries {
+        let Some(entry_id) = model_entry_id(&entry).map(str::to_string) else {
+            continue;
+        };
+        let already_exists = target
+            .iter()
+            .any(|existing| model_entry_id(existing) == Some(entry_id.as_str()));
+        if !already_exists {
+            target.push(entry);
+        }
+    }
+}
+
+fn model_value_from_entries(entries: Vec<Value>) -> Option<Value> {
+    match entries.len() {
+        0 => None,
+        1 => entries.into_iter().next(),
+        _ => Some(Value::Array(entries)),
+    }
+}
+
+pub fn merge_fallback_chains_into_agent_model_arrays(
+    agents: Option<Value>,
+    chains: &Value,
+) -> Value {
+    let mut agents_obj = agents
+        .and_then(|agents_value| match agents_value {
+            Value::Object(obj) => Some(obj),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let Some(chains_obj) = chains.as_object() else {
+        return Value::Object(agents_obj);
+    };
+
+    for (agent_name, chain_value) in chains_obj {
+        let fallback_entries = model_entries_from_value(chain_value);
+        if fallback_entries.is_empty() {
+            continue;
+        }
+
+        let agent_value = agents_obj
+            .entry(agent_name.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(agent_obj) = agent_value.as_object_mut() else {
+            continue;
+        };
+
+        let mut model_entries = agent_obj
+            .get("model")
+            .map(model_entries_from_value)
+            .unwrap_or_default();
+        append_unique_model_entries(&mut model_entries, fallback_entries);
+
+        if let Some(model_value) = model_value_from_entries(model_entries) {
+            agent_obj.insert("model".to_string(), model_value);
+        }
+    }
+
+    Value::Object(agents_obj)
+}
+
+fn merge_fallback_chains_preserving_primary(primary: Value, secondary: Value) -> Value {
+    match (primary, secondary) {
+        (Value::Object(mut primary_obj), Value::Object(secondary_obj)) => {
+            for (key, value) in secondary_obj {
+                primary_obj.entry(key).or_insert(value);
+            }
+            Value::Object(primary_obj)
+        }
+        (primary_value, _) => primary_value,
+    }
+}
+
+pub fn merge_fallback_configs(
+    primary: Option<OhMyOpenCodeSlimFallbackConfig>,
+    secondary: Option<OhMyOpenCodeSlimFallbackConfig>,
+) -> Option<OhMyOpenCodeSlimFallbackConfig> {
+    match (primary, secondary) {
+        (None, None) => None,
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (Some(mut primary), Some(secondary)) => {
+            if primary.enabled.is_none() {
+                primary.enabled = secondary.enabled;
+            }
+            if primary.timeout_ms.is_none() {
+                primary.timeout_ms = secondary.timeout_ms;
+            }
+            if primary.retry_delay_ms.is_none() {
+                primary.retry_delay_ms = secondary.retry_delay_ms;
+            }
+            if primary.retry_on_empty.is_none() {
+                primary.retry_on_empty = secondary.retry_on_empty;
+            }
+
+            let primary_chains = primary.chains.take();
+            primary.chains = match (primary_chains, secondary.chains) {
+                (Some(mut primary_chains), Some(secondary_chains)) => {
+                    primary_chains =
+                        merge_fallback_chains_preserving_primary(primary_chains, secondary_chains);
+                    Some(primary_chains)
+                }
+                (Some(primary_chains), None) => Some(primary_chains),
+                (None, Some(secondary_chains)) => Some(secondary_chains),
+                (None, None) => None,
+            };
+
+            for (key, value) in secondary.other_fields {
+                primary.other_fields.entry(key).or_insert(value);
+            }
+
+            Some(primary)
+        }
+    }
+}
+
+pub fn fallback_config_to_value(config: &OhMyOpenCodeSlimFallbackConfig) -> Option<Value> {
+    let mut fallback_obj = Map::new();
+
+    if let Some(enabled) = config.enabled {
+        fallback_obj.insert("enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(timeout_ms) = config.timeout_ms {
+        fallback_obj.insert("timeoutMs".to_string(), Value::Number(timeout_ms.into()));
+    }
+    if let Some(retry_delay_ms) = config.retry_delay_ms {
+        fallback_obj.insert(
+            "retryDelayMs".to_string(),
+            Value::Number(retry_delay_ms.into()),
+        );
+    }
+    if let Some(retry_on_empty) = config.retry_on_empty {
+        fallback_obj.insert("retry_on_empty".to_string(), Value::Bool(retry_on_empty));
+    }
+    if let Some(chains) = &config.chains {
+        fallback_obj.insert("chains".to_string(), chains.clone());
+    }
+    for (key, value) in &config.other_fields {
+        fallback_obj.insert(key.clone(), value.clone());
+    }
+
+    if fallback_obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(fallback_obj))
+    }
+}
+
+pub fn fallback_config_to_runtime_value(config: &OhMyOpenCodeSlimFallbackConfig) -> Option<Value> {
+    let mut fallback_obj = Map::new();
+
+    if let Some(enabled) = config.enabled {
+        fallback_obj.insert("enabled".to_string(), Value::Bool(enabled));
+    }
+    if let Some(timeout_ms) = config.timeout_ms {
+        fallback_obj.insert("timeoutMs".to_string(), Value::Number(timeout_ms.into()));
+    }
+    if let Some(retry_delay_ms) = config.retry_delay_ms {
+        fallback_obj.insert(
+            "retryDelayMs".to_string(),
+            Value::Number(retry_delay_ms.into()),
+        );
+    }
+    if let Some(retry_on_empty) = config.retry_on_empty {
+        fallback_obj.insert("retry_on_empty".to_string(), Value::Bool(retry_on_empty));
+    }
+
+    if fallback_obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(fallback_obj))
+    }
+}
+
+pub fn merge_fallback_values(primary: Option<Value>, secondary: Option<Value>) -> Option<Value> {
+    match (primary, secondary) {
+        (None, None) => None,
+        (Some(primary_value), None) => Some(primary_value),
+        (None, Some(secondary_value)) => Some(secondary_value),
+        (Some(primary_value), Some(secondary_value)) => {
+            match (
+                parse_fallback_config_value(&primary_value),
+                parse_fallback_config_value(&secondary_value),
+            ) {
+                (Some(primary_config), Some(secondary_config)) => {
+                    merge_fallback_configs(Some(primary_config), Some(secondary_config))
+                        .and_then(|merged_config| fallback_config_to_value(&merged_config))
+                }
+                _ => {
+                    if primary_value.is_object() && secondary_value.is_object() {
+                        let mut merged_value = secondary_value;
+                        deep_merge_json(&mut merged_value, &primary_value);
+                        Some(merged_value)
+                    } else {
+                        Some(primary_value)
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn resolve_slim_agents_from_config_value(value: &Value) -> Option<Value> {
+    let root_agents = value
+        .get("agents")
+        .filter(|agents| agents.is_object())
+        .cloned();
+    let presets = value.get("presets").and_then(|presets| presets.as_object());
+    let active_preset_name = value
+        .get("preset")
+        .and_then(|preset| preset.as_str())
+        .map(|preset| preset.trim())
+        .filter(|preset| !preset.is_empty());
+
+    let mut preset_agents = active_preset_name
+        .and_then(|preset| presets.and_then(|presets| presets.get(preset)))
+        .filter(|agents| agents.is_object())
+        .cloned();
+
+    if preset_agents.is_none() {
+        if let Some(presets) = presets {
+            let preset_entries: Vec<Value> = presets
+                .values()
+                .filter(|preset_value| preset_value.is_object())
+                .cloned()
+                .collect();
+            if preset_entries.len() == 1 {
+                preset_agents = preset_entries.into_iter().next();
+            }
+        }
+    }
+
+    match (preset_agents, root_agents) {
+        (Some(mut preset_agents), Some(root_agents)) => {
+            deep_merge_json(&mut preset_agents, &root_agents);
+            Some(preset_agents)
+        }
+        (Some(preset_agents), None) => Some(preset_agents),
+        (None, Some(root_agents)) => Some(root_agents),
+        (None, None) => None,
+    }
+}
+
 // ============================================================================
 // Adapter Functions
 // ============================================================================
@@ -75,6 +529,29 @@ pub fn clean_empty_values(value: &mut Value) {
 pub fn from_db_value(value: Value) -> OhMyOpenCodeSlimConfig {
     let is_applied = get_bool_compat(&value, "is_applied", "isApplied", false);
     let is_disabled = get_bool_compat(&value, "is_disabled", "isDisabled", false);
+    let raw_other_fields = value
+        .get("other_fields")
+        .or_else(|| value.get("otherFields"))
+        .cloned();
+    let fallback_from_value = value.get("fallback").and_then(parse_fallback_config_value);
+    let fallback_from_other_fields = raw_other_fields
+        .as_ref()
+        .and_then(|other| other.get("fallback"))
+        .and_then(parse_fallback_config_value);
+    let legacy_council = raw_other_fields
+        .as_ref()
+        .and_then(|other| other.get("council"))
+        .cloned();
+    let cleaned_other_fields = raw_other_fields.and_then(|mut other| {
+        if let Some(map) = other.as_object_mut() {
+            map.remove("council");
+            map.remove("fallback");
+            if map.is_empty() {
+                return None;
+            }
+        }
+        Some(other)
+    });
     let sort_index = value
         .get("sort_index")
         .or_else(|| value.get("sortIndex"))
@@ -87,11 +564,11 @@ pub fn from_db_value(value: Value) -> OhMyOpenCodeSlimConfig {
         is_disabled,
         agents: value
             .get("agents")
-            .cloned(),
-        other_fields: value
-            .get("other_fields")
-            .or_else(|| value.get("otherFields"))
-            .cloned(),
+            .cloned()
+            .map(strip_legacy_fallback_models_from_agents),
+        council: value.get("council").cloned().or(legacy_council),
+        fallback: merge_fallback_configs(fallback_from_value, fallback_from_other_fields),
+        other_fields: cleaned_other_fields,
         sort_index,
         created_at: get_opt_str_compat(&value, "created_at", "createdAt"),
         updated_at: get_opt_str_compat(&value, "updated_at", "updatedAt"),
@@ -101,7 +578,10 @@ pub fn from_db_value(value: Value) -> OhMyOpenCodeSlimConfig {
 /// Convert OhMyOpenCodeSlimConfigContent to database Value
 pub fn to_db_value(content: &OhMyOpenCodeSlimConfigContent) -> Value {
     serde_json::to_value(content).unwrap_or_else(|e| {
-        eprintln!("Failed to serialize oh-my-opencode-slim config content: {}", e);
+        eprintln!(
+            "Failed to serialize oh-my-opencode-slim config content: {}",
+            e
+        );
         json!({})
     })
 }
@@ -141,6 +621,24 @@ fn safe_to_string_array(value: &Value) -> Option<Vec<String>> {
 
 /// Convert database Value to OhMyOpenCodeSlimGlobalConfig with fault tolerance
 pub fn global_config_from_db_value(value: Value) -> OhMyOpenCodeSlimGlobalConfig {
+    let raw_other_fields = value
+        .get("other_fields")
+        .or_else(|| value.get("otherFields"))
+        .cloned();
+    let legacy_council = raw_other_fields
+        .as_ref()
+        .and_then(|other| other.get("council"))
+        .cloned();
+    let cleaned_other_fields = raw_other_fields.and_then(|mut other| {
+        if let Some(map) = other.as_object_mut() {
+            map.remove("council");
+            if map.is_empty() {
+                return None;
+            }
+        }
+        Some(other)
+    });
+
     OhMyOpenCodeSlimGlobalConfig {
         id: db_extract_id(&value),
         sisyphus_agent: value
@@ -160,13 +658,9 @@ pub fn global_config_from_db_value(value: Value) -> OhMyOpenCodeSlimGlobalConfig
             .or_else(|| value.get("disabledHooks"))
             .and_then(|v| safe_to_string_array(v)),
         lsp: value.get("lsp").cloned(),
-        experimental: value
-            .get("experimental")
-            .cloned(),
-        other_fields: value
-            .get("other_fields")
-            .or_else(|| value.get("otherFields"))
-            .cloned(),
+        experimental: value.get("experimental").cloned(),
+        council: value.get("council").cloned().or(legacy_council),
+        other_fields: cleaned_other_fields,
         updated_at: get_opt_str_compat(&value, "updated_at", "updatedAt"),
     }
 }
@@ -174,7 +668,157 @@ pub fn global_config_from_db_value(value: Value) -> OhMyOpenCodeSlimGlobalConfig
 /// Convert OhMyOpenCodeSlimGlobalConfigContent to database Value
 pub fn global_config_to_db_value(content: &OhMyOpenCodeSlimGlobalConfigContent) -> Value {
     serde_json::to_value(content).unwrap_or_else(|e| {
-        eprintln!("Failed to serialize oh-my-opencode-slim global config content: {}", e);
+        eprintln!(
+            "Failed to serialize oh-my-opencode-slim global config content: {}",
+            e
+        );
         json!({})
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_council_config_strips_master_fields_and_preset_master() {
+        let council = json!({
+            "master": { "model": "openai/legacy-master" },
+            "master_timeout": 300000,
+            "master_fallback": ["openai/fallback"],
+            "timeout": 180000,
+            "presets": {
+                "default": {
+                    "master": { "model": "openai/preset-master" },
+                    "alpha": { "model": "openai/gpt-5.6" }
+                }
+            }
+        });
+
+        let normalized = normalize_council_config(council);
+        assert!(normalized.get("master").is_none());
+        assert!(normalized.get("master_timeout").is_none());
+        assert!(normalized.get("master_fallback").is_none());
+        assert_eq!(normalized.get("timeout"), Some(&json!(180000)));
+        assert!(normalized.pointer("/presets/default/master").is_none());
+        assert_eq!(
+            normalized.pointer("/presets/default/alpha/model"),
+            Some(&json!("openai/gpt-5.6"))
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_master_requires_raw_council_before_normalize() {
+        let agents = None;
+        let raw_council = json!({
+            "master": {
+                "model": "openai/legacy-master",
+                "variant": "high",
+                "prompt": "synthesize"
+            },
+            "master_fallback": [
+                "openai/fallback-a",
+                { "id": "openai/fallback-b", "variant": "medium" },
+                "openai/legacy-master"
+            ],
+            "presets": {
+                "default": {
+                    "alpha": { "model": "openai/gpt-5.6" }
+                }
+            }
+        });
+
+        // Apply order must be: migrate from raw council, then normalize.
+        let migrated =
+            migrate_legacy_council_master_into_agents(agents, Some(&raw_council)).unwrap();
+        assert_eq!(
+            migrated.pointer("/council/model"),
+            Some(&json!([
+                "openai/legacy-master",
+                "openai/fallback-a",
+                { "id": "openai/fallback-b", "variant": "medium" }
+            ]))
+        );
+        assert_eq!(migrated.pointer("/council/variant"), Some(&json!("high")));
+
+        let normalized = normalize_council_config(raw_council);
+        assert!(normalized.get("master").is_none());
+        // Migrating after normalize would fail to find master.
+        let too_late =
+            migrate_legacy_council_master_into_agents(None, Some(&normalized)).unwrap_or(json!({}));
+        assert!(too_late.get("council").is_none());
+    }
+
+    #[test]
+    fn migrate_legacy_master_does_not_override_existing_agents_council() {
+        let agents = json!({
+            "council": {
+                "model": "openai/preferred",
+                "temperature": 0.1
+            },
+            "orchestrator": { "model": "openai/gpt-5.6" }
+        });
+        let raw_council = json!({
+            "master": { "model": "openai/legacy-master" },
+            "master_fallback": [
+                "openai/fallback",
+                { "id": "openai/object-fallback", "variant": "high" }
+            ]
+        });
+
+        let migrated =
+            migrate_legacy_council_master_into_agents(Some(agents), Some(&raw_council)).unwrap();
+        assert_eq!(
+            migrated.pointer("/council/model"),
+            Some(&json!([
+                "openai/preferred",
+                "openai/fallback",
+                { "id": "openai/object-fallback", "variant": "high" }
+            ]))
+        );
+        assert_eq!(migrated.pointer("/council/temperature"), Some(&json!(0.1)));
+    }
+
+    #[test]
+    fn merge_agents_preserving_council_keeps_base_council_when_profile_omits_it() {
+        let base = json!({
+            "council": { "model": "openai/from-global" },
+            "explorer": { "model": "openai/explorer" }
+        });
+        let overlay = json!({
+            "orchestrator": { "model": "openai/profile" }
+        });
+
+        let merged = merge_agents_preserving_council(Some(base), overlay);
+        assert_eq!(
+            merged.pointer("/council/model"),
+            Some(&json!("openai/from-global"))
+        );
+        assert_eq!(
+            merged.pointer("/orchestrator/model"),
+            Some(&json!("openai/profile"))
+        );
+        // Base non-council agents fill only missing keys; profile wins for shared keys.
+        assert_eq!(
+            merged.pointer("/explorer/model"),
+            Some(&json!("openai/explorer"))
+        );
+    }
+
+    #[test]
+    fn merge_agents_preserving_council_prefers_profile_council() {
+        let base = json!({
+            "council": { "model": "openai/from-global" }
+        });
+        let overlay = json!({
+            "council": { "model": "openai/from-profile", "variant": "high" }
+        });
+
+        let merged = merge_agents_preserving_council(Some(base), overlay);
+        assert_eq!(
+            merged.pointer("/council/model"),
+            Some(&json!("openai/from-profile"))
+        );
+        assert_eq!(merged.pointer("/council/variant"), Some(&json!("high")));
+    }
 }

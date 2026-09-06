@@ -1,9 +1,12 @@
-import React, { useRef, useCallback, useEffect, useState } from 'react';
+import { useRef, useCallback, useEffect, useState } from 'react';
+import type { FC, MouseEvent as ReactMouseEvent } from 'react';
+import { useTranslation } from 'react-i18next';
 import MonacoEditor from 'react-monaco-editor';
 import type { editor } from 'monaco-editor';
-import * as monaco from 'monaco-editor';
+import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
 import { parse as parseToml } from 'smol-toml';
 import { useThemeStore } from '@/stores/themeStore';
+import { INVALID_UNCLOSED_DOUBLE_QUOTE_STRING_PATTERN } from './invalidDoubleQuoteStringPattern';
 
 export interface TomlEditorProps {
   /** TOML 内容值 */
@@ -107,7 +110,7 @@ const registerTomlLanguage = () => {
         [/\./, 'delimiter'],
         [/'[^']*$/, `${tokenClass}.invalid`],
         [/'/, { token: singleQuoteClass, next: `@${singleQuotedState}` }],
-        [/"(\\.|[^"])*$/, `${tokenClass}.invalid`],
+        [INVALID_UNCLOSED_DOUBLE_QUOTE_STRING_PATTERN, `${tokenClass}.invalid`],
         [/"/, { token: doubleQuoteClass, next: `@${doubleQuotedState}` }],
         [/./, '@rematch', '@pop'],
       ],
@@ -259,7 +262,7 @@ const registerTomlLanguage = () => {
       'value.cases': [
         // 多行双引号字符串
         [/"""/, { token: 'string.multi', switchTo: '@value.string.multi.doubleQuoted' }],
-        [/"(\\.|[^"])*$/, 'string.invalid'],
+        [INVALID_UNCLOSED_DOUBLE_QUOTE_STRING_PATTERN, 'string.invalid'],
         [/"/, { token: 'string', switchTo: '@value.string.doubleQuoted' }],
 
         // 多行单引号字符串
@@ -329,7 +332,7 @@ const validateToml = (content: string): { line: number; column: number; message:
 /**
  * 基于 Monaco Editor 的 TOML 编辑器组件
  */
-const TomlEditor: React.FC<TomlEditorProps> = ({
+const TomlEditor: FC<TomlEditorProps> = ({
   value,
   onChange,
   onBlur,
@@ -341,6 +344,7 @@ const TomlEditor: React.FC<TomlEditorProps> = ({
   maxHeight = 800,
   resizable = true,
 }) => {
+  const { t } = useTranslation();
   const { resolvedTheme } = useThemeStore();
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const validateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -359,7 +363,7 @@ const TomlEditor: React.FC<TomlEditorProps> = ({
   const startYRef = useRef(0);
   const startHeightRef = useRef(0);
 
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+  const handleMouseDown = useCallback((e: ReactMouseEvent) => {
     e.preventDefault();
     isResizingRef.current = true;
     startYRef.current = e.clientY;
@@ -492,7 +496,8 @@ const TomlEditor: React.FC<TomlEditorProps> = ({
     lineDecorationsWidth: LINE_DECORATIONS_WIDTH,
   };
 
-  const actualHeight = resizable ? currentHeight : (typeof height === 'number' ? height : parseInt(height, 10) || 300);
+  // When not resizable, support CSS height strings like "calc(...)" (same behavior as JsonEditor)
+  const actualHeight = resizable ? currentHeight : height;
 
   // 判断是否显示 placeholder
   const showPlaceholder = placeholder && value.trim() === '';
@@ -537,9 +542,14 @@ const TomlEditor: React.FC<TomlEditorProps> = ({
         )}
       </div>
       {resizable && (
-        <div
+        <button
+          type="button"
+          aria-label={t('common.resizeEditor')}
           onMouseDown={handleMouseDown}
           style={{
+            border: 'none',
+            background: 'transparent',
+            padding: 0,
             position: 'absolute',
             bottom: 0,
             right: 0,
@@ -556,9 +566,10 @@ const TomlEditor: React.FC<TomlEditorProps> = ({
           onMouseLeave={(e) => { e.currentTarget.style.opacity = '0.5'; }}
         >
           <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
+            <title>{t('common.resizeEditor')}</title>
             <path d="M8 2L2 8M8 5L5 8M8 8L8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
-        </div>
+        </button>
       )}
     </div>
   );

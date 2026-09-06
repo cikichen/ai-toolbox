@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::coding::runtime_location::WslDirectModuleStatus;
+
 // ============================================================================
 // File Mapping Types
 // ============================================================================
@@ -10,12 +12,40 @@ use serde::{Deserialize, Serialize};
 pub struct FileMapping {
     pub id: String,
     pub name: String,
-    pub module: String, // "opencode" | "claude" | "codex" | "openclaw"
+    pub module: String, // "opencode" | "claude" | "codex" | "grok" | "kimi" | "openclaw" | "geminicli" | ...
     pub windows_path: String,
     pub wsl_path: String,
     pub enabled: bool,
     pub is_pattern: bool,
     pub is_directory: bool,
+    #[serde(default)]
+    pub directory_excludes: Vec<String>,
+    #[serde(default)]
+    pub cleanup_paths: Vec<String>,
+}
+
+/// Normalize a list of directory exclude names, matching the SSH variant.
+///
+/// Each exclude must be a single path segment (no `/` or `\`); empty entries,
+/// absolute-looking entries, and duplicates are dropped.
+pub fn normalize_directory_excludes(excludes: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut normalized = Vec::new();
+
+    for exclude in excludes {
+        let name = exclude
+            .trim()
+            .trim_matches(|c| c == '/' || c == '\\')
+            .trim();
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            normalized.push(name.to_string());
+        }
+    }
+
+    normalized
 }
 
 // ============================================================================
@@ -38,6 +68,8 @@ pub struct WSLSyncConfig {
     pub last_sync_time: Option<String>,
     pub last_sync_status: String, // "success" | "error" | "never"
     pub last_sync_error: Option<String>,
+    #[serde(default)]
+    pub module_statuses: Vec<WslDirectModuleStatus>,
 }
 
 impl Default for WSLSyncConfig {
@@ -51,6 +83,7 @@ impl Default for WSLSyncConfig {
             last_sync_time: None,
             last_sync_status: "never".to_string(),
             last_sync_error: None,
+            module_statuses: vec![],
         }
     }
 }
@@ -98,6 +131,8 @@ pub struct WSLStatusResult {
     pub last_sync_time: Option<String>,
     pub last_sync_status: String,
     pub last_sync_error: Option<String>,
+    #[serde(default)]
+    pub module_statuses: Vec<WslDirectModuleStatus>,
 }
 
 // ============================================================================
@@ -118,4 +153,7 @@ pub struct SyncProgress {
     pub total: u32,
     /// Overall progress message
     pub message: String,
+    /// Current file being uploaded within the current item, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_file: Option<String>,
 }

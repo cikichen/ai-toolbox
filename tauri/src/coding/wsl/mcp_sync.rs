@@ -2,63 +2,51 @@
 //!
 //! Syncs MCP server configurations to WSL for all MCP-enabled tools:
 //! - Claude Code: directly edit ~/.claude.json mcpServers field
-//! - OpenCode/Codex: sync config files via file mappings
+//! - OpenCode/Codex/Gemini CLI/Pi: sync config files via file mappings
 
 use log::info;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
 use super::adapter;
-use super::commands::resolve_dynamic_paths;
-use super::sync::{read_wsl_file, sync_mappings, write_wsl_file};
+use super::commands::resolve_dynamic_paths_with_db;
+use super::sync::{read_wsl_file, sync_mappings, windows_to_wsl_path, write_wsl_file};
 use super::types::{FileMapping, SyncProgress, WSLSyncConfig};
 use crate::coding::mcp::command_normalize;
 use crate::coding::mcp::mcp_store;
-use crate::DbState;
+use crate::coding::runtime_location;
+use crate::db::helpers::{db_get, db_list};
+use crate::db::schema::DbTable;
+use crate::SqliteDbState;
 
 /// Read WSL sync config directly from database (without tauri::State wrapper)
-async fn get_wsl_config(state: &DbState) -> Result<WSLSyncConfig, String> {
-    let db = state.0.lock().await;
-
-    let config_result: Result<Vec<serde_json::Value>, _> = db
-        .query("SELECT *, type::string(id) as id FROM wsl_sync_config:`config` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query WSL config: {}", e))?
-        .take(0);
-
-    match config_result {
-        Ok(records) => {
-            if let Some(record) = records.first() {
-                Ok(adapter::config_from_db_value(record.clone(), vec![]))
-            } else {
-                Ok(WSLSyncConfig::default())
-            }
-        }
-        Err(_) => Ok(WSLSyncConfig::default()),
-    }
+async fn get_wsl_config(state: &SqliteDbState) -> Result<WSLSyncConfig, String> {
+    let db = state.db();
+    let record = db.with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "config"))?;
+    Ok(record
+        .map(|value| adapter::config_from_db_value(value, vec![]))
+        .unwrap_or_default())
 }
 
 /// Get file mappings from database
-async fn get_file_mappings(state: &DbState) -> Result<Vec<FileMapping>, String> {
-    let db = state.0.lock().await;
-
-    let mappings_result: Result<Vec<serde_json::Value>, _> = db
-        .query("SELECT *, type::string(id) as id FROM wsl_file_mapping ORDER BY module, name")
-        .await
-        .map_err(|e| format!("Failed to query file mappings: {}", e))?
-        .take(0);
-
-    match mappings_result {
-        Ok(records) => Ok(records
-            .into_iter()
-            .map(adapter::mapping_from_db_value)
-            .collect()),
-        Err(_) => Ok(vec![]),
-    }
+async fn get_file_mappings(state: &SqliteDbState) -> Result<Vec<FileMapping>, String> {
+    let db = state.db();
+    let mut records = db.with_conn(|conn| db_list(conn, DbTable::WslFileMapping, None))?;
+    records.sort_by(|a, b| {
+        let module_a = a.get("module").and_then(Value::as_str).unwrap_or_default();
+        let module_b = b.get("module").and_then(Value::as_str).unwrap_or_default();
+        let name_a = a.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name_b = b.get("name").and_then(Value::as_str).unwrap_or_default();
+        module_a.cmp(module_b).then_with(|| name_a.cmp(name_b))
+    });
+    Ok(records
+        .into_iter()
+        .map(adapter::mapping_from_db_value)
+        .collect())
 }
 
 /// Sync MCP configuration to WSL (called on mcp-changed event)
-pub async fn sync_mcp_to_wsl(state: &DbState, app: AppHandle) -> Result<(), String> {
+pub async fn sync_mcp_to_wsl(state: &SqliteDbState, app: AppHandle) -> Result<(), String> {
     let config = get_wsl_config(state).await?;
 
     if !config.enabled || !config.sync_mcp {
@@ -70,25 +58,54 @@ pub async fn sync_mcp_to_wsl(state: &DbState, app: AppHandle) -> Result<(), Stri
         Ok(d) => d,
         Err(e) => {
             log::warn!("WSL MCP sync skipped: {}", e);
-            let _ = app.emit(
-                "wsl-sync-warning",
-                format!("WSL MCP 同步已跳过：{}", e),
-            );
+            let _ = app.emit("wsl-sync-warning", format!("WSL MCP 同步已跳过：{}", e));
             return Ok(());
         }
     };
+    let direct_statuses = runtime_location::get_wsl_direct_status_map_async(&state.db()).await?;
+    let skip_claude = direct_statuses
+        .iter()
+        .any(|status| status.module == "claude" && status.is_wsl_direct);
+    let skip_opencode = direct_statuses
+        .iter()
+        .any(|status| status.module == "opencode" && status.is_wsl_direct);
+    let skip_codex = direct_statuses
+        .iter()
+        .any(|status| status.module == "codex" && status.is_wsl_direct);
+    let skip_grok = direct_statuses
+        .iter()
+        .any(|status| status.module == "grok" && status.is_wsl_direct);
+    let skip_geminicli = direct_statuses
+        .iter()
+        .any(|status| status.module == "geminicli" && status.is_wsl_direct);
+    let skip_pi = direct_statuses
+        .iter()
+        .any(|status| status.module == "pi" && status.is_wsl_direct);
+    let skip_omp = direct_statuses
+        .iter()
+        .any(|status| status.module == "oh_my_pi" && status.is_wsl_direct);
+    let skip_hermes = direct_statuses
+        .iter()
+        .any(|status| status.module == "hermes" && status.is_wsl_direct);
+    let skip_dsh = direct_statuses
+        .iter()
+        .any(|status| status.module == "dsh" && status.is_wsl_direct);
 
     // 收集所有错误
     let mut all_errors: Vec<String> = vec![];
 
     // Emit progress for MCP sync
-    let _ = app.emit("wsl-sync-progress", SyncProgress {
-        phase: "mcp".to_string(),
-        current_item: "Claude Code MCP".to_string(),
-        current: 1,
-        total: 2,
-        message: "MCP 同步: Claude Code...".to_string(),
-    });
+    let _ = app.emit(
+        "wsl-sync-progress",
+        SyncProgress {
+            phase: "mcp".to_string(),
+            current_item: "Claude Code MCP".to_string(),
+            current: 1,
+            total: 2,
+            message: "MCP 同步: Claude Code...".to_string(),
+            current_file: None,
+        },
+    );
 
     // 1. Claude Code: directly modify WSL ~/.claude.json
     let servers = mcp_store::get_mcp_servers(state).await?;
@@ -97,43 +114,67 @@ pub async fn sync_mcp_to_wsl(state: &DbState, app: AppHandle) -> Result<(), Stri
         .filter(|s| s.enabled_tools.contains(&"claude_code".to_string()))
         .collect();
 
-    if let Err(e) = sync_mcp_to_wsl_claude(&distro, &claude_servers) {
-        log::warn!("Skipped claude.json MCP sync: {}", e);
-        all_errors.push(format!("Claude Code: {}", e));
-        let _ = app.emit(
-            "wsl-sync-warning",
-            format!("WSL ~/.claude.json 同步已跳过：文件解析失败，请检查该文件格式是否正确。({})", e),
-        );
+    if !skip_claude {
+        if let Err(e) = sync_mcp_to_wsl_claude(state, &distro, &claude_servers).await {
+            log::warn!("Skipped claude.json MCP sync: {}", e);
+            all_errors.push(format!("Claude Code: {}", e));
+            let _ = app.emit(
+                "wsl-sync-warning",
+                format!(
+                    "WSL ~/.claude.json 同步已跳过：文件解析失败，请检查该文件格式是否正确。({})",
+                    e
+                ),
+            );
+        }
     }
 
-    // Emit progress for OpenCode/Codex
-    let _ = app.emit("wsl-sync-progress", SyncProgress {
-        phase: "mcp".to_string(),
-        current_item: "OpenCode/Codex MCP".to_string(),
-        current: 2,
-        total: 2,
-        message: "MCP 同步: OpenCode/Codex...".to_string(),
-    });
+    // Emit progress for OpenCode/Codex/Grok/Gemini CLI/Pi
+    let _ = app.emit(
+        "wsl-sync-progress",
+        SyncProgress {
+            phase: "mcp".to_string(),
+            current_item: "OpenCode/Codex/Grok/Gemini CLI/Pi MCP".to_string(),
+            current: 2,
+            total: 2,
+            message: "MCP 同步: OpenCode/Codex/Grok/Gemini CLI/Pi...".to_string(),
+            current_file: None,
+        },
+    );
 
-    // 2. OpenCode/Codex: sync config files via file mappings
+    // 2. OpenCode/Codex/Grok/Gemini CLI/Pi: sync config files via file mappings
     match get_file_mappings(state).await {
         Ok(file_mappings) => {
-            let mcp_modules = ["opencode", "codex"];
             let mcp_mappings: Vec<_> = file_mappings
                 .into_iter()
-                .filter(|m| m.enabled && mcp_modules.contains(&m.module.as_str()))
+                .filter(|m| m.enabled && is_mapped_mcp_config_file(&m.id))
+                .filter(|m| {
+                    !should_skip_mapped_mcp_config_file_for_wsl_direct(
+                        &m.module,
+                        skip_opencode,
+                        skip_codex,
+                        skip_grok,
+                        skip_geminicli,
+                        skip_pi,
+                        skip_omp,
+                        skip_hermes,
+                        skip_dsh,
+                    )
+                })
                 .collect();
 
             if !mcp_mappings.is_empty() {
-                let resolved = resolve_dynamic_paths(mcp_mappings);
+                let resolved = resolve_dynamic_paths_with_db(&state.db(), mcp_mappings).await;
                 let result = sync_mappings(&resolved, &distro, None);
                 if !result.errors.is_empty() {
                     let msg = result.errors.join("; ");
                     log::warn!("MCP file mapping sync errors: {}", msg);
-                    all_errors.push(format!("OpenCode/Codex: {}", msg));
+                    all_errors.push(format!("OpenCode/Codex/Grok/Gemini CLI/Pi: {}", msg));
                     let _ = app.emit(
                         "wsl-sync-warning",
-                        format!("OpenCode/Codex 配置同步部分失败：{}", msg),
+                        format!(
+                            "OpenCode/Codex/Grok/Gemini CLI/Pi 配置同步部分失败：{}",
+                            msg
+                        ),
                     );
                 }
 
@@ -145,8 +186,15 @@ pub async fn sync_mcp_to_wsl(state: &DbState, app: AppHandle) -> Result<(), Stri
                     .filter_map(|s| s.split(" -> ").nth(1).map(|p| p.to_string()))
                     .collect();
                 for mapping in &resolved {
-                    if mapping.enabled && is_mcp_config_file(&mapping.id) && synced_paths.contains(&mapping.wsl_path) {
-                        if let Err(e) = strip_cmd_c_from_wsl_mcp_file(&distro, &mapping.wsl_path, &mapping.module) {
+                    if mapping.enabled
+                        && is_mapped_mcp_config_file(&mapping.id)
+                        && synced_paths.contains(&mapping.wsl_path)
+                    {
+                        if let Err(e) = strip_cmd_c_from_wsl_mcp_file(
+                            &distro,
+                            &mapping.wsl_path,
+                            &mapping.module,
+                        ) {
                             log::warn!("Failed to strip cmd /c from {}: {}", mapping.wsl_path, e);
                         }
                     }
@@ -154,11 +202,11 @@ pub async fn sync_mcp_to_wsl(state: &DbState, app: AppHandle) -> Result<(), Stri
             }
         }
         Err(e) => {
-            log::warn!("Skipped OpenCode/Codex MCP sync: {}", e);
-            all_errors.push(format!("OpenCode/Codex: {}", e));
+            log::warn!("Skipped OpenCode/Codex/Grok/Gemini CLI/Pi MCP sync: {}", e);
+            all_errors.push(format!("OpenCode/Codex/Grok/Gemini CLI/Pi: {}", e));
             let _ = app.emit(
                 "wsl-sync-warning",
-                format!("OpenCode/Codex MCP 同步已跳过：{}", e),
+                format!("OpenCode/Codex/Grok/Gemini CLI/Pi MCP 同步已跳过：{}", e),
             );
         }
     }
@@ -185,14 +233,16 @@ pub async fn sync_mcp_to_wsl(state: &DbState, app: AppHandle) -> Result<(), Stri
 }
 
 /// Sync MCP servers to WSL Claude Code ~/.claude.json
-fn sync_mcp_to_wsl_claude(
+async fn sync_mcp_to_wsl_claude(
+    state: &SqliteDbState,
     distro: &str,
     servers: &[&crate::coding::mcp::types::McpServer],
 ) -> Result<(), String> {
-    let wsl_config_path = "~/.claude.json";
+    let db = state.db();
+    let wsl_config_path = runtime_location::get_claude_wsl_claude_json_path_async(&db).await;
 
     // 1. Read existing WSL ~/.claude.json
-    let existing_content = read_wsl_file(distro, wsl_config_path)?;
+    let existing_content = read_wsl_file(distro, wsl_config_path.as_str())?;
 
     // 2. Parse JSON, update mcpServers field
     let mut config: Value = if existing_content.trim().is_empty() {
@@ -218,7 +268,7 @@ fn sync_mcp_to_wsl_claude(
     // 5. Write back to WSL
     let content = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    write_wsl_file(distro, wsl_config_path, &content)?;
+    write_wsl_file(distro, wsl_config_path.as_str(), &content)?;
 
     Ok(())
 }
@@ -248,18 +298,31 @@ fn build_standard_server_config(server: &crate::coding::mcp::types::McpServer) -
             });
 
             if let Some(env_val) = env {
-                if env_val.is_object()
-                    && !env_val
-                        .as_object()
-                        .map(|o| o.is_empty())
-                        .unwrap_or(true)
+                if env_val.is_object() && !env_val.as_object().map(|o| o.is_empty()).unwrap_or(true)
                 {
                     result["env"] = env_val;
                 }
             }
 
-            // Safeguard: ensure no cmd /c for WSL (database should already be normalized)
-            command_normalize::unwrap_cmd_c(&result)
+            // 1. Safeguard: ensure no cmd /c for WSL (database should already be
+            //    normalized). This may unwrap `cmd /c <exe>` into `<exe>`.
+            let mut result = command_normalize::unwrap_cmd_c(&result);
+
+            // 2. WSL can run Windows exes via /mnt; convert the (now real) command's
+            //    Windows full path (or ~/%APPDATA%, expanded on the host first) to
+            //    /mnt/c/... so the WSL-side CLI can spawn it. Must run AFTER the
+            //    cmd /c unwrap, otherwise the real exe buried in args is missed.
+            //    Bare command names (npx, node) and already-Linux paths pass through.
+            if let Some(cmd) = result.get("command").and_then(|v| v.as_str()) {
+                let mapped = windows_to_wsl_path(cmd).unwrap_or_else(|_| cmd.to_string());
+                if mapped != cmd {
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("command".to_string(), Value::String(mapped));
+                    }
+                }
+            }
+
+            result
         }
         "http" | "sse" => {
             let url = server
@@ -291,13 +354,42 @@ fn build_standard_server_config(server: &crate::coding::mcp::types::McpServer) -
     }
 }
 
-/// Check if a file mapping ID corresponds to a file that contains MCP server configurations.
-/// Only these files need cmd /c stripping; auth files, slim configs, etc. do not.
-fn is_mcp_config_file(mapping_id: &str) -> bool {
+/// Check whether a file mapping is part of the MCP-specific sync path.
+/// Claude Code is handled by direct ~/.claude.json writes, not file mappings.
+fn is_mapped_mcp_config_file(mapping_id: &str) -> bool {
     matches!(
         mapping_id,
-        "opencode-main" | "opencode-oh-my" | "codex-config"
+        "opencode-main"
+            | "opencode-oh-my"
+            | "codex-config"
+            | "grok-config"
+            | "geminicli-settings"
+            | "pi-mcp"
+            | "omp-mcp"
+            | "hermes-config"
+            | "dsh-mcp"
     )
+}
+
+fn should_skip_mapped_mcp_config_file_for_wsl_direct(
+    module: &str,
+    skip_opencode: bool,
+    skip_codex: bool,
+    skip_grok: bool,
+    skip_geminicli: bool,
+    skip_pi: bool,
+    skip_omp: bool,
+    skip_hermes: bool,
+    skip_dsh: bool,
+) -> bool {
+    (module == "opencode" && skip_opencode)
+        || (module == "codex" && skip_codex)
+        || (module == "grok" && skip_grok)
+        || (module == "geminicli" && skip_geminicli)
+        || (module == "pi" && skip_pi)
+        || (module == "oh_my_pi" && skip_omp)
+        || (module == "hermes" && skip_hermes)
+        || (module == "dsh" && skip_dsh)
 }
 
 /// Strip cmd /c from WSL MCP config file after sync.
@@ -309,17 +401,35 @@ fn strip_cmd_c_from_wsl_mcp_file(distro: &str, wsl_path: &str, module: &str) -> 
         return Ok(());
     }
 
+    // Convert Windows full-path (or ~/%APPDATA%, expanded on host) stdio
+    // commands to /mnt/c/... so WSL can spawn the Windows exe. Bare command
+    // names and Linux paths pass through unchanged.
+    let to_wsl = |s: &str| windows_to_wsl_path(s).unwrap_or_else(|_| s.to_string());
+
     let processed = match module {
-        "opencode" => command_normalize::process_opencode_json(&content, false)?,
+        "opencode" => command_normalize::process_opencode_json(&content, false, &to_wsl)?,
         "codex" => {
             // Determine parser by file extension: only .toml files use TOML parser
             if wsl_path.ends_with(".toml") {
-                command_normalize::process_codex_toml(&content, false)?
+                command_normalize::process_codex_toml(&content, false, &to_wsl)?
             } else {
                 // JSON files in codex module (e.g. auth.json) should not be processed
                 return Ok(());
             }
         }
+        // Grok carries MCP servers in config.toml with the same mcp_servers /
+        // stdio structure as Codex, but never wraps cmd /c. Reuse the Codex TOML
+        // parser: the cmd /c strip is a no-op for Grok, and the path transform
+        // converts any Windows full-path command to /mnt for the WSL target.
+        "grok" => command_normalize::process_codex_toml(&content, false, &to_wsl)?,
+        "geminicli" | "pi" | "oh_my_pi" => {
+            command_normalize::process_claude_json(&content, false, &to_wsl)?
+        }
+        // Hermes mcp_servers lives in YAML; dsh uses the cordis patch DSL
+        // (also YAML). Both carry `cmd /c` on Windows and need it stripped
+        // for the Linux-side WSL target.
+        "hermes" => command_normalize::process_hermes_yaml_mcp_servers(&content, &to_wsl)?,
+        "dsh" => command_normalize::process_cordis_patch_yaml(&content, &to_wsl)?,
         _ => return Ok(()),
     };
 
@@ -330,4 +440,115 @@ fn strip_cmd_c_from_wsl_mcp_file(distro: &str, wsl_path: &str, module: &str) -> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_standard_server_config, is_mapped_mcp_config_file,
+        should_skip_mapped_mcp_config_file_for_wsl_direct,
+    };
+
+    #[test]
+    fn recognizes_gemini_cli_settings_as_mcp_config_file() {
+        assert!(is_mapped_mcp_config_file("geminicli-settings"));
+    }
+
+    #[test]
+    fn recognizes_pi_mcp_as_mcp_config_file() {
+        assert!(is_mapped_mcp_config_file("pi-mcp"));
+    }
+
+    #[test]
+    fn excludes_gemini_cli_non_mcp_file_mappings() {
+        assert!(!is_mapped_mcp_config_file("geminicli-env"));
+        assert!(!is_mapped_mcp_config_file("geminicli-prompt"));
+        assert!(!is_mapped_mcp_config_file("geminicli-oauth"));
+    }
+
+    #[test]
+    fn excludes_pi_non_mcp_file_mappings() {
+        assert!(!is_mapped_mcp_config_file("pi-settings"));
+        assert!(!is_mapped_mcp_config_file("pi-auth"));
+        assert!(!is_mapped_mcp_config_file("pi-prompt"));
+    }
+
+    #[test]
+    fn skips_pi_mcp_file_mapping_when_pi_is_wsl_direct() {
+        assert!(should_skip_mapped_mcp_config_file_for_wsl_direct(
+            "pi", false, false, false, false, true, false, false, false,
+        ));
+        assert!(!should_skip_mapped_mcp_config_file_for_wsl_direct(
+            "pi", false, false, false, false, false, false, false, false,
+        ));
+        assert!(!should_skip_mapped_mcp_config_file_for_wsl_direct(
+            "codex", false, false, false, false, true, false, false, false,
+        ));
+        assert!(should_skip_mapped_mcp_config_file_for_wsl_direct(
+            "oh_my_pi", false, false, false, false, false, true, false, false,
+        ));
+    }
+
+    #[test]
+    fn skips_grok_mcp_file_mapping_when_grok_is_wsl_direct() {
+        assert!(should_skip_mapped_mcp_config_file_for_wsl_direct(
+            "grok", false, false, true, false, false, false, false, false,
+        ));
+        assert!(!should_skip_mapped_mcp_config_file_for_wsl_direct(
+            "grok", false, false, false, false, false, false, false, false,
+        ));
+        assert!(is_mapped_mcp_config_file("grok-config"));
+    }
+
+    fn make_stdio_mcp_server(command: &str, args: &[&str]) -> crate::coding::mcp::types::McpServer {
+        crate::coding::mcp::types::McpServer {
+            id: String::new(),
+            name: "fs".to_string(),
+            server_type: "stdio".to_string(),
+            server_config: serde_json::json!({
+                "command": command,
+                "args": args,
+            }),
+            enabled_tools: vec![],
+            sync_details: None,
+            description: None,
+            user_group: None,
+            user_note: None,
+            tags: vec![],
+            timeout: None,
+            sort_index: 0,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn build_standard_server_config_converts_full_path_command_to_mnt() {
+        let server = make_stdio_mcp_server("C:\\Users\\x\\.fastctx\\bin\\fastctx.exe", &["-y"]);
+        let config = build_standard_server_config(&server);
+        assert_eq!(config["command"], "/mnt/c/Users/x/.fastctx/bin/fastctx.exe");
+        // args untouched
+        assert_eq!(config["args"], serde_json::json!(["-y"]));
+    }
+
+    #[test]
+    fn build_standard_server_config_unwraps_cmd_c_then_converts() {
+        // cmd /c wrapping a full path: the real exe must be unwrapped FIRST and
+        // then converted to /mnt. Regression test for the ordering bug where the
+        // transform ran before the unwrap and missed the exe buried in args.
+        let server = make_stdio_mcp_server("cmd", &["/c", "C:\\x.exe"]);
+        let config = build_standard_server_config(&server);
+        assert_eq!(config["command"], "/mnt/c/x.exe");
+        assert!(config["args"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_standard_server_config_leaves_bare_command_unchanged() {
+        let server = make_stdio_mcp_server("npx", &["-y", "pkg"]);
+        let config = build_standard_server_config(&server);
+        assert_eq!(config["command"], "npx");
+        assert_eq!(config["args"], serde_json::json!(["-y", "pkg"]));
+    }
 }

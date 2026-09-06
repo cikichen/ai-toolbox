@@ -4,12 +4,24 @@ import { ClearOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import type { McpServer, McpTool, StdioConfig, HttpConfig } from '../../types';
 import * as mcpApi from '../../services/mcpApi';
+import { ToolIcon } from '@/features/coding/shared/toolIcon/ToolIcon';
 import { useMcpStore } from '../../stores/mcpStore';
 import { refreshTrayMenu } from '@/services/appApi';
+import {
+  parseManagementGridColumnSetting,
+  type ManagementGridColumnSetting,
+} from '@/features/coding/shared/management';
 import styles from './McpSettingsModal.module.less';
 
 interface McpSettingsModalProps {
   open: boolean;
+  cardColumnSetting?: ManagementGridColumnSetting;
+  cardColumnOptions?: readonly ManagementGridColumnSetting[];
+  onCardColumnSettingChange?: (value: ManagementGridColumnSetting) => void;
+  onToolMenuPreferencesChange?: (preferences: {
+    preferredTools: string[];
+    limitAddMoreToPreferredTools: boolean;
+  }) => void;
   onClose: () => void;
 }
 
@@ -23,6 +35,10 @@ interface CustomMcpTool {
 
 export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
   open: isOpen,
+  cardColumnSetting,
+  cardColumnOptions,
+  onCardColumnSettingChange,
+  onToolMenuPreferencesChange,
   onClose,
 }) => {
   const { t } = useTranslation();
@@ -36,6 +52,7 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
   const [addingTool, setAddingTool] = React.useState(false);
   const [showInTray, setShowInTray] = React.useState(false);
   const [syncDisabledToOpencode, setSyncDisabledToOpencode] = React.useState(false);
+  const [limitAddMoreToPreferredTools, setLimitAddMoreToPreferredTools] = React.useState(false);
   const [showClearAllModal, setShowClearAllModal] = React.useState(false);
   const [clearAllConfirmText, setClearAllConfirmText] = React.useState('');
   const [clearingAll, setClearingAll] = React.useState(false);
@@ -47,11 +64,18 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
 
   const loadData = async () => {
     try {
-      const [tools, trayEnabled, savedPreferredTools, syncDisabled] = await Promise.all([
+      const [
+        tools,
+        trayEnabled,
+        savedPreferredTools,
+        syncDisabled,
+        savedLimitAddMoreToPreferredTools,
+      ] = await Promise.all([
         mcpApi.getMcpTools(),
         mcpApi.getMcpShowInTray(),
         mcpApi.getMcpPreferredTools(),
         mcpApi.getMcpSyncDisabledToOpencode(),
+        mcpApi.getMcpLimitAddMoreToPreferredTools(),
       ]);
 
       // Sort: installed tools first
@@ -62,6 +86,7 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
       setAllTools(sorted);
       setShowInTray(trayEnabled);
       setSyncDisabledToOpencode(syncDisabled);
+      setLimitAddMoreToPreferredTools(savedLimitAddMoreToPreferredTools);
 
       // Extract custom tools
       const custom = tools.filter((t) => t.is_custom && t.supports_mcp);
@@ -130,9 +155,13 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
   const handleSave = async () => {
     setLoading(true);
     try {
-      // Save preferred tools
       await mcpApi.setMcpPreferredTools(preferredTools);
+      await mcpApi.setMcpLimitAddMoreToPreferredTools(limitAddMoreToPreferredTools);
       await fetchTools(); // Refresh global store
+      onToolMenuPreferencesChange?.({
+        preferredTools,
+        limitAddMoreToPreferredTools,
+      });
       message.success(t('common.success'));
       onClose();
     } catch (error) {
@@ -148,6 +177,7 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
     mcpConfigPath: string;
     mcpConfigFormat: 'json' | 'toml';
     mcpField: string;
+    iconUrl?: string;
   }) => {
     setAddingTool(true);
     try {
@@ -157,6 +187,7 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
         mcpConfigPath: values.mcpConfigPath,
         mcpConfigFormat: values.mcpConfigFormat,
         mcpField: values.mcpField,
+        iconUrl: values.iconUrl,
       });
       message.success(t('common.success'));
       form.resetFields();
@@ -273,6 +304,29 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
         </div>
       </div>
 
+      {cardColumnSetting !== undefined && cardColumnOptions && onCardColumnSettingChange && (
+        <div className={styles.section}>
+          <div className={styles.labelArea}>
+            <label className={styles.label}>{t('common.cardColumns')}</label>
+          </div>
+          <div className={styles.inputArea}>
+            <select
+              className={styles.selectControl}
+              value={String(cardColumnSetting)}
+              onChange={(event) => onCardColumnSettingChange(parseManagementGridColumnSetting(event.target.value))}
+            >
+              {cardColumnOptions.map((option) => (
+                <option key={option} value={String(option)}>
+                  {option === 'auto'
+                    ? t('common.cardColumnsAuto')
+                    : t('common.cardColumnsCount', { count: option })}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      )}
+
       {isOpencodeInstalled && (
         <div className={styles.section}>
           <div className={styles.labelArea}>
@@ -305,7 +359,15 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
                       onChange={(e) => handleToolToggle(tool.key, e.target.checked)}
                       disabled={isDisabled}
                     >
-                      {tool.display_name}
+                      <span className={styles.toolItemLabel}>
+                        <ToolIcon
+                          toolKey={tool.key}
+                          label={tool.display_name}
+                          size={14}
+                          iconUrl={tool.icon_url ?? undefined}
+                        />
+                        {tool.display_name}
+                      </span>
                     </Checkbox>
                   </Tooltip>
                   {isCustomTool && (
@@ -330,6 +392,14 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
             </Button>
           </div>
           <p className={styles.hint}>{t('mcp.preferredToolsHint')}</p>
+          <div className={styles.inlineOption}>
+            <Switch
+              checked={limitAddMoreToPreferredTools}
+              onChange={setLimitAddMoreToPreferredTools}
+            />
+            <span className={styles.optionLabel}>{t('mcp.limitAddMoreToPreferredTools')}</span>
+          </div>
+          <p className={styles.hint}>{t('mcp.limitAddMoreToPreferredToolsHint')}</p>
         </div>
       </div>
 
@@ -419,6 +489,24 @@ export const McpSettingsModal: React.FC<McpSettingsModalProps> = ({
             rules={[{ required: true, message: t('mcp.customToolSettings.configFieldRequired') }]}
           >
             <Input placeholder="mcpServers" />
+          </Form.Item>
+          <Form.Item
+            name="iconUrl"
+            label={t('mcp.customToolSettings.iconUrl')}
+            rules={[
+              {
+                validator: (_, value: string) => {
+                  const trimmed = (value ?? '').trim();
+                  if (!trimmed || trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+                    return Promise.resolve();
+                  }
+                  return Promise.reject(new Error(t('mcp.customToolSettings.iconUrlInvalid')));
+                },
+              },
+            ]}
+            extra={t('mcp.customToolSettings.iconUrlHint')}
+          >
+            <Input placeholder="https://example.com/icon.png" />
           </Form.Item>
           <div style={{ textAlign: 'right' }}>
             <Space>

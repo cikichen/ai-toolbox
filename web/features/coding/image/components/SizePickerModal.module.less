@@ -1,0 +1,192 @@
+@import '../styles/buttonSystem.less';
+
+.modal {
+  :global(.ant-modal-header) {
+    padding: 20px 24px 10px;
+  }
+
+  :global(.ant-modal-title) {
+    line-height: 1.3;
+  }
+
+  :global(.ant-modal-body) {
+    padding: 6px 18px 16px;
+  }
+}
+
+.titleBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.titleText {
+  color: var(--color-text-primary);
+}
+
+.titleHint {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  font-weight: 400;
+  margin-top: 2px;
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modeTabs {
+  .segmentedContainer();
+  flex-wrap: nowrap;
+}
+
+.modeTab {
+  .segmentedButton();
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.modeTabActive {
+  .segmentedButtonActive();
+}
+
+.sectionCard {
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  background: var(--color-bg-elevated);
+  padding: 14px;
+}
+
+.modeBody {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.fieldRow {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.fieldLabel {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  color: var(--color-text-primary);
+  font-size: 13px;
+}
+
+.optionGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.choiceButton {
+  .buttonBase();
+  .buttonSecondarySurface();
+  .buttonCompact();
+  width: 100%;
+  white-space: nowrap;
+}
+
+.choiceButtonActive {
+  border-color: color-mix(in srgb, var(--ant-color-primary) 32%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--ant-color-primary) 10%, white 12%) 0%,
+      color-mix(in srgb, var(--ant-color-primary) 16%, transparent) 100%
+    );
+  color: var(--ant-color-primary);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, white 38%, transparent) inset,
+    0 10px 18px color-mix(in srgb, var(--ant-color-primary) 12%, transparent);
+}
+
+.choiceButtonWide {
+  grid-column: span 4;
+}
+
+.resolutionGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.resolutionDivider {
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.infoBlock {
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: var(--color-bg-container);
+  padding: 10px 12px;
+  color: var(--color-text-secondary);
+}
+
+.previewCard {
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  background: var(--color-bg-container);
+  padding: 12px 14px;
+}
+
+.previewValue {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.primaryActionButton:global(.ant-btn) {
+  .buttonBase();
+  .buttonPrimarySurface();
+}
+
+.secondaryActionButton:global(.ant-btn) {
+  .buttonBase();
+  .buttonSecondarySurface();
+}
+
+@media (max-width: 720px) {
+  .modeTabs {
+    width: 100%;
+  }
+
+  .modeTab {
+    flex: 1;
+  }
+
+  .fieldRow {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    align-items: start;
+  }
+
+  .optionGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .choiceButtonWide {
+    grid-column: span 2;
+  }
+
+  .resolutionGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .resolutionDivider {
+    display: none;
+  }
+}

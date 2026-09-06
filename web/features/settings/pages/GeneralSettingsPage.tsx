@@ -1,5 +1,5 @@
 import React from 'react';
-import { Typography, Button, Select, Space, message, Modal, Table, Switch, Progress, Input, Row, Col, Card, Divider } from 'antd';
+import { Typography, Button, Select, Space, message, Modal, Table, Switch, Input, Row, Col, Card, Divider, Checkbox } from 'antd';
 import {
   EditOutlined,
   CloudUploadOutlined,
@@ -29,17 +29,17 @@ import {
 } from '@dnd-kit/core';
 import {
   SortableContext,
-  horizontalListSortingStrategy,
+  rectSortingStrategy,
   useSortable,
   arrayMove,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { restrictToHorizontalAxis } from '@dnd-kit/modifiers';
 import { useAppStore, useSettingsStore } from '@/stores';
 import { useThemeStore, type ThemeMode } from '@/stores/themeStore';
 import { languages, type Language } from '@/i18n';
 import i18n from '@/i18n';
 import { BackupSettingsModal, WebDAVRestoreModal } from '../components';
+import UpdateProgressModal from '@/components/common/UpdateProgressModal';
 import { platform } from '@tauri-apps/plugin-os';
 import {
   backupDatabase,
@@ -47,6 +47,8 @@ import {
   selectBackupFile,
   backupToWebDAV,
   restoreFromWebDAV,
+  type ProxyMode,
+  type RestoreResult,
   openAppDataDir,
   getAppVersion,
   checkForUpdates,
@@ -62,6 +64,65 @@ import { listen } from '@tauri-apps/api/event';
 import styles from './GeneralSettingsPage.module.less';
 
 const { Text } = Typography;
+
+const TOOL_LABEL_KEYS: Record<string, string> = {
+  opencode: 'subModules.opencode',
+  claude: 'subModules.claudecode',
+  codex: 'subModules.codex',
+  grok: 'subModules.grok',
+  kimi: 'subModules.kimi',
+  openclaw: 'subModules.openclaw',
+  geminicli: 'subModules.geminicli',
+  pi: 'subModules.pi',
+  oh_my_pi: 'subModules.ohMyPi',
+  claudedesktop: 'subModules.claudedesktop',
+  claude_desktop: 'subModules.claudedesktop',
+  hermes: 'subModules.hermes',
+  dsh: 'subModules.dsh',
+};
+
+/** Local mutable holder so Modal.confirm content can toggle without reopening. */
+const createSkipCliCustomRootsHolder = () => {
+  const holder = { value: false };
+  return holder;
+};
+
+const buildRestoreConfirmContent = (
+  description: React.ReactNode,
+  holder: { value: boolean },
+  t: (key: string) => string
+) => (
+  <div>
+    <div style={{ marginBottom: 12 }}>{description}</div>
+    <Checkbox
+      defaultChecked={false}
+      onChange={(event) => {
+        holder.value = event.target.checked;
+      }}
+    >
+      <Space direction="vertical" size={0}>
+        <span>{t('settings.backupSettings.skipCliCustomRoots')}</span>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {t('settings.backupSettings.skipCliCustomRootsDesc')}
+        </Text>
+      </Space>
+    </Checkbox>
+  </div>
+);
+
+const buildRestoreSuccessContent = (
+  restoreResult: RestoreResult,
+  t: (key: string) => string
+) => (
+  <div>
+    <div>{t('settings.backupSettings.restoreSuccessReload')}</div>
+    {restoreResult.willReapplyApplied ? (
+      <div style={{ marginTop: 8 }}>
+        <Text type="secondary">{t('settings.backupSettings.restoreWillReapply')}</Text>
+      </div>
+    ) : null}
+  </div>
+);
 
 interface SortableCodingChipProps {
   id: string;
@@ -119,9 +180,15 @@ const GeneralSettingsPage: React.FC = () => {
     launchOnStartup,
     minimizeToTrayOnClose,
     startMinimized,
+    startLightweight,
+    lightweightOnClose,
     setLaunchOnStartup,
     setMinimizeToTrayOnClose,
     setStartMinimized,
+    setStartLightweight,
+    setLightweightOnClose,
+    proxyMode,
+    setProxyMode,
     proxyUrl,
     setProxyUrl,
     autoBackupEnabled,
@@ -183,10 +250,7 @@ const GeneralSettingsPage: React.FC = () => {
       setUpdateSpeed(speed);
       setUpdateDownloaded(downloaded);
       setUpdateTotal(total);
-
-      if (status === 'installing') {
-        message.success(t('settings.about.downloadingComplete'));
-      }
+      // toast 由 AppInitializer (providers.tsx) 全局处理，此处仅更新进度状态
     });
 
     return () => {
@@ -215,6 +279,8 @@ const GeneralSettingsPage: React.FC = () => {
     setProxyInput(proxyUrl);
   }, [proxyUrl]);
 
+  const isCustomProxyMode = proxyMode === 'custom';
+
   const handleCheckUpdate = async (silent = false) => {
     setCheckingUpdate(true);
     setUpdateInfo(null);
@@ -222,7 +288,9 @@ const GeneralSettingsPage: React.FC = () => {
       const info = await checkForUpdates();
       setUpdateInfo(info);
       if (!silent) {
-        if (info.hasUpdate) {
+        if (info.hasUpdate && info.scoopInstall) {
+          message.info(t('settings.about.scoopUpdateHint', { version: info.latestVersion }));
+        } else if (info.hasUpdate) {
           message.info(t('settings.about.updateAvailable', { version: info.latestVersion }));
         } else {
           message.success(t('settings.about.latestVersion'));
@@ -314,24 +382,6 @@ const GeneralSettingsPage: React.FC = () => {
     }
   };
 
-  // 格式化文件大小
-  const formatFileSize = (bytes: number) => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
-  // 格式化下载速度
-  const formatSpeed = (bytesPerSecond: number) => {
-    if (bytesPerSecond === 0) return '0 B/s';
-    const k = 1024;
-    const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-    const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
-    return parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
   const handleBackup = async () => {
     setBackupLoading(true);
     try {
@@ -402,23 +452,34 @@ const GeneralSettingsPage: React.FC = () => {
           return;
         }
 
+        const skipCliCustomRootsHolder = createSkipCliCustomRootsHolder();
         Modal.confirm({
           title: t('settings.backupSettings.confirmRestore'),
-          content: t('settings.backupSettings.confirmRestoreDesc'),
+          content: buildRestoreConfirmContent(
+            t('settings.backupSettings.confirmRestoreDesc'),
+            skipCliCustomRootsHolder,
+            t
+          ),
           okText: t('common.confirm'),
           cancelText: t('common.cancel'),
           onOk: async () => {
             try {
-              await restoreDatabase(zipFilePath);
+              const restoreResult = await restoreDatabase(zipFilePath, {
+                skipCliCustomRoots: skipCliCustomRootsHolder.value,
+              });
               // 恢复成功后弹出重启对话框
               Modal.info({
                 title: t('settings.backupSettings.restoreSuccess'),
-                content: t('settings.backupSettings.restoreSuccessReload'),
+                content: buildRestoreSuccessContent(restoreResult, t),
                 okText: t('common.restart'),
+                closable: false,
+                maskClosable: false,
+                keyboard: false,
                 onOk: () => {
                   restartApp();
                 },
               });
+              showRestoreWarnings(restoreResult);
             } catch (error) {
               console.error('Restore failed:', error);
               message.error(t('settings.backupSettings.restoreFailed'));
@@ -434,31 +495,76 @@ const GeneralSettingsPage: React.FC = () => {
     }
   };
 
-  const handleWebDAVRestoreSelect = async (filename: string) => {
+  const showRestoreWarnings = (result: RestoreResult) => {
+    if (result.warnings.length === 0) {
+      return;
+    }
+
+    Modal.warning({
+      title: t('settings.backupSettings.restorePathFallbackTitle'),
+      content: (
+        <div>
+          {result.warnings.map((warning) => (
+            <div key={`${warning.tool}-${warning.originalPath}`}>
+              {t('settings.backupSettings.restorePathFallbackLine', {
+                tool: t(TOOL_LABEL_KEYS[warning.tool] || warning.tool),
+                originalPath: warning.originalPath,
+                fallbackPath: warning.fallbackPath,
+              })}
+            </div>
+          ))}
+        </div>
+      ),
+      okText: t('common.confirm'),
+    });
+  };
+
+  const handleWebDAVRestoreSelect = async (selection: {
+    filename: string;
+    hostLabel: string | null;
+    matchType: 'current' | 'other' | 'unlabeled';
+  }) => {
+    const restoreDescription =
+      selection.matchType === 'current'
+        ? t('settings.backupSettings.confirmRestoreCurrentHost', {
+            hostLabel: selection.hostLabel || webdav.hostLabel,
+          })
+        : selection.matchType === 'other'
+          ? t('settings.backupSettings.confirmRestoreOtherHost', {
+              hostLabel: selection.hostLabel || t('settings.backupSettings.unknownHostLabel'),
+            })
+          : t('settings.backupSettings.confirmRestoreDesc');
+
+    const skipCliCustomRootsHolder = createSkipCliCustomRootsHolder();
     Modal.confirm({
       title: t('settings.backupSettings.confirmRestore'),
-      content: t('settings.backupSettings.confirmRestoreDesc'),
+      content: buildRestoreConfirmContent(restoreDescription, skipCliCustomRootsHolder, t),
       okText: t('common.confirm'),
       cancelText: t('common.cancel'),
       onOk: async () => {
         setRestoreLoading(true);
         try {
-          await restoreFromWebDAV(
+          const restoreResult = await restoreFromWebDAV(
             webdav.url,
             webdav.username,
             webdav.password,
             webdav.remotePath,
-            filename
+            selection.filename,
+            { skipCliCustomRoots: skipCliCustomRootsHolder.value }
           );
           // 恢复成功后弹出重启对话框
           Modal.info({
             title: t('settings.backupSettings.restoreSuccess'),
-            content: t('settings.backupSettings.restoreSuccessReload'),
+            content: buildRestoreSuccessContent(restoreResult, t),
             okText: t('common.restart'),
+            closable: false,
+            maskClosable: false,
+            keyboard: false,
             onOk: () => {
               restartApp();
             },
           });
+          showRestoreWarnings(restoreResult);
         } catch (error) {
           console.error('Restore failed:', error);
 
@@ -486,7 +592,7 @@ const GeneralSettingsPage: React.FC = () => {
       await openAppDataDir();
     } catch (error) {
       console.error('Failed to open data directory:', error);
-      message.error('打开数据目录失败');
+      message.error(t('settings.openDataDirFailed'));
     }
   };
 
@@ -500,6 +606,15 @@ const GeneralSettingsPage: React.FC = () => {
         console.error('Failed to save proxy:', error);
         message.error(t('common.error'));
       }
+    }
+  };
+
+  const handleProxyModeChange = async (nextProxyMode: ProxyMode) => {
+    try {
+      await setProxyMode(nextProxyMode);
+    } catch (error) {
+      console.error('Failed to save proxy mode:', error);
+      message.error(t('common.error'));
     }
   };
 
@@ -557,8 +672,8 @@ const GeneralSettingsPage: React.FC = () => {
     </div>
   );
 
-  const CODING_TABS = ['opencode', 'claudecode', 'codex', 'openclaw'] as const;
-  const OTHER_TABS = ['ssh', ...(isWindows ? ['wsl'] : [])] as string[];
+  const CODING_TABS = ['opencode', 'claudecode', 'claudedesktop', 'codex', 'grok', 'geminicli', 'kimi', 'openclaw', 'pi', 'oh_my_pi', 'hermes', 'dsh'] as const;
+  const OTHER_TABS = ['gateway', 'image', 'ssh', ...(isWindows ? ['wsl'] : [])] as string[];
 
   const [reorderMode, setReorderMode] = React.useState(false);
 
@@ -671,13 +786,7 @@ const GeneralSettingsPage: React.FC = () => {
                 <Text>{t('settings.window.launchOnStartup')}</Text>
                 <Switch
                   checked={launchOnStartup}
-                  onChange={(checked) => {
-                    setLaunchOnStartup(checked);
-                    // Disable start minimized when launch on startup is disabled
-                    if (!checked && startMinimized) {
-                      setStartMinimized(false);
-                    }
-                  }}
+                  onChange={setLaunchOnStartup}
                 />
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -689,10 +798,25 @@ const GeneralSettingsPage: React.FC = () => {
                 />
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Text>{t('settings.window.startLightweight')}</Text>
+                <Switch
+                  checked={startLightweight}
+                  onChange={setStartLightweight}
+                />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <Text>{t('settings.window.minimizeToTrayOnClose')}</Text>
                 <Switch
                   checked={minimizeToTrayOnClose}
                   onChange={setMinimizeToTrayOnClose}
+                />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Text>{t('settings.window.lightweightOnClose')}</Text>
+                <Switch
+                  checked={lightweightOnClose}
+                  disabled={!minimizeToTrayOnClose}
+                  onChange={setLightweightOnClose}
                 />
               </div>
             </div>
@@ -721,10 +845,15 @@ const GeneralSettingsPage: React.FC = () => {
                 >
                   {checkingUpdate ? t('settings.about.checking') : t('settings.about.checkUpdate')}
                 </Button>
-                {updateInfo?.hasUpdate && (
+                {updateInfo?.hasUpdate && !updateInfo.scoopInstall && (
                   <Button type="primary" onClick={handleGoToDownload}>
                     {t('settings.about.goToDownload')} (v{updateInfo.latestVersion})
                   </Button>
+                )}
+                {updateInfo?.hasUpdate && updateInfo.scoopInstall && (
+                  <Typography.Text type="warning">
+                    {t('settings.about.scoopUpdateHint', { version: updateInfo.latestVersion })}
+                  </Typography.Text>
                 )}
                 <Button icon={<GithubOutlined />} onClick={handleOpenGitHub}>
                   {t('settings.about.github')}
@@ -763,10 +892,9 @@ const GeneralSettingsPage: React.FC = () => {
                 <DndContext
                   sensors={sensors}
                   collisionDetection={closestCenter}
-                  modifiers={[restrictToHorizontalAxis]}
                   onDragEnd={handleDragEnd}
                 >
-                  <SortableContext items={codingTabOrder} strategy={horizontalListSortingStrategy}>
+                  <SortableContext items={codingTabOrder} strategy={rectSortingStrategy}>
                     <div className={styles.sortableChipList}>
                       {codingTabOrder.map((key) => (
                         <SortableCodingChip
@@ -808,25 +936,43 @@ const GeneralSettingsPage: React.FC = () => {
             {/* Proxy Settings */}
             <SectionTitle icon={<ApiOutlined style={{ color: '#fa8c16' }} />} title={t('settings.cards.proxy')} />
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <Input
-                  value={proxyInput}
-                  onChange={(e) => setProxyInput(e.target.value)}
-                  onBlur={handleProxySave}
-                  onPressEnter={handleProxySave}
-                  placeholder={t('settings.proxy.urlPlaceholder')}
-                  style={{ flex: 1 }}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Text>{t('settings.proxy.modeLabel')}</Text>
+                <Select
+                  value={proxyMode}
+                  onChange={(value: ProxyMode) => void handleProxyModeChange(value)}
+                  style={{ width: 160 }}
+                  options={[
+                    { value: 'direct', label: t('settings.proxy.modeDirect') },
+                    { value: 'custom', label: t('settings.proxy.modeCustom') },
+                    { value: 'system', label: t('settings.proxy.modeSystem') },
+                  ]}
                 />
-                <Button
-                  onClick={handleProxyTest}
-                  loading={proxyTesting}
-                >
-                  {proxyTesting ? t('settings.proxy.testing') : t('settings.proxy.testConnection')}
-                </Button>
               </div>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {t('settings.proxy.hint')}
-              </Text>
+              {isCustomProxyMode ? (
+                <>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <Input
+                      value={proxyInput}
+                      onChange={(e) => setProxyInput(e.target.value)}
+                      onBlur={handleProxySave}
+                      onPressEnter={handleProxySave}
+                      placeholder={t('settings.proxy.urlPlaceholder')}
+                      style={{ flex: 1 }}
+                    />
+                    <Button
+                      onClick={handleProxyTest}
+                      loading={proxyTesting}
+                      disabled={!proxyInput}
+                    >
+                      {proxyTesting ? t('settings.proxy.testing') : t('settings.proxy.testConnection')}
+                    </Button>
+                  </div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {t('settings.proxy.hint')}
+                  </Text>
+                </>
+              ) : null}
             </div>
 
             <Divider />
@@ -892,49 +1038,18 @@ const GeneralSettingsPage: React.FC = () => {
         username={webdav.username}
         password={webdav.password}
         remotePath={webdav.remotePath}
+        currentHostLabel={webdav.hostLabel}
       />
 
       {/* Update Progress Modal */}
-      <Modal
-        title={t('settings.about.downloadingUpdate')}
+      <UpdateProgressModal
         open={updateModalOpen}
-        closable={false}
-        footer={null}
-        centered
-      >
-        <div style={{ padding: '20px 0' }}>
-          <Progress
-            percent={updateProgress}
-            status={updateStatus === 'installing' ? 'active' : 'active'}
-            strokeColor={{
-              '0%': '#108ee9',
-              '100%': '#87d068',
-            }}
-          />
-          <div style={{ marginTop: 16 }}>
-            {updateStatus === 'downloading' && (
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <Text type="secondary" style={{ fontSize: 14 }}>
-                  {formatFileSize(updateDownloaded)} / {formatFileSize(updateTotal)}
-                </Text>
-                <Text style={{ color: '#1890ff', fontSize: 14, fontWeight: 500 }}>
-                  {formatSpeed(updateSpeed)}
-                </Text>
-              </div>
-            )}
-            {updateStatus === 'installing' && (
-              <Text type="secondary" style={{ fontSize: 14 }}>
-                {t('settings.about.installingUpdate')}
-              </Text>
-            )}
-            {updateStatus === 'started' && (
-              <Text type="secondary" style={{ fontSize: 14 }}>
-                {t('settings.about.downloadingUpdate')}
-              </Text>
-            )}
-          </div>
-        </div>
-      </Modal>
+        progress={updateProgress}
+        status={updateStatus}
+        speed={updateSpeed}
+        downloaded={updateDownloaded}
+        total={updateTotal}
+      />
     </div>
   );
 };

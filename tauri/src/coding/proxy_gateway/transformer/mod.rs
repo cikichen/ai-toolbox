@@ -1,0 +1,35 @@
+//! Reusable AI protocol conversion helpers for Proxy Gateway.
+//!
+//! The module is deliberately independent from database, Tauri commands and
+//! provider storage. Runtime code supplies a source/target protocol and the
+//! module only rewrites protocol payloads.
+
+mod anthropic;
+mod error;
+mod gemini;
+mod kernel;
+mod llm;
+mod openai;
+mod shared;
+mod sse;
+mod stream;
+mod traits;
+mod types;
+
+#[cfg(test)]
+#[path = "tool_media_tests.rs"]
+mod tool_media_tests;
+
+pub use error::ProtocolConversionError;
+pub(crate) use gemini::gemini_stream_error;
+pub use kernel::{
+    convert_error_response_body, convert_request_body, convert_request_body_with_context,
+    convert_request_value, convert_response_body, convert_response_body_with_context,
+    convert_response_value, convert_responses_compact_request_body_to_target,
+    convert_target_response_body_to_responses_compact,
+};
+pub use kernel::{convert_sse_stream, convert_sse_stream_with_context, ConversionContext};
+pub use shared::lossy::{check_lossy_conversion, LossyConversionIssue};
+pub use shared::tool_schema::flatten_namespace_tool_name;
+pub(crate) use sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+pub use types::{AiProtocol, ConversionRoute};

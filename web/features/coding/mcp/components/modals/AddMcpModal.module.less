@@ -1,16 +1,47 @@
+.dragHandle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  color: var(--color-text-tertiary);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+
+  &:active {
+    cursor: grabbing;
+  }
+
+  &:hover {
+    color: var(--color-text-secondary);
+  }
+}
+
 .argRow {
   display: flex;
   gap: 8px;
   margin-bottom: 8px;
   width: 100%;
+  align-items: center;
 
   :global(.ant-form-item) {
     flex: 1;
     margin-bottom: 0;
   }
 
-  :global(.ant-space-item:first-child) {
-    flex: 1;
+  :global(.ant-input) {
+    width: 100%;
+  }
+
+  :global(.anticon-minus-circle) {
+    color: var(--color-text-tertiary);
+    cursor: pointer;
+    flex-shrink: 0;
+
+    &:hover {
+      color: var(--color-error);
+    }
   }
 }
 
@@ -72,15 +103,6 @@
 .noTools {
   color: var(--color-text-tertiary);
   font-size: 13px;
-}
-
-.notInstalledTag {
-  margin-left: 8px;
-  font-size: 11px;
-  color: var(--color-text-tertiary);
-  background: var(--color-bg-secondary);
-  padding: 1px 6px;
-  border-radius: 4px;
 }
 
 .nameRow {

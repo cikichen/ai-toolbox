@@ -1,6 +1,63 @@
-use std::path::Path;
 use super::session::{self, upload_file_via_sftp, SshSession};
-use super::types::{SSHConnection, SSHConnectionResult, SSHFileMapping, SyncResult};
+use super::types::{
+    normalize_directory_excludes, SSHConnection, SSHConnectionResult, SSHFileMapping, SyncResult,
+};
+use std::path::{Path, PathBuf};
+
+type CurrentFileReporter<'a> = &'a (dyn Fn(String) + Send + Sync);
+
+fn mapping_kind(mapping: &SSHFileMapping) -> &'static str {
+    if mapping.is_directory {
+        "directory"
+    } else if mapping.is_pattern {
+        "pattern"
+    } else {
+        "file"
+    }
+}
+
+fn normalize_display_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn file_name_or_path(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(normalize_display_path)
+        .unwrap_or_else(|| normalize_display_path(fallback))
+}
+
+fn glob_static_base(pattern: &str) -> Option<PathBuf> {
+    let meta_index = pattern
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '*' | '?' | '['))
+        .map(|(index, _)| index)?;
+    let prefix = &pattern[..meta_index];
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let prefix_path = Path::new(prefix);
+    if prefix.ends_with('/') || prefix.ends_with('\\') {
+        Some(prefix_path.to_path_buf())
+    } else {
+        prefix_path.parent().map(Path::to_path_buf)
+    }
+}
+
+fn pattern_file_display_path(expanded_pattern: &str, file_path: &Path) -> String {
+    if let Some(base_dir) = glob_static_base(expanded_pattern) {
+        if let Ok(relative_path) = file_path.strip_prefix(&base_dir) {
+            let display = normalize_display_path(&relative_path.to_string_lossy());
+            if !display.is_empty() {
+                return display;
+            }
+        }
+    }
+
+    file_name_or_path(file_path, &file_path.to_string_lossy())
+}
 
 // ============================================================================
 // Connection Testing
@@ -44,15 +101,32 @@ pub fn expand_local_path(path: &str) -> Result<String, String> {
 // ============================================================================
 
 /// 同步单个文件到远程（通过 SFTP）
-pub async fn sync_single_file(
+pub async fn sync_single_file_with_progress(
     local_path: &str,
     remote_path: &str,
     session: &SshSession,
+    current_file_reporter: Option<CurrentFileReporter<'_>>,
 ) -> Result<Vec<String>, String> {
     let expanded = expand_local_path(local_path)?;
+    log::trace!(
+        "SSH single file sync start: local_path={}, expanded_local_path={}, remote_path={}",
+        local_path,
+        expanded,
+        remote_path
+    );
 
     if !Path::new(&expanded).exists() {
+        log::warn!(
+            "SSH single file sync skipped because local file does not exist: local_path={}, expanded_local_path={}, remote_path={}",
+            local_path,
+            expanded,
+            remote_path
+        );
         return Ok(vec![]);
+    }
+
+    if let Some(reporter) = current_file_reporter {
+        reporter(file_name_or_path(Path::new(&expanded), local_path));
     }
 
     let remote_target = remote_path.replace("~", "$HOME");
@@ -63,20 +137,41 @@ pub async fn sync_single_file(
 
     // SFTP 上传文件
     session.upload_file(&expanded, remote_path).await?;
+    log::trace!(
+        "SSH single file sync uploaded successfully: expanded_local_path={}, remote_path={}",
+        expanded,
+        remote_path
+    );
 
     Ok(vec![format!("{} -> {}", local_path, remote_path)])
 }
 
 /// 同步整个目录到远程（通过 SFTP）
 /// 使用临时目录 + mv 实现原子替换，防止上传中断导致数据丢失
-pub async fn sync_directory(
+pub async fn sync_directory_with_progress(
     local_path: &str,
     remote_path: &str,
     session: &SshSession,
+    directory_excludes: &[String],
+    current_file_reporter: Option<CurrentFileReporter<'_>>,
 ) -> Result<Vec<String>, String> {
     let expanded = expand_local_path(local_path)?;
+    let directory_excludes = normalize_directory_excludes(directory_excludes);
+    log::trace!(
+        "SSH directory sync start: local_path={}, expanded_local_path={}, remote_path={}, directory_excludes={:?}",
+        local_path,
+        expanded,
+        remote_path,
+        directory_excludes
+    );
 
     if !Path::new(&expanded).exists() {
+        log::warn!(
+            "SSH directory sync skipped because local path does not exist: local_path={}, expanded_local_path={}, remote_path={}",
+            local_path,
+            expanded,
+            remote_path
+        );
         return Ok(vec![]);
     }
 
@@ -101,7 +196,14 @@ pub async fn sync_directory(
     session.exec_command(&mkdir_cmd).await?;
 
     // SFTP 递归上传到临时目录（upload_dir 内部会展开 ~ 和 $HOME）
-    session.upload_dir(&expanded, &tmp_remote_path).await?;
+    session
+        .upload_dir_with_excludes_and_progress(
+            &expanded,
+            &tmp_remote_path,
+            &directory_excludes,
+            current_file_reporter,
+        )
+        .await?;
 
     // 原子替换：rm 旧目录 + mv 临时目录到目标
     let swap_cmd = format!(
@@ -115,17 +217,31 @@ pub async fn sync_directory(
             .await;
         return Err(format!("目录替换失败: {}", e));
     }
+    log::trace!(
+        "SSH directory sync uploaded successfully: expanded_local_path={}, remote_path={}, tmp_remote_path={}, directory_excludes={:?}",
+        expanded,
+        remote_path,
+        tmp_remote_path,
+        directory_excludes
+    );
 
     Ok(vec![format!("{} -> {}", local_path, remote_path)])
 }
 
 /// 同步符合 glob 模式的文件到远程
-pub async fn sync_pattern_files(
+pub async fn sync_pattern_files_with_progress(
     local_pattern: &str,
     remote_dir: &str,
     session: &SshSession,
+    current_file_reporter: Option<CurrentFileReporter<'_>>,
 ) -> Result<Vec<String>, String> {
     let expanded = expand_local_path(local_pattern)?;
+    log::trace!(
+        "SSH pattern sync start: local_pattern={}, expanded_pattern={}, remote_dir={}",
+        local_pattern,
+        expanded,
+        remote_dir
+    );
 
     // 使用 glob 查找匹配的文件
     let matches: Vec<_> = glob::glob(&expanded)
@@ -134,6 +250,12 @@ pub async fn sync_pattern_files(
         .collect();
 
     if matches.is_empty() {
+        log::warn!(
+            "SSH pattern sync skipped because no local files matched: local_pattern={}, expanded_pattern={}, remote_dir={}",
+            local_pattern,
+            expanded,
+            remote_dir
+        );
         return Ok(vec![]);
     }
 
@@ -147,6 +269,7 @@ pub async fn sync_pattern_files(
     let sftp = session.create_sftp_session().await?;
 
     let mut synced = vec![];
+    let mut failed_upload_count = 0usize;
     for file_path in &matches {
         let file_str = file_path.to_string_lossy().to_string();
         let file_name = file_path
@@ -154,11 +277,11 @@ pub async fn sync_pattern_files(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let remote_dest = format!(
-            "{}/{}",
-            remote_dir.trim_end_matches('/'),
-            file_name
-        );
+        let remote_dest = format!("{}/{}", remote_dir.trim_end_matches('/'), file_name);
+
+        if let Some(reporter) = current_file_reporter {
+            reporter(pattern_file_display_path(&expanded, file_path));
+        }
 
         match upload_file_via_sftp(&sftp, &file_str, &remote_dest).await {
             Ok(()) => {
@@ -170,9 +293,27 @@ pub async fn sync_pattern_files(
                 ));
             }
             Err(e) => {
+                failed_upload_count += 1;
                 log::warn!("SFTP 模式文件失败 {}: {}", file_str, e);
             }
         }
+    }
+
+    log::trace!(
+        "SSH pattern sync finished: local_pattern={}, matched_files={}, uploaded_files={}, failed_uploads={}, remote_dir={}",
+        local_pattern,
+        matches.len(),
+        synced.len(),
+        failed_upload_count,
+        remote_dir
+    );
+    if synced.is_empty() {
+        log::warn!(
+            "SSH pattern sync produced zero uploaded files after matching local files: local_pattern={}, matched_files={}, remote_dir={}",
+            local_pattern,
+            matches.len(),
+            remote_dir
+        );
     }
 
     Ok(synced)
@@ -183,13 +324,90 @@ pub async fn sync_file_mapping(
     mapping: &SSHFileMapping,
     session: &SshSession,
 ) -> Result<Vec<String>, String> {
-    if mapping.is_directory {
-        sync_directory(&mapping.local_path, &mapping.remote_path, session).await
+    sync_file_mapping_with_progress(mapping, session, None).await
+}
+
+pub async fn sync_file_mapping_with_progress(
+    mapping: &SSHFileMapping,
+    session: &SshSession,
+    current_file_reporter: Option<CurrentFileReporter<'_>>,
+) -> Result<Vec<String>, String> {
+    let kind = mapping_kind(mapping);
+    log::trace!(
+        "SSH sync mapping start: id={}, name={}, module={}, kind={}, local_path={}, remote_path={}",
+        mapping.id,
+        mapping.name,
+        mapping.module,
+        kind,
+        mapping.local_path,
+        mapping.remote_path
+    );
+
+    let result = if mapping.is_directory {
+        sync_directory_with_progress(
+            &mapping.local_path,
+            &mapping.remote_path,
+            session,
+            &mapping.directory_excludes,
+            current_file_reporter,
+        )
+        .await
     } else if mapping.is_pattern {
-        sync_pattern_files(&mapping.local_path, &mapping.remote_path, session).await
+        sync_pattern_files_with_progress(
+            &mapping.local_path,
+            &mapping.remote_path,
+            session,
+            current_file_reporter,
+        )
+        .await
     } else {
-        sync_single_file(&mapping.local_path, &mapping.remote_path, session).await
+        sync_single_file_with_progress(
+            &mapping.local_path,
+            &mapping.remote_path,
+            session,
+            current_file_reporter,
+        )
+        .await
+    };
+
+    match &result {
+        Ok(files) if files.is_empty() => {
+            log::warn!(
+                "SSH sync mapping finished without uploaded files: id={}, name={}, module={}, kind={}, local_path={}, remote_path={}",
+                mapping.id,
+                mapping.name,
+                mapping.module,
+                kind,
+                mapping.local_path,
+                mapping.remote_path
+            );
+        }
+        Ok(files) => {
+            log::trace!(
+                "SSH sync mapping finished successfully: id={}, name={}, module={}, kind={}, uploaded_files={}, remote_path={}",
+                mapping.id,
+                mapping.name,
+                mapping.module,
+                kind,
+                files.len(),
+                mapping.remote_path
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "SSH sync mapping execution failed: id={}, name={}, module={}, kind={}, local_path={}, remote_path={}, error={}",
+                mapping.id,
+                mapping.name,
+                mapping.module,
+                kind,
+                mapping.local_path,
+                mapping.remote_path,
+                error
+            );
+        }
     }
+
+    result
 }
 
 /// 同步所有启用的文件映射
@@ -207,6 +425,12 @@ pub async fn sync_mappings(
         .filter(|m| m.enabled)
         .filter(|m| module_filter.is_none() || Some(m.module.as_str()) == module_filter)
         .collect();
+    log::info!(
+        "SSH sync_mappings start: total_mappings={}, selected_mappings={}, module_filter={:?}",
+        mappings.len(),
+        filtered_mappings.len(),
+        module_filter
+    );
 
     for mapping in filtered_mappings {
         match sync_file_mapping(mapping, session).await {
@@ -222,6 +446,14 @@ pub async fn sync_mappings(
         }
     }
 
+    log::info!(
+        "SSH sync_mappings completed: success={}, synced_files={}, skipped_files={}, errors={}, module_filter={:?}",
+        errors.is_empty(),
+        synced_files.len(),
+        skipped_files.len(),
+        errors.len(),
+        module_filter
+    );
     SyncResult {
         success: errors.is_empty(),
         synced_files,
@@ -280,6 +512,21 @@ pub async fn read_remote_file_raw(session: &SshSession, path: &str) -> Result<St
     session.exec_command(&command).await
 }
 
+/// 查询远端登录用户的真实 $HOME。
+///
+/// 用于把 `~` 嵌入到文件**内容**(例如 Claude `known_marketplaces.json`
+/// 的 `installLocation`)前先解析成绝对路径。读写文件路径仍然走 shell 的
+/// `$HOME` 展开,这里只服务于"作为字段值落盘"的场景 —— Claude CLI 2.1.126+
+/// 不会展开字段值里的 `~`,直接判定 corrupted。
+pub async fn get_remote_user_home(session: &SshSession) -> Result<String, String> {
+    let raw = session.exec_command("echo $HOME").await?;
+    let home = raw.trim().to_string();
+    if home.is_empty() {
+        return Err("远端 $HOME 为空".to_string());
+    }
+    Ok(home)
+}
+
 /// 从远程服务器读取文件内容，带编码检测和自动 GBK→UTF-8 转换
 ///
 /// Flow:
@@ -297,7 +544,10 @@ pub async fn read_remote_file(session: &SshSession, path: &str) -> Result<String
     }
 
     // Non-UTF-8 detected, try iconv GBK→UTF-8 on remote
-    log::warn!("File {} is non-UTF-8, attempting remote iconv GBK→UTF-8...", path);
+    log::warn!(
+        "File {} is non-UTF-8, attempting remote iconv GBK→UTF-8...",
+        path
+    );
 
     let remote_path = path.replace("~", "$HOME");
     let convert_cmd = format!("iconv -f GBK -t UTF-8 \"{}\" 2>/dev/null", remote_path);
@@ -399,5 +649,118 @@ pub async fn check_remote_symlink_exists(
     match session.exec_command(&command).await {
         Ok(output) => output.trim() == "yes",
         Err(_) => false,
+    }
+}
+
+/// What currently sits at a remote path that the app may want to manage as a
+/// symlink into the central skills repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemotePathKind {
+    /// Nothing exists at the path.
+    Missing,
+    /// A symlink whose target lives under `central_prefix` (app-managed).
+    Managed,
+    /// A real file/directory, or a symlink pointing outside `central_prefix`
+    /// (user-owned; must never be removed or replaced by the app).
+    Foreign,
+}
+
+/// Inspect a remote path before the app deletes or replaces it: only symlinks
+/// whose target lives under the app-managed central dir are considered ours;
+/// everything else is user-owned and must be left alone.
+///
+/// Returns `Missing` when nothing exists, `Managed` when the path is a symlink
+/// under `central_prefix`, `Foreign` otherwise. Inspection failures fail safe
+/// to `Foreign` so the app never deletes something it cannot verify.
+pub async fn inspect_remote_path_kind(
+    session: &SshSession,
+    path: &str,
+    central_prefix: &str,
+) -> RemotePathKind {
+    let path_expanded = path.replace("~", "$HOME");
+    let central_expanded = central_prefix.replace("~", "$HOME");
+
+    // `-e` follows symlinks, so a dangling link is reported as missing by
+    // `[ -e ]`; `-L` catches it first. Output is one of:
+    //   managed:<target> | foreign:<target> | real | missing
+    let command = format!(
+        "if [ -L \"{}\" ]; then \
+             t=$(readlink \"{}\"); \
+             case \"$t\" in \
+               \"{}\"|\"{}\"/*) echo \"managed:$t\";; \
+               *) echo \"foreign:$t\";; \
+             esac; \
+         elif [ -e \"{}\" ]; then \
+             echo real; \
+         else \
+             echo missing; \
+         fi",
+        path_expanded, path_expanded, central_expanded, central_expanded, path_expanded
+    );
+
+    match session.exec_command(&command).await {
+        Ok(output) => {
+            let kind = output.trim().to_string();
+            if kind.starts_with("managed:") {
+                RemotePathKind::Managed
+            } else if kind.starts_with("foreign:") || kind == "real" {
+                RemotePathKind::Foreign
+            } else {
+                RemotePathKind::Missing
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to inspect remote path kind for '{}': {}",
+                path,
+                error
+            );
+            RemotePathKind::Foreign // fail safe: never delete what we cannot verify
+        }
+    }
+}
+
+/// Remove `path` on the remote host only when it is an app-managed symlink
+/// whose target lives under `central_prefix`. Real directories/files and
+/// foreign symlinks are never touched. Returns `true` when something was
+/// removed.
+pub async fn remove_remote_managed_symlink(
+    session: &SshSession,
+    path: &str,
+    central_prefix: &str,
+) -> Result<bool, String> {
+    match inspect_remote_path_kind(session, path, central_prefix).await {
+        RemotePathKind::Managed => {
+            let path_expanded = path.replace("~", "$HOME");
+            let command = format!("rm -f \"{}\"", path_expanded);
+            session.exec_command(&command).await?;
+            Ok(true)
+        }
+        RemotePathKind::Missing | RemotePathKind::Foreign => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pattern_file_display_path;
+    use std::path::Path;
+
+    #[test]
+    fn pattern_file_display_path_uses_static_glob_root() {
+        let pattern = "/home/me/.config/opencode/*.mjs";
+        let file_path = Path::new("/home/me/.config/opencode/plugin.mjs");
+
+        assert_eq!(pattern_file_display_path(pattern, file_path), "plugin.mjs");
+    }
+
+    #[test]
+    fn pattern_file_display_path_preserves_nested_relative_path() {
+        let pattern = "/home/me/.config/opencode/**/*.mjs";
+        let file_path = Path::new("/home/me/.config/opencode/plugins/plugin.mjs");
+
+        assert_eq!(
+            pattern_file_display_path(pattern, file_path),
+            "plugins/plugin.mjs"
+        );
     }
 }

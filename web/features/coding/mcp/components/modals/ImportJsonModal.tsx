@@ -6,6 +6,7 @@ import { useMcpTools } from '../../hooks/useMcpTools';
 import { useMcpStore } from '../../stores/mcpStore';
 import * as mcpApi from '../../services/mcpApi';
 import type { CreateMcpServerInput, McpServer, StdioConfig, HttpConfig } from '../../types';
+import { parseMcpServersFromJsonValue } from '../../utils/mcpJsonImport';
 import JsonEditor from '@/components/common/JsonEditor';
 import styles from './ImportMcpModal.module.less';
 import addMcpStyles from './AddMcpModal.module.less';
@@ -59,16 +60,16 @@ export const ImportJsonModal: React.FC<ImportJsonModalProps> = ({
     return tools.filter((t) => t.installed || selectedTools.includes(t.key));
   }, [tools, preferredTools, selectedTools]);
 
-  // Hidden tools: everything not in visible list, sorted by installed first
+  // Hidden dropdown only offers installed tools that are outside the preferred row.
   const hiddenTools = useMemo(() => {
-    const hidden = preferredTools && preferredTools.length > 0
-      ? tools.filter((t) => !preferredTools.includes(t.key) && !selectedTools.includes(t.key))
-      : tools.filter((t) => !t.installed && !selectedTools.includes(t.key));
-    // Sort: installed first
-    return [...hidden].sort((a, b) => {
-      if (a.installed === b.installed) return 0;
-      return a.installed ? -1 : 1;
-    });
+    if (preferredTools && preferredTools.length > 0) {
+      return tools.filter((t) => (
+        t.installed
+        && !preferredTools.includes(t.key)
+        && !selectedTools.includes(t.key)
+      ));
+    }
+    return [];
   }, [tools, preferredTools, selectedTools]);
 
   // Load preferred tools on mount
@@ -119,47 +120,6 @@ export const ImportJsonModal: React.FC<ImportJsonModalProps> = ({
     onClose();
   };
 
-  // Detect server type from config
-  const detectServerType = (config: Record<string, unknown>): 'stdio' | 'http' | 'sse' => {
-    if (config.type === 'stdio' || config.type === 'local') return 'stdio';
-    if (config.type === 'http') return 'http';
-    if (config.type === 'sse' || config.type === 'remote') return 'sse';
-    if (config.command) return 'stdio';
-    if (config.url) return 'http';
-    return 'stdio';
-  };
-
-  // Parse server config to unified format
-  const parseServerConfig = (config: Record<string, unknown>): StdioConfig | HttpConfig => {
-    const serverType = detectServerType(config);
-
-    if (serverType === 'stdio') {
-      let command = '';
-      let args: string[] = [];
-
-      if (Array.isArray(config.command)) {
-        command = String(config.command[0] || '');
-        args = config.command.slice(1).map(String);
-      } else {
-        command = String(config.command || '');
-        args = Array.isArray(config.args) ? config.args.map(String) : [];
-      }
-
-      const env = (config.env || config.environment) as Record<string, string> | undefined;
-
-      return {
-        command,
-        args,
-        env: env && Object.keys(env).length > 0 ? env : undefined,
-      };
-    } else {
-      return {
-        url: String(config.url || ''),
-        headers: config.headers as Record<string, string> | undefined,
-      };
-    }
-  };
-
   const handleParse = () => {
     if (!jsonValid || !jsonValue) {
       setParseError(t('mcp.importJson.invalidJson'));
@@ -167,35 +127,17 @@ export const ImportJsonModal: React.FC<ImportJsonModalProps> = ({
     }
 
     try {
-      const parsed = jsonValue as Record<string, unknown>;
-      const result: ParsedServer[] = [];
+      const result: ParsedServer[] = parseMcpServersFromJsonValue(jsonValue).map((server) => {
+        const existing = servers.find((s) => s.name === server.name);
 
-      // Check if it's wrapped in mcpServers
-      const serversObj = (parsed.mcpServers || parsed) as Record<string, unknown>;
-
-      // Validate it's an object
-      if (typeof serversObj !== 'object' || Array.isArray(serversObj)) {
-        throw new Error(t('mcp.importJson.invalidFormat'));
-      }
-
-      // Parse each server
-      for (const [name, config] of Object.entries(serversObj)) {
-        if (typeof config !== 'object' || config === null) continue;
-
-        const serverConfig = config as Record<string, unknown>;
-        const serverType = detectServerType(serverConfig);
-
-        // Check if duplicate
-        const existing = servers.find((s) => s.name === name);
-
-        result.push({
-          name,
-          server_type: serverType,
-          server_config: parseServerConfig(serverConfig),
+        return {
+          name: server.name,
+          server_type: server.server_type,
+          server_config: server.server_config,
           isDuplicate: !!existing,
           existingId: existing?.id,
-        });
-      }
+        };
+      });
 
       if (result.length === 0) {
         throw new Error(t('mcp.importJson.noServersFound'));
@@ -415,24 +357,15 @@ export const ImportJsonModal: React.FC<ImportJsonModalProps> = ({
               menu={{
                 items: hiddenTools.map((tool) => ({
                   key: tool.key,
-                  disabled: !tool.installed,
                   label: (
                     <Checkbox
                       checked={selectedTools.includes(tool.key)}
-                      disabled={!tool.installed}
                       onClick={(e) => e.stopPropagation()}
                     >
                       {tool.display_name}
-                      {!tool.installed && (
-                        <span className={addMcpStyles.notInstalledTag}> {t('mcp.notInstalled')}</span>
-                      )}
                     </Checkbox>
                   ),
-                  onClick: () => {
-                    if (tool.installed) {
-                      handleToggleTool(tool.key);
-                    }
-                  },
+                  onClick: () => handleToggleTool(tool.key),
                 })),
               }}
             >

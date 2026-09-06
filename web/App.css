@@ -16,11 +16,31 @@
   /* Border colors */
   --color-border: rgba(0, 0, 0, 0.06);
   --color-border-secondary: rgba(0, 0, 0, 0.15);
-  --color-border-card: rgb(228, 228, 231);
+  --color-border-card: rgba(0, 0, 0, 0.05);
+  --color-border-card-subtle: rgba(0, 0, 0, 0.04);
 
-  /* Shadow and scrollbar */
-  --color-shadow: rgba(0, 0, 0, 0.08);
+  /* Brand primary, aligned with the antd colorPrimary token in providers.tsx */
+  --color-primary: #1890ff;
+
+  /* Semantic status colors */
+  --color-status-success: #16a34a;
+  --color-status-warning: #d97706;
+  --color-status-error: #dc2626;
+  --color-status-error-bg: rgba(220, 38, 38, 0.08);
+  --color-status-error-border: rgba(220, 38, 38, 0.28);
+
+  /* Shadow base colors */
+  --color-shadow: rgba(0, 0, 0, 0.06);
+  --color-shadow-hover: rgba(0, 0, 0, 0.1);
   --color-shadow-secondary: rgba(0, 0, 0, 0.04);
+  /* Composed shadows for different elevations */
+  /* Small cards in dense lists (provider cards, MCP/Skills items) */
+  --shadow-card: 0 2px 8px var(--color-shadow);
+  --shadow-card-hover: 0 4px 12px var(--color-shadow-hover);
+  --shadow-card-sm: 0 2px 8px var(--color-shadow);
+  --shadow-card-sm-hover: 0 4px 12px var(--color-shadow-hover);
+  /* Large containers (Collapse panels, modals) - heavier for visual hierarchy */
+  --shadow-container: 0 2px 8px rgba(0, 0, 0, 0.08), 0 4px 16px rgba(0, 0, 0, 0.06);
   --color-scrollbar: rgba(0, 0, 0, 0.2);
 }
 
@@ -41,11 +61,25 @@
   /* Border colors */
   --color-border: rgba(255, 255, 255, 0.12);
   --color-border-secondary: rgba(255, 255, 255, 0.2);
-  --color-border-card: rgba(255, 255, 255, 0.12);
+  --color-border-card: rgba(255, 255, 255, 0.08);
+  --color-border-card-subtle: rgba(255, 255, 255, 0.06);
 
-  /* Shadow and scrollbar */
-  --color-shadow: rgba(0, 0, 0, 0.45);
-  --color-shadow-secondary: rgba(0, 0, 0, 0.25);
+  /* Brand primary, aligned with the antd colorPrimary token in providers.tsx */
+  --color-primary: #1668dc;
+
+  /* Semantic status colors */
+  --color-status-success: #22c55e;
+  --color-status-warning: #f59e0b;
+  --color-status-error: #f87171;
+  --color-status-error-bg: rgba(248, 113, 113, 0.12);
+  --color-status-error-border: rgba(248, 113, 113, 0.32);
+
+  /* Shadow base colors */
+  --color-shadow: rgba(0, 0, 0, 0.5);
+  --color-shadow-hover: rgba(0, 0, 0, 0.6);
+  --color-shadow-secondary: rgba(0, 0, 0, 0.3);
+  /* Large containers (dark mode) */
+  --shadow-container: 0 2px 8px rgba(0, 0, 0, 0.6), 0 4px 16px rgba(0, 0, 0, 0.5);
   --color-scrollbar: rgba(255, 255, 255, 0.2);
 }
 
@@ -95,7 +129,7 @@ body {
   background: var(--color-bg-container);
   border: none;
   border-radius: 12px;
-  box-shadow: 0 2px 8px var(--color-shadow), 0 4px 16px var(--color-shadow-secondary);
+  box-shadow: var(--shadow-container);
   overflow: hidden;
 }
 
@@ -103,12 +137,16 @@ body {
   border-bottom: none;
 }
 
+.ant-collapse .ant-collapse-panel {
+  border-top: 1px solid var(--color-border) !important;
+}
+
 .ant-collapse > .ant-collapse-item > .ant-collapse-header {
   background: var(--color-bg-container);
 }
 
 .ant-collapse > .ant-collapse-item > .ant-collapse-content {
-  border-top: 1px solid var(--color-border);
+  border-top: 1px solid var(--color-border-card-subtle);
 }
 
 .ant-collapse > .ant-collapse-item > .ant-collapse-content > .ant-collapse-content-box {
@@ -166,6 +204,28 @@ body {
 
 [data-theme='dark'] .ant-select-item-option-selected:not(.ant-select-item-option-disabled) {
   background-color: var(--color-bg-selected);
+}
+
+/* Keep tall modals within the viewport and scroll their body instead. */
+.ant-modal-wrap {
+  box-sizing: border-box;
+  padding: calc(var(--ai-modal-viewport-block-gap, 48px) / 2)
+    calc(var(--ai-modal-viewport-inline-gap, 32px) / 2);
+}
+
+.ant-modal {
+  max-width: calc(100vw - var(--ai-modal-viewport-inline-gap, 32px));
+}
+
+.ant-modal .ant-modal-content {
+  display: flex;
+  max-height: calc(100vh - var(--ai-modal-viewport-block-gap, 48px));
+  flex-direction: column;
+}
+
+.ant-modal .ant-modal-body {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* Fix Modal in dark mode */

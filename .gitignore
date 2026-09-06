@@ -7,13 +7,17 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+target
+target-test
 node_modules
 dist
 dist-ssr
 *.local
 
+.pnpm-store/
 .sisyphus/
 .ace-tool/
+.tmp/
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -25,3 +29,6 @@ dist-ssr
 *.sln
 *.sw?
 nul
+.workflow
+.pi
+.playwright-mcp

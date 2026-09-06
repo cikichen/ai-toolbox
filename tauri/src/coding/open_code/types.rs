@@ -1,10 +1,10 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use surrealdb::sql::Thing;
-
 /// Deserialize a JSON value, normalizing null and empty objects to None
-fn deserialize_nullable_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+fn deserialize_nullable_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -30,10 +30,10 @@ fn is_empty_or_none(val: &Option<serde_json::Value>) -> bool {
 // OpenCode Common Config Types
 // ============================================================================
 
-/// OpenCodeCommonConfig - Database record
+/// OpenCodeCommonConfig - database record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeCommonConfigRecord {
-    pub id: Thing,
+    pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
     pub updated_at: String,
@@ -80,10 +80,26 @@ pub enum ReadConfigResult {
     Error { error: String },
 }
 
+/// Raw file contents for the OpenCode file-based preview modal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodePreviewData {
+    pub config_path: String,
+    /// Raw main OpenCode config file content (`opencode.json` / `opencode.jsonc`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_content: Option<String>,
+    pub auth_path: String,
+    /// Raw `auth.json` file content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_content: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeModelLimit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<i64>,
 }
@@ -99,7 +115,13 @@ pub struct OpenCodeModelModalities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeModel {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<OpenCodeModelLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,10 +134,20 @@ pub struct OpenCodeModel {
     pub tool_call: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_nullable_value", skip_serializing_if = "is_empty_or_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_value",
+        skip_serializing_if = "is_empty_or_none"
+    )]
     pub options: Option<serde_json::Value>,
-    #[serde(default, deserialize_with = "deserialize_nullable_value", skip_serializing_if = "is_empty_or_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable_value",
+        skip_serializing_if = "is_empty_or_none"
+    )]
     pub variants: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +170,12 @@ pub struct OpenCodeProviderOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeProvider {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub npm: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -150,6 +188,24 @@ pub struct OpenCodeProvider {
     pub whitelist: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blacklist: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenCodePluginEntry {
+    Name(String),
+    NameWithOptions((String, serde_json::Map<String, serde_json::Value>)),
+}
+
+impl OpenCodePluginEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            OpenCodePluginEntry::Name(name) => name,
+            OpenCodePluginEntry::NameWithOptions((name, _)) => name,
+        }
+    }
 }
 
 // ============================================================================
@@ -160,6 +216,8 @@ pub struct OpenCodeProvider {
 #[serde(rename_all = "camelCase")]
 pub struct OpenCodeDiagnosticsConfig {
     pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_test_model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,15 +239,56 @@ pub struct OpenCodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<IndexMap<String, OpenCodeProvider>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_providers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(rename = "small_model", skip_serializing_if = "Option::is_none")]
     pub small_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<Vec<String>>,
+    pub plugin: Option<Vec<OpenCodePluginEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<serde_json::Value>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+// ============================================================================
+// Prompt Config Types
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodePromptConfigInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodePromptConfig {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub is_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenCodePromptConfigContent {
+    pub name: String,
+    pub content: String,
+    pub is_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<i32>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 // ============================================================================
@@ -206,6 +305,10 @@ pub struct FreeModel {
     pub provider_name: String, // Display name (e.g., "OpenCode Zen")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_mode: Option<String>,
 }
 
 /// Provider models data stored in database
@@ -222,7 +325,7 @@ pub struct ProviderModelsData {
 /// Provider models database record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModelsRecord {
-    pub id: Thing,
+    pub id: String,
     pub data: ProviderModelsData,
 }
 
@@ -250,6 +353,10 @@ pub struct UnifiedModelOption {
     pub provider_id: String,
     pub model_id: String,
     pub is_free: bool, // Whether this is a free model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_mode: Option<String>,
 }
 
 // ============================================================================
@@ -303,6 +410,9 @@ pub struct GetAuthProvidersResponse {
     /// Official models from providers that ARE in custom config (merged)
     /// Key: provider_id, Value: list of official models not in custom config
     pub merged_models: std::collections::HashMap<String, Vec<OfficialModel>>,
+    /// Provider IDs that can resolve auth.json credential + default API base URL
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resolved_auth_provider_ids: Vec<String>,
     /// All custom provider IDs for reference
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub custom_provider_ids: Vec<String>,
@@ -330,4 +440,88 @@ pub struct OpenCodeFavoriteProvider {
     pub diagnostics: Option<OpenCodeDiagnosticsConfig>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAllApiHubProvider {
+    pub provider_id: String,
+    pub name: String,
+    pub npm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub requires_browser_open: bool,
+    pub is_disabled: bool,
+    pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_cny: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_type: Option<String>,
+    pub account_label: String,
+    pub source_profile_name: String,
+    pub source_extension_id: String,
+    pub provider_config: OpenCodeProvider,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAllApiHubProvidersResult {
+    pub found: bool,
+    pub profiles: Vec<crate::coding::all_api_hub::AllApiHubProfileInfo>,
+    pub providers: Vec<OpenCodeAllApiHubProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveOpenCodeAllApiHubProvidersRequest {
+    pub provider_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenCodeConfig;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn opencode_config_roundtrip_preserves_agent_fields_and_unknown_options() {
+        let source = json!({
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {},
+            "default_agent": "build",
+            "agent": {
+                "explore": {
+                    "model": "anthropic/claude-sonnet-5",
+                    "variant": "high",
+                    "permission": {
+                        "edit": "deny",
+                        "bash": {
+                            "*": "ask",
+                            "git diff*": "allow"
+                        }
+                    },
+                    "options": {
+                        "providerPrivateFlag": true
+                    },
+                    "futureField": {
+                        "enabled": true
+                    }
+                }
+            }
+        });
+
+        let config: OpenCodeConfig =
+            serde_json::from_value(source.clone()).expect("OpenCode config should deserialize");
+        let serialized: Value =
+            serde_json::to_value(config).expect("OpenCode config should serialize");
+
+        assert_eq!(serialized, source);
+    }
 }

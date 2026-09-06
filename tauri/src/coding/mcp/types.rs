@@ -56,7 +56,7 @@ pub struct HttpConfig {
     pub headers: Option<Value>,
 }
 
-/// MCP Server record stored in SurrealDB
+/// MCP Server record stored in SQLite JSONB
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpServer {
     pub id: String,
@@ -68,21 +68,33 @@ pub struct McpServer {
     pub sync_details: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_note: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<i64>,
     #[serde(default)]
     pub sort_index: i32,
+    #[serde(default = "default_true")]
+    pub management_enabled: bool,
+    #[serde(default)]
+    pub disabled_previous_tools: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// MCP Server sync detail for a specific tool
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpSyncDetail {
     pub tool: String,
-    pub status: String,  // "ok" | "error" | "pending"
+    pub status: String, // "ok" | "error" | "pending"
     pub synced_at: Option<i64>,
     pub error_message: Option<String>,
 }
@@ -97,9 +109,13 @@ pub struct McpServerDto {
     pub enabled_tools: Vec<String>,
     pub sync_details: Vec<McpSyncDetailDto>,
     pub description: Option<String>,
+    pub user_group: Option<String>,
+    pub user_note: Option<String>,
     pub tags: Vec<String>,
     pub timeout: Option<i64>,
     pub sort_index: i32,
+    pub management_enabled: bool,
+    pub disabled_previous_tools: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -150,6 +166,8 @@ pub struct McpPreferences {
     pub favorites_initialized: bool,
     #[serde(default)]
     pub sync_disabled_to_opencode: bool,
+    #[serde(default)]
+    pub limit_add_more_to_preferred_tools: bool,
     pub updated_at: i64,
 }
 
@@ -161,6 +179,7 @@ impl Default for McpPreferences {
             preferred_tools: Vec::new(),
             favorites_initialized: false,
             sync_disabled_to_opencode: false,
+            limit_add_more_to_preferred_tools: false,
             updated_at: 0,
         }
     }
@@ -174,12 +193,22 @@ pub struct McpSyncResultDto {
     pub error_message: Option<String>,
 }
 
+/// Preview result for a group-inventory JSON import (server grouping only).
+#[derive(Debug, Serialize)]
+pub struct McpGroupInventoryPreviewDto {
+    pub valid: bool,
+    pub group_count: usize,
+    pub matched_server_count: usize,
+    pub changed_count: usize,
+    pub errors: Vec<String>,
+}
+
 /// Import result
 #[derive(Debug, Serialize)]
 pub struct McpImportResultDto {
     pub servers_imported: i32,
     pub servers_skipped: i32,
-    pub servers_duplicated: Vec<String>,  // Names of servers created with suffix due to config differences
+    pub servers_duplicated: Vec<String>, // Names of servers created with suffix due to config differences
     pub errors: Vec<String>,
 }
 
@@ -191,6 +220,10 @@ pub struct McpDiscoveredServerDto {
     pub tool_name: String,
     pub server_type: String,
     pub server_config: Value,
+    /// AI Toolbox tool keys marked enabled at the source. Only set for the
+    /// CC Switch source (`tool_key = "cc_switch"`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_enabled_tools: Vec<String>,
 }
 
 /// Scan result for discovered MCP servers
@@ -199,6 +232,44 @@ pub struct McpScanResultDto {
     pub total_tools_scanned: i32,
     pub total_servers_found: i32,
     pub servers: Vec<McpDiscoveredServerDto>,
+}
+
+/// Package manager family used to resolve an MCP stdio runner package version.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum McpPackageVersionManager {
+    Npx,
+    Uv,
+}
+
+/// Request item for resolving package versions used by MCP stdio runner commands.
+#[derive(Clone, Debug, Deserialize)]
+pub struct McpPackageVersionResolveRequest {
+    pub manager: McpPackageVersionManager,
+    pub package_name: String,
+}
+
+/// Best-effort package version resolution result.
+#[derive(Debug, Serialize)]
+pub struct McpPackageVersionResolveResult {
+    pub manager: McpPackageVersionManager,
+    pub package_name: String,
+    pub version: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// Managed MCP group entity (mirrors SkillGroupRecord; membership is by the
+/// server's `user_group` text matching the group name).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub sort_index: i32,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// Favorite MCP server (for quick select in add modal)

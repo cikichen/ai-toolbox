@@ -1,13 +1,52 @@
 import React from 'react';
-import { Modal, Form, Input, Button, Typography, Collapse, Select, message, Divider, Space } from 'antd';
-import { PlusOutlined, DeleteOutlined, SwapOutlined, ImportOutlined } from '@ant-design/icons';
+import { Modal, Form, Input, Button, Typography, Collapse, Select, message, Divider } from 'antd';
+import { MoreOutlined, PlusOutlined, DeleteOutlined, SwapOutlined, ImportOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import { SLIM_AGENT_TYPES, SLIM_AGENT_DISPLAY_NAMES, SLIM_AGENT_DESCRIPTIONS, type OhMyOpenCodeSlimAgents, type SlimAgentType } from '@/types/ohMyOpenCodeSlim';
+import {
+  SLIM_AGENT_TYPES,
+  getSlimAgentDescriptionKey,
+  getSlimAgentDisplayNameKey,
+  type OhMyOpenCodeSlimAgents,
+  type OhMyOpenCodeSlimFallbackConfig,
+  type SlimAgentType,
+} from '@/types/ohMyOpenCodeSlim';
 import JsonEditor from '@/components/common/JsonEditor';
-import ImportJsonConfigModal, { type ImportedConfigData } from './ImportJsonConfigModal';
+import {
+  applyBatchReplaceModel,
+  collectBatchReplaceSourceUsage,
+} from './batchReplaceModelUtils';
+import ImportJsonConfigModal from './ImportJsonConfigModal';
+import { type ImportedConfigData } from './importJsonConfigUtils';
+import OhMyOpenCodeSlimCouncilForm, {
+  buildSlimCouncilConfig,
+  mergeCouncilAgentIntoAgents,
+  parseSlimCouncilFormValues,
+} from './OhMyOpenCodeSlimCouncilForm';
+import { buildSlimAgentsFromFormValues, splitSlimModelValue } from './ohMyOpenCodeSlimFormUtils';
 import styles from './OhMyOpenCodeSlimConfigModal.module.less';
 
 const { Text } = Typography;
+type ModelOption = { label: string; value: string; disabled?: boolean };
+type ModelOptionGroup = { label: string; options: ModelOption[] };
+type GroupedModelOptions = Array<ModelOption | ModelOptionGroup>;
+
+const getSlimBatchReplaceVariantFieldName = (modelFieldName: string) =>
+  modelFieldName.replace('_model', '_variant');
+
+const getSlimBatchReplaceFallbackFieldName = (modelFieldName: string) =>
+  modelFieldName.replace('_model', '_fallback_models');
+
+const MANAGED_SLIM_AGENT_KEYS = new Set(['model', 'variant', 'fallback_models']);
+
+const extractAgentAdvancedSettings = (agent: Record<string, unknown>): Record<string, unknown> => {
+  const advancedSettings: Record<string, unknown> = {};
+  Object.entries(agent).forEach(([key, value]) => {
+    if (!MANAGED_SLIM_AGENT_KEYS.has(key) && value !== undefined) {
+      advancedSettings[key] = value;
+    }
+  });
+  return advancedSettings;
+};
 
 interface OhMyOpenCodeSlimConfigModalProps {
   open: boolean;
@@ -16,9 +55,11 @@ interface OhMyOpenCodeSlimConfigModalProps {
     id?: string;
     name: string;
     agents?: OhMyOpenCodeSlimAgents;
+    council?: Record<string, unknown> | null;
+    fallback?: OhMyOpenCodeSlimFallbackConfig | null;
     otherFields?: Record<string, unknown>;
   };
-  modelOptions: { label: string; value: string }[];
+  modelOptions: GroupedModelOptions;
   /** Map of model ID to its variant keys */
   modelVariantsMap?: Record<string, string[]>;
   onCancel: () => void;
@@ -29,8 +70,70 @@ export interface OhMyOpenCodeSlimConfigFormValues {
   id?: string;
   name: string;
   agents: OhMyOpenCodeSlimAgents;
+  council?: Record<string, unknown>;
+  fallback?: OhMyOpenCodeSlimFallbackConfig;
   otherFields?: Record<string, unknown>;
 }
+
+const asStringArray = (value: unknown): string[] | undefined => {
+  if (typeof value === 'string') {
+    const trimmedValue = value.trim();
+    return trimmedValue ? [trimmedValue] : undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const items = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item !== '');
+
+  return items.length > 0 ? items : undefined;
+};
+
+const mergeFallbackModels = (...fallbackGroups: Array<string[] | undefined>): string[] | undefined => {
+  const merged: string[] = [];
+  fallbackGroups.forEach((fallbackModels) => {
+    fallbackModels?.forEach((fallbackModel) => {
+      if (!merged.includes(fallbackModel)) {
+        merged.push(fallbackModel);
+      }
+    });
+  });
+
+  return merged.length > 0 ? merged : undefined;
+};
+
+const extractManagedFallbackState = (
+  fallback?: OhMyOpenCodeSlimFallbackConfig | null,
+): {
+  fallback: OhMyOpenCodeSlimFallbackConfig | undefined;
+  chains: Record<string, string[]> | undefined;
+} => {
+  if (!fallback || typeof fallback !== 'object' || Array.isArray(fallback)) {
+    return { fallback: undefined, chains: undefined };
+  }
+
+  const normalizedFallback: OhMyOpenCodeSlimFallbackConfig = { ...fallback };
+  const rawChains = fallback.chains;
+  const chains: Record<string, string[]> = {};
+  if (rawChains && typeof rawChains === 'object' && !Array.isArray(rawChains)) {
+    Object.entries(rawChains).forEach(([agentKey, chainValue]) => {
+      const parsedChain = asStringArray(chainValue);
+      if (parsedChain) {
+        chains[agentKey] = parsedChain;
+      }
+    });
+  }
+  delete normalizedFallback.chains;
+
+  return {
+    fallback: Object.keys(normalizedFallback).length > 0 ? normalizedFallback : undefined,
+    chains: Object.keys(chains).length > 0 ? chains : undefined,
+  };
+};
 
 const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = ({
   open,
@@ -51,6 +154,7 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
   const [showAddAgent, setShowAddAgent] = React.useState(false);
   const [showBatchReplace, setShowBatchReplace] = React.useState(false);
   const [showImportJson, setShowImportJson] = React.useState(false);
+  const [expandedAgents, setExpandedAgents] = React.useState<Record<string, boolean>>({});
 
   // Batch replace model state
   const [batchReplaceFromModel, setBatchReplaceFromModel] = React.useState<string | undefined>(undefined);
@@ -58,19 +162,20 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
   const [batchReplaceFromVariant, setBatchReplaceFromVariant] = React.useState<string | undefined>(undefined);
   const [batchReplaceToVariant, setBatchReplaceToVariant] = React.useState<string | undefined>(undefined);
 
-  const fromModelVariants = React.useMemo(
-    () => (batchReplaceFromModel ? modelVariantsMap[batchReplaceFromModel] ?? [] : []),
-    [batchReplaceFromModel, modelVariantsMap]
-  );
-
   const toModelVariants = React.useMemo(
     () => (batchReplaceToModel ? modelVariantsMap[batchReplaceToModel] ?? [] : []),
     [batchReplaceToModel, modelVariantsMap]
   );
 
   // Store otherFields - keep both raw string and parsed value for submit-time validation
+  const advancedSettingsRef = React.useRef<Record<string, Record<string, unknown>>>({});
+  const advancedSettingsRawRef = React.useRef<Record<string, string>>({});
   const otherFieldsRef = React.useRef<Record<string, unknown>>({});
   const otherFieldsRawRef = React.useRef<string>('');
+  const fallbackConfigRef = React.useRef<OhMyOpenCodeSlimFallbackConfig | undefined>(undefined);
+  // Latest agents.council object used when merging managed synthesizer fields on save/import.
+  const councilAgentSourceRef = React.useRef<Record<string, unknown> | null>(null);
+  const councilOtherFieldsValidRef = React.useRef(true);
 
   // Track if modal has been initialized
   const initializedRef = React.useRef(false);
@@ -80,6 +185,35 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
 
   // Built-in agent keys
   const builtInAgentKeys = React.useMemo(() => [...SLIM_AGENT_TYPES], []);
+  const batchReplaceModelFieldNames = React.useMemo(
+    () => [...builtInAgentKeys, ...customAgents].map((agentType) => `agent_${agentType}_model`),
+    [builtInAgentKeys, customAgents]
+  );
+  const watchedFormValues = Form.useWatch([], form) as Record<string, unknown> | undefined;
+  const batchReplaceSourceUsage = React.useMemo(() => {
+    return collectBatchReplaceSourceUsage({
+      values: watchedFormValues ?? {},
+      modelFieldNames: batchReplaceModelFieldNames,
+      getVariantFieldName: getSlimBatchReplaceVariantFieldName,
+      getFallbackFieldName: getSlimBatchReplaceFallbackFieldName,
+    });
+  }, [batchReplaceModelFieldNames, watchedFormValues]);
+  const batchReplaceFromModelOptions = React.useMemo<GroupedModelOptions>(() => {
+    return Array.from(batchReplaceSourceUsage.usedModels)
+      .sort((left, right) => left.localeCompare(right))
+      .map((modelId) => ({
+        label: modelId,
+        value: modelId
+      }));
+  }, [batchReplaceSourceUsage.usedModels]);
+  const batchReplaceFromVariantOptions = React.useMemo(() => {
+    if (!batchReplaceFromModel) {
+      return [];
+    }
+
+    return Array.from(batchReplaceSourceUsage.variantsByModel.get(batchReplaceFromModel) ?? [])
+      .sort((left, right) => left.localeCompare(right));
+  }, [batchReplaceFromModel, batchReplaceSourceUsage.variantsByModel]);
 
   // Initialize form values when modal opens
   React.useEffect(() => {
@@ -96,28 +230,64 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
 
     // Always reset form and refs first to prevent stale values from previous edits
     form.resetFields();
+    advancedSettingsRef.current = {};
+    advancedSettingsRawRef.current = {};
     otherFieldsRef.current = {};
     otherFieldsRawRef.current = '';
+    fallbackConfigRef.current = undefined;
+    councilAgentSourceRef.current = null;
 
     if (initialValues) {
+      const initialCouncilAgent =
+        initialValues.agents?.council && typeof initialValues.agents.council === 'object'
+          ? (initialValues.agents.council as Record<string, unknown>)
+          : null;
+      councilAgentSourceRef.current = initialCouncilAgent;
+      const councilFormValues = parseSlimCouncilFormValues({
+        council: initialValues.council ?? null,
+        agents: (initialValues.agents as Record<string, unknown> | undefined) ?? null,
+      });
+      const { fallback, chains: legacyFallbackChains } = extractManagedFallbackState(initialValues.fallback);
       // Build form values with nested agent paths
       const formValues: Record<string, unknown> = {
         id: initialValues.id,
         name: initialValues.name,
+        ...councilFormValues,
       };
 
       const detectedCustomAgents: string[] = [];
       const builtInAgentKeySet = new Set<string>(builtInAgentKeys);
 
-      // Set agent models (built-in + custom)
+      // Set agent models (built-in + custom). agents.council is owned by the Council form.
       if (initialValues.agents) {
         Object.entries(initialValues.agents).forEach(([agentType, agent]) => {
+          if (!agent || typeof agent !== 'object') {
+            return;
+          }
+          if (agentType === 'council') {
+            return;
+          }
           if (agent?.model) {
-            formValues[`agent_${agentType}_model`] = agent.model;
+            const modelState = splitSlimModelValue(agent.model);
+            if (modelState.primaryModel) {
+              formValues[`agent_${agentType}_model`] = modelState.primaryModel;
+            }
+            if (modelState.primaryVariant && !agent.variant) {
+              formValues[`agent_${agentType}_variant`] = modelState.primaryVariant;
+            }
+            const agentFallback = mergeFallbackModels(
+              modelState.fallbackModels,
+              legacyFallbackChains?.[agentType],
+            );
+            if (agentFallback) {
+              formValues[`agent_${agentType}_fallback_models`] = agentFallback;
+            }
           }
           if (typeof agent?.variant === 'string' && agent.variant) {
             formValues[`agent_${agentType}_variant`] = agent.variant;
           }
+
+          advancedSettingsRef.current[agentType] = extractAgentAdvancedSettings(agent as Record<string, unknown>);
 
           // Track custom agents
           if (!builtInAgentKeySet.has(agentType)) {
@@ -126,9 +296,27 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
         });
       }
 
+      if (legacyFallbackChains) {
+        Object.entries(legacyFallbackChains).forEach(([agentType, chain]) => {
+          if (agentType === 'council') {
+            return;
+          }
+          if (chain.length > 0) {
+            formValues[`agent_${agentType}_fallback_models`] = mergeFallbackModels(
+              asStringArray(formValues[`agent_${agentType}_fallback_models`]),
+              chain,
+            );
+          }
+          if (!builtInAgentKeySet.has(agentType) && !detectedCustomAgents.includes(agentType)) {
+            detectedCustomAgents.push(agentType);
+          }
+        });
+      }
+
       setCustomAgents(detectedCustomAgents);
 
       form.setFieldsValue(formValues);
+      fallbackConfigRef.current = fallback;
       otherFieldsRef.current = initialValues.otherFields || {};
       otherFieldsRawRef.current = initialValues.otherFields && Object.keys(initialValues.otherFields).length > 0
         ? JSON.stringify(initialValues.otherFields, null, 2)
@@ -136,15 +324,17 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
     } else {
       setCustomAgents([]);
     }
-    
+
     setShowAddAgent(false);
     setShowBatchReplace(false);
     setShowImportJson(false);
+    setExpandedAgents({});
     setNewAgentKey('');
     setBatchReplaceFromModel(undefined);
     setBatchReplaceToModel(undefined);
     setBatchReplaceFromVariant(undefined);
     setBatchReplaceToVariant(undefined);
+    councilOtherFieldsValidRef.current = true;
   }, [open, initialValues, form, builtInAgentKeys]);
 
   React.useEffect(() => {
@@ -152,10 +342,20 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
       setBatchReplaceFromVariant(undefined);
       return;
     }
-    if (batchReplaceFromVariant && !fromModelVariants.includes(batchReplaceFromVariant)) {
+    if (!batchReplaceSourceUsage.usedModels.has(batchReplaceFromModel)) {
+      setBatchReplaceFromModel(undefined);
+      setBatchReplaceFromVariant(undefined);
+      return;
+    }
+    if (batchReplaceFromVariant && !batchReplaceFromVariantOptions.includes(batchReplaceFromVariant)) {
       setBatchReplaceFromVariant(undefined);
     }
-  }, [batchReplaceFromModel, batchReplaceFromVariant, fromModelVariants]);
+  }, [
+    batchReplaceFromModel,
+    batchReplaceFromVariant,
+    batchReplaceFromVariantOptions,
+    batchReplaceSourceUsage.usedModels,
+  ]);
 
   React.useEffect(() => {
     if (!batchReplaceToModel) {
@@ -176,7 +376,7 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
       return;
     }
 
-    const sourceVariants = modelVariantsMap[fromModel] ?? [];
+    const sourceVariants = batchReplaceFromVariantOptions;
     if (batchReplaceFromVariant && !sourceVariants.includes(batchReplaceFromVariant)) {
       message.warning(t('opencode.ohMyOpenCode.batchReplaceInvalidFromVariant'));
       return;
@@ -193,44 +393,17 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
       return;
     }
 
-    const allAgentKeys = [...builtInAgentKeys, ...customAgents];
-    const modelFieldNames = allAgentKeys.map((agentType) => `agent_${agentType}_model`);
-
     const values = form.getFieldsValue(true) as Record<string, unknown>;
-    const updateValues: Record<string, unknown> = {};
-
-    let replacedCount = 0;
-    let clearedVariantCount = 0;
-    const hasTargetVariants = targetVariants.length > 0;
-
-    modelFieldNames.forEach((modelFieldName) => {
-      if (values[modelFieldName] !== fromModel) {
-        return;
-      }
-
-      const variantFieldName = modelFieldName.replace('_model', '_variant');
-      const variantValue = values[variantFieldName];
-
-      if (batchReplaceFromVariant) {
-        if (typeof variantValue !== 'string' || variantValue !== batchReplaceFromVariant) {
-          return;
-        }
-      }
-
-      updateValues[modelFieldName] = toModel;
-      replacedCount += 1;
-
-      if (batchReplaceToVariant) {
-        updateValues[variantFieldName] = batchReplaceToVariant;
-        return;
-      }
-
-      if (typeof variantValue === 'string' && variantValue) {
-        if (!hasTargetVariants || !targetVariants.includes(variantValue)) {
-          updateValues[variantFieldName] = undefined;
-          clearedVariantCount += 1;
-        }
-      }
+    const { updateValues, replacedCount, clearedVariantCount } = applyBatchReplaceModel({
+      values,
+      modelFieldNames: batchReplaceModelFieldNames,
+      fromModel,
+      toModel,
+      fromVariant: batchReplaceFromVariant,
+      toVariant: batchReplaceToVariant,
+      targetVariants,
+      getVariantFieldName: getSlimBatchReplaceVariantFieldName,
+      getFallbackFieldName: getSlimBatchReplaceFallbackFieldName,
     });
 
     if (replacedCount === 0) {
@@ -251,40 +424,116 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
     message.success(t('opencode.ohMyOpenCode.batchReplaceSuccess', { count: replacedCount }));
   };
 
-  const handleImportJson = (data: ImportedConfigData, _mode: 'core' | 'full') => {
-    const updateValues: Record<string, string | undefined> = {};
+  const handleImportJson = (data: ImportedConfigData, mode: 'core' | 'full') => {
+    const updateValues: Record<string, unknown> = {};
     const builtInAgentKeySet = new Set<string>(builtInAgentKeys);
     const newCustomAgents: string[] = [];
     let agentCount = 0;
+    let nextImportedFallback: OhMyOpenCodeSlimFallbackConfig | undefined = fallbackConfigRef.current;
 
-    // Process agents
+    // Process agents. agents.council is owned by the Council form, not the agent list UI.
     if (data.agents) {
       Object.entries(data.agents).forEach(([agentType, agentConfig]) => {
         if (!agentConfig || typeof agentConfig !== 'object') return;
+        if (agentType === 'council') {
+          return;
+        }
+        const normalizedAgentConfig = agentConfig as Record<string, unknown>;
 
         // Detect custom agents
         if (!builtInAgentKeySet.has(agentType) && !customAgents.includes(agentType) && !newCustomAgents.includes(agentType)) {
           newCustomAgents.push(agentType);
         }
 
-        // Set model field
-        if (typeof agentConfig.model === 'string' && agentConfig.model) {
-          updateValues[`agent_${agentType}_model`] = agentConfig.model;
+        // Set model fields. OMOS v2 uses model arrays for primary + fallback chain.
+        const modelState = splitSlimModelValue(normalizedAgentConfig.model);
+        if (modelState.primaryModel) {
+          updateValues[`agent_${agentType}_model`] = modelState.primaryModel;
+        }
+        if (modelState.fallbackModels) {
+          updateValues[`agent_${agentType}_fallback_models`] = modelState.fallbackModels;
         }
 
         // Set variant field
-        if (typeof agentConfig.variant === 'string' && agentConfig.variant) {
-          updateValues[`agent_${agentType}_variant`] = agentConfig.variant;
+        if (typeof normalizedAgentConfig.variant === 'string' && normalizedAgentConfig.variant) {
+          updateValues[`agent_${agentType}_variant`] = normalizedAgentConfig.variant;
+        } else if (modelState.primaryVariant) {
+          updateValues[`agent_${agentType}_variant`] = modelState.primaryVariant;
+        }
+
+        const advancedConfig = extractAgentAdvancedSettings(normalizedAgentConfig);
+        if (Object.keys(advancedConfig).length > 0) {
+          advancedSettingsRef.current[agentType] = advancedConfig;
+          advancedSettingsRawRef.current[agentType] = JSON.stringify(advancedConfig, null, 2);
         }
 
         agentCount++;
       });
     }
 
+    // Council synthesizer may live on agents.council (new) or council.master (legacy).
+    // Accept it in both core and full import modes.
+    const importedCouncilFromOther =
+      mode === 'full' &&
+      data.otherFields?.council &&
+      typeof data.otherFields.council === 'object' &&
+      !Array.isArray(data.otherFields.council)
+        ? (data.otherFields.council as Record<string, unknown>)
+        : null;
+    const importedCouncilAgent =
+      data.agents?.council &&
+      typeof data.agents.council === 'object' &&
+      !Array.isArray(data.agents.council)
+        ? (data.agents.council as Record<string, unknown>)
+        : null;
+
+    if (importedCouncilFromOther || importedCouncilAgent) {
+      form.setFieldsValue(parseSlimCouncilFormValues({
+        council: importedCouncilFromOther,
+        agents: (data.agents as Record<string, unknown> | undefined) ?? null,
+      }));
+      if (importedCouncilAgent) {
+        councilAgentSourceRef.current = importedCouncilAgent;
+      } else if (
+        importedCouncilFromOther?.master &&
+        typeof importedCouncilFromOther.master === 'object' &&
+        !Array.isArray(importedCouncilFromOther.master)
+      ) {
+        councilAgentSourceRef.current = importedCouncilFromOther.master as Record<string, unknown>;
+      }
+    }
+
     // Process otherFields
-    if (data.otherFields && Object.keys(data.otherFields).length > 0) {
-      otherFieldsRef.current = data.otherFields;
-      otherFieldsRawRef.current = JSON.stringify(data.otherFields, null, 2);
+    if (mode === 'full' && data.otherFields && Object.keys(data.otherFields).length > 0) {
+      const importedOtherFields = { ...data.otherFields };
+      const importedFallbackState = extractManagedFallbackState(
+        (importedOtherFields as Record<string, unknown>).fallback as OhMyOpenCodeSlimFallbackConfig | undefined
+      );
+
+      delete importedOtherFields.council;
+      if (importedFallbackState.fallback || importedFallbackState.chains) {
+        delete importedOtherFields.fallback;
+        nextImportedFallback = importedFallbackState.fallback;
+        if (importedFallbackState.chains) {
+          Object.entries(importedFallbackState.chains).forEach(([agentType, chain]) => {
+            updateValues[`agent_${agentType}_fallback_models`] = mergeFallbackModels(
+              asStringArray(updateValues[`agent_${agentType}_fallback_models`]),
+              chain,
+            );
+            if (!builtInAgentKeySet.has(agentType) && !customAgents.includes(agentType) && !newCustomAgents.includes(agentType)) {
+              newCustomAgents.push(agentType);
+            }
+          });
+        }
+      }
+      otherFieldsRef.current = importedOtherFields;
+      otherFieldsRawRef.current = Object.keys(importedOtherFields).length > 0
+        ? JSON.stringify(importedOtherFields, null, 2)
+        : '';
+    }
+
+    if (mode === 'full') {
+      fallbackConfigRef.current = nextImportedFallback;
     }
 
     // Add custom agents
@@ -304,6 +553,12 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
       const values = await form.validateFields();
       setLoading(true);
 
+      if (!councilOtherFieldsValidRef.current) {
+        message.error(t('opencode.ohMyOpenCode.invalidJson'));
+        setLoading(false);
+        return;
+      }
+
       // Validate otherFields JSON at submit time
       const rawContent = otherFieldsRawRef.current.trim();
       let parsedOtherFields: Record<string, unknown> = {};
@@ -322,26 +577,78 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
         }
       }
 
-      // Build agents object (built-in + custom)
-      const allAgentKeys = [...builtInAgentKeys, ...customAgents];
-      const agents: OhMyOpenCodeSlimAgents = {};
-      allAgentKeys.forEach((agentType) => {
-        const modelFieldName = `agent_${agentType}_model`;
-        const variantFieldName = `agent_${agentType}_variant`;
-        const modelValue = values[modelFieldName];
-        const variantValue = values[variantFieldName];
+      delete parsedOtherFields.council;
+      delete parsedOtherFields.fallback;
 
-        if (modelValue || variantValue) {
-          agents[agentType] = {
-            ...(modelValue ? { model: modelValue } : {}),
-            ...(variantValue ? { variant: variantValue } : {}),
-          };
+      const allAgentKeys = [...builtInAgentKeys, ...customAgents];
+      const parsedAdvancedSettings: Record<string, Record<string, unknown>> = {};
+      for (const agentKey of allAgentKeys) {
+        const rawAdvanced = advancedSettingsRawRef.current[agentKey]?.trim() || '';
+        if (rawAdvanced !== '') {
+          try {
+            const parsed = JSON.parse(rawAdvanced);
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+              message.error(t('opencode.ohMyOpenCode.invalidJson'));
+              setLoading(false);
+              return;
+            }
+            parsedAdvancedSettings[agentKey] = parsed as Record<string, unknown>;
+          } catch {
+            message.error(t('opencode.ohMyOpenCode.invalidJson'));
+            setLoading(false);
+            return;
+          }
+        } else if (Object.prototype.hasOwnProperty.call(advancedSettingsRef.current, agentKey)) {
+          parsedAdvancedSettings[agentKey] = advancedSettingsRef.current[agentKey];
         }
+      }
+
+      const agents = buildSlimAgentsFromFormValues({
+        builtInAgentKeys,
+        customAgents,
+        formValues: values as Record<string, unknown>,
+        initialAgents: initialValues?.agents,
+        advancedSettings: parsedAdvancedSettings,
       });
+      const nextFallback: OhMyOpenCodeSlimFallbackConfig = { ...(fallbackConfigRef.current || {}) };
+      delete nextFallback.chains;
+
+      const councilBuildResult = buildSlimCouncilConfig(values as Record<string, unknown>, t);
+      if (councilBuildResult.errorMessage) {
+        message.error(councilBuildResult.errorMessage);
+        setLoading(false);
+        return;
+      }
+
+      const existingCouncilAgent = councilAgentSourceRef.current;
+      let agentsWithCouncil: OhMyOpenCodeSlimAgents | undefined;
+      if (councilBuildResult.councilAgent) {
+        agentsWithCouncil = mergeCouncilAgentIntoAgents(
+          agents as Record<string, unknown>,
+          councilBuildResult.councilAgent,
+          existingCouncilAgent,
+        ) as OhMyOpenCodeSlimAgents | undefined;
+        if (
+          agentsWithCouncil?.council &&
+          typeof agentsWithCouncil.council === 'object'
+        ) {
+          councilAgentSourceRef.current = agentsWithCouncil.council as Record<string, unknown>;
+        }
+      } else {
+        // Council disabled: drop agents.council so runtime no longer carries a synthesizer.
+        const nextAgents = { ...(agents as Record<string, unknown>) };
+        delete nextAgents.council;
+        agentsWithCouncil = nextAgents as OhMyOpenCodeSlimAgents;
+        councilAgentSourceRef.current = null;
+      }
 
       const result: OhMyOpenCodeSlimConfigFormValues = {
         name: values.name,
-        agents,
+        agents: agentsWithCouncil ?? {},
+        council: councilBuildResult.council ?? undefined,
+        fallback: Object.keys(nextFallback).length > 0
+          ? nextFallback
+          : undefined,
         otherFields: Object.keys(parsedOtherFields).length > 0
           ? parsedOtherFields
           : undefined,
@@ -385,134 +692,378 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
     // Clear form fields
     form.setFieldValue(`agent_${agentKey}_model`, undefined);
     form.setFieldValue(`agent_${agentKey}_variant`, undefined);
+    form.setFieldValue(`agent_${agentKey}_fallback_models`, undefined);
+    delete advancedSettingsRef.current[agentKey];
+    delete advancedSettingsRawRef.current[agentKey];
+    setExpandedAgents(prev => {
+      const nextExpandedAgents = { ...prev };
+      delete nextExpandedAgents[agentKey];
+      return nextExpandedAgents;
+    });
   };
+
+  const toggleAdvancedSettings = (agentType: string) => {
+    setExpandedAgents(prev => ({
+      ...prev,
+      [agentType]: !prev[agentType],
+    }));
+  };
+
+  const renderAgentAdvancedEditor = (agentType: string) => {
+    if (!expandedAgents[agentType]) {
+      return null;
+    }
+
+    const advancedSettings = advancedSettingsRef.current[agentType];
+    const advancedValue = advancedSettings && Object.keys(advancedSettings).length > 0
+      ? advancedSettings
+      : undefined;
+
+    return (
+      <Form.Item
+        labelCol={{ span: labelCol }}
+        wrapperCol={{ offset: labelCol, span: wrapperCol }}
+        className={styles.advancedEditorItem}
+        extra={<Text type="secondary" className={styles.advancedHint}>{t('opencode.ohMyOpenCodeSlim.agentAdvancedFieldsHint')}</Text>}
+      >
+        <JsonEditor
+          value={advancedValue}
+          onChange={(value) => {
+            if (value === null || value === undefined) {
+              advancedSettingsRef.current[agentType] = {};
+              advancedSettingsRawRef.current[agentType] = '';
+            } else if (typeof value === 'string') {
+              advancedSettingsRawRef.current[agentType] = value;
+              if (value.trim() === '') {
+                advancedSettingsRef.current[agentType] = {};
+              }
+            } else {
+              advancedSettingsRef.current[agentType] = value as Record<string, unknown>;
+              advancedSettingsRawRef.current[agentType] = JSON.stringify(value, null, 2);
+            }
+          }}
+          height={150}
+          minHeight={100}
+          maxHeight={300}
+          resizable
+          mode="text"
+          placeholder={t('opencode.ohMyOpenCodeSlim.agentAdvancedFieldsPlaceholder')}
+        />
+      </Form.Item>
+    );
+  };
+
+  const renderAgentFallbackField = (agentType: string) => (
+    <div className={styles.subFieldsPanel}>
+      <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.fallbackModelsLabel')}</span>
+      <Form.Item name={`agent_${agentType}_fallback_models`} noStyle>
+        <Select
+          mode="tags"
+          placeholder={t('opencode.ohMyOpenCode.fallbackModelsPlaceholder')}
+          options={modelOptions}
+          allowClear
+          showSearch
+          optionFilterProp="label"
+          className={styles.fallbackSelect}
+        />
+      </Form.Item>
+    </div>
+  );
 
   // Render built-in agent item
   const renderBuiltInAgentItem = (agentType: SlimAgentType) => (
-    <Form.Item
-      key={agentType}
-      label={SLIM_AGENT_DISPLAY_NAMES[agentType]}
-      tooltip={SLIM_AGENT_DESCRIPTIONS[agentType]}
-    >
+    <div key={agentType}>
       <Form.Item
-        noStyle
-        shouldUpdate={(prevValues, currentValues) =>
-          prevValues[`agent_${agentType}_model`] !== currentValues[`agent_${agentType}_model`] ||
-          prevValues[`agent_${agentType}_variant`] !== currentValues[`agent_${agentType}_variant`]
-        }
+        label={t(getSlimAgentDisplayNameKey(agentType))}
+        tooltip={t(getSlimAgentDescriptionKey(agentType))}
       >
-        {({ getFieldValue }) => {
-          const selectedModel = getFieldValue(`agent_${agentType}_model`);
-          const currentVariant = getFieldValue(`agent_${agentType}_variant`);
-          const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
-          const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
-          const variantOptions = [...mapVariants];
-          if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
-            variantOptions.unshift(currentVariant);
+        <Form.Item
+          noStyle
+          shouldUpdate={(prevValues, currentValues) =>
+            prevValues[`agent_${agentType}_model`] !== currentValues[`agent_${agentType}_model`] ||
+            prevValues[`agent_${agentType}_variant`] !== currentValues[`agent_${agentType}_variant`]
           }
+        >
+          {({ getFieldValue }) => {
+            const selectedModel = getFieldValue(`agent_${agentType}_model`);
+            const currentVariant = getFieldValue(`agent_${agentType}_variant`);
+            const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
+            const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
+            const variantOptions = [...mapVariants];
+            if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
+              variantOptions.unshift(currentVariant);
+            }
 
-          return (
-            <Space.Compact style={{ width: '100%' }}>
-              <Form.Item name={`agent_${agentType}_model`} noStyle>
-                <Select
-                  placeholder={t('opencode.ohMyOpenCode.selectModel')}
-                  options={modelOptions}
-                  allowClear
-                  showSearch
-                  optionFilterProp="label"
-                  style={{ width: hasVariants ? 'calc(100% - 100px)' : '100%' }}
-                  onChange={(newModel) => {
-                    const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
-                    if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
-                      form.setFieldValue(`agent_${agentType}_variant`, undefined);
-                    }
-                  }}
-                />
-              </Form.Item>
-              {hasVariants && (
-                <Form.Item name={`agent_${agentType}_variant`} noStyle>
-                  <Select
-                    placeholder="variant"
-                    options={variantOptions.map((v) => ({ label: v, value: v }))}
-                    allowClear
-                    style={{ width: 100 }}
+            return (
+              <div className={styles.agentFieldGroup}>
+                <div className={styles.compactFieldRow}>
+                  <Form.Item name={`agent_${agentType}_model`} noStyle>
+                    <Select
+                      placeholder={t('opencode.ohMyOpenCode.selectModel')}
+                      options={modelOptions}
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      className={styles.compactModelSelect}
+                      onChange={(newModel) => {
+                        const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                        if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
+                          form.setFieldValue(`agent_${agentType}_variant`, undefined);
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                  {hasVariants && (
+                    <Form.Item name={`agent_${agentType}_variant`} noStyle>
+                      <Select
+                        placeholder="variant"
+                        options={variantOptions.map((v) => ({ label: v, value: v }))}
+                        allowClear
+                        className={styles.variantSelect}
+                      />
+                    </Form.Item>
+                  )}
+                  <Button
+                    icon={<MoreOutlined />}
+                    onClick={() => toggleAdvancedSettings(agentType)}
+                    type={expandedAgents[agentType] ? 'primary' : 'default'}
+                    title={t('opencode.ohMyOpenCode.advancedSettings')}
+                    className={styles.iconButton}
                   />
-                </Form.Item>
-              )}
-            </Space.Compact>
-          );
-        }}
+                </div>
+                {renderAgentFallbackField(agentType)}
+              </div>
+            );
+          }}
+        </Form.Item>
       </Form.Item>
-    </Form.Item>
+      {renderAgentAdvancedEditor(agentType)}
+    </div>
   );
 
   // Render custom agent item (with delete button)
   const renderCustomAgentItem = (agentType: string) => (
-    <Form.Item
-      key={agentType}
-      label={<span style={{ color: '#1890ff' }}>{agentType}</span>}
-      tooltip={t('opencode.ohMyOpenCode.customAgentTooltip')}
-    >
+    <div key={agentType}>
       <Form.Item
-        noStyle
-        shouldUpdate={(prevValues, currentValues) =>
-          prevValues[`agent_${agentType}_model`] !== currentValues[`agent_${agentType}_model`] ||
-          prevValues[`agent_${agentType}_variant`] !== currentValues[`agent_${agentType}_variant`]
-        }
+        label={<span className={styles.customAgentLabel}>{agentType}</span>}
+        tooltip={t('opencode.ohMyOpenCode.customAgentTooltip')}
       >
-        {({ getFieldValue }) => {
-          const selectedModel = getFieldValue(`agent_${agentType}_model`);
-          const currentVariant = getFieldValue(`agent_${agentType}_variant`);
-          const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
-          const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
-          const variantOptions = [...mapVariants];
-          if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
-            variantOptions.unshift(currentVariant);
+        <Form.Item
+          noStyle
+          shouldUpdate={(prevValues, currentValues) =>
+            prevValues[`agent_${agentType}_model`] !== currentValues[`agent_${agentType}_model`] ||
+            prevValues[`agent_${agentType}_variant`] !== currentValues[`agent_${agentType}_variant`]
           }
+        >
+          {({ getFieldValue }) => {
+            const selectedModel = getFieldValue(`agent_${agentType}_model`);
+            const currentVariant = getFieldValue(`agent_${agentType}_variant`);
+            const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
+            const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
+            const variantOptions = [...mapVariants];
+            if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
+              variantOptions.unshift(currentVariant);
+            }
 
-          return (
-            <Space.Compact style={{ width: '100%' }}>
-              <Form.Item name={`agent_${agentType}_model`} noStyle>
-                <Select
-                  placeholder={t('opencode.ohMyOpenCode.selectModel')}
-                  options={modelOptions}
-                  allowClear
-                  showSearch
-                  optionFilterProp="label"
-                  style={{ width: hasVariants ? 'calc(100% - 32px - 100px)' : 'calc(100% - 32px)' }}
-                  onChange={(newModel) => {
-                    const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
-                    if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
-                      form.setFieldValue(`agent_${agentType}_variant`, undefined);
-                    }
-                  }}
-                />
-              </Form.Item>
-              {hasVariants && (
-                <Form.Item name={`agent_${agentType}_variant`} noStyle>
-                  <Select
-                    placeholder="variant"
-                    options={variantOptions.map((v) => ({ label: v, value: v }))}
-                    allowClear
-                    style={{ width: 100 }}
+            return (
+              <div className={styles.agentFieldGroup}>
+                <div className={styles.compactFieldRow}>
+                  <Form.Item name={`agent_${agentType}_model`} noStyle>
+                    <Select
+                      placeholder={t('opencode.ohMyOpenCode.selectModel')}
+                      options={modelOptions}
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      className={styles.compactModelSelect}
+                      onChange={(newModel) => {
+                        const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                        if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
+                          form.setFieldValue(`agent_${agentType}_variant`, undefined);
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                  {hasVariants && (
+                    <Form.Item name={`agent_${agentType}_variant`} noStyle>
+                      <Select
+                        placeholder="variant"
+                        options={variantOptions.map((v) => ({ label: v, value: v }))}
+                        allowClear
+                        className={styles.variantSelect}
+                      />
+                    </Form.Item>
+                  )}
+                  <Button
+                    icon={<MoreOutlined />}
+                    onClick={() => toggleAdvancedSettings(agentType)}
+                    type={expandedAgents[agentType] ? 'primary' : 'default'}
+                    title={t('opencode.ohMyOpenCode.advancedSettings')}
+                    className={styles.iconButton}
                   />
-                </Form.Item>
-              )}
-              <Button
-                icon={<DeleteOutlined />}
-                onClick={() => handleRemoveCustomAgent(agentType)}
-                danger
-                title={t('common.delete')}
-              />
-            </Space.Compact>
-          );
-        }}
+                  <Button
+                    icon={<DeleteOutlined />}
+                    onClick={() => handleRemoveCustomAgent(agentType)}
+                    danger
+                    title={t('common.delete')}
+                    className={styles.iconButton}
+                  />
+                </div>
+                {renderAgentFallbackField(agentType)}
+              </div>
+            );
+          }}
+        </Form.Item>
       </Form.Item>
-    </Form.Item>
+      {renderAgentAdvancedEditor(agentType)}
+    </div>
   );
+
+  const agentsSectionLabel = (
+    <div className={styles.sectionLabel}>
+      <div className={styles.sectionLabelMain}>
+        <span className={styles.sectionTitle}>{t('opencode.ohMyOpenCode.agentModels')}</span>
+      </div>
+      <span className={styles.sectionHint}>{t('opencode.ohMyOpenCode.agentModelsHint')}</span>
+    </div>
+  );
+
+  const otherFieldsSectionLabel = (
+    <div className={styles.sectionLabel}>
+      <div className={styles.sectionLabelMain}>
+        <span className={styles.sectionTitle}>{t('opencode.ohMyOpenCode.otherFields')}</span>
+      </div>
+      <span className={styles.sectionHint}>{t('opencode.ohMyOpenCodeSlim.otherFieldsHint')}</span>
+    </div>
+  );
+
+  const batchReplaceButtonClassName = showBatchReplace
+    ? `${styles.actionButton} ${styles.actionButtonActive}`
+    : styles.actionButton;
+
+  const handleCancelAddCustomAgent = () => {
+    setShowAddAgent(false);
+    setNewAgentKey('');
+  };
+
+  const otherFieldsValue = otherFieldsRef.current && Object.keys(otherFieldsRef.current).length > 0
+    ? otherFieldsRef.current
+    : undefined;
+
+  const otherFieldsTable = (
+    <div className={styles.optionTableWrap}>
+      <table className={styles.optionTable}>
+        <thead>
+          <tr>
+            <th>{t('opencode.ohMyOpenCodeSlim.optionName')}</th>
+            <th>{t('opencode.ohMyOpenCodeSlim.optionType')}</th>
+            <th>{t('opencode.ohMyOpenCodeSlim.optionDefault')}</th>
+            <th>{t('opencode.ohMyOpenCodeSlim.optionDesc')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>tmux.enabled</td>
+            <td>boolean</td>
+            <td>false</td>
+            <td>{t('opencode.ohMyOpenCodeSlim.tmuxEnabledDesc')}</td>
+          </tr>
+          <tr>
+            <td>tmux.layout</td>
+            <td>string</td>
+            <td>"main-vertical"</td>
+            <td>{t('opencode.ohMyOpenCodeSlim.tmuxLayoutDesc')}</td>
+          </tr>
+          <tr>
+            <td>disabled_mcps</td>
+            <td>string[]</td>
+            <td>[]</td>
+            <td>{t('opencode.ohMyOpenCodeSlim.disabledMcpsDesc')}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+
+  const actionsCardClassName = `${styles.sectionCard} ${styles.actionsCard}`;
+
+  const agentsSectionContent = (
+    <div className={styles.contentSection}>
+      {SLIM_AGENT_TYPES.map(renderBuiltInAgentItem)}
+
+      {customAgents.length > 0 && (
+        <>
+          <Divider className={styles.sectionDivider}>{t('opencode.ohMyOpenCode.customAgents')}</Divider>
+          {customAgents.map(renderCustomAgentItem)}
+        </>
+      )}
+
+      {showAddAgent ? (
+        <div className={styles.addCustomRow}>
+          <Input
+            placeholder={t('opencode.ohMyOpenCode.customAgentKeyPlaceholder')}
+            value={newAgentKey}
+            onChange={(e) => setNewAgentKey(e.target.value)}
+            onPressEnter={handleAddCustomAgent}
+            className={styles.addCustomInput}
+          />
+          <Button type="primary" onClick={handleAddCustomAgent} className={styles.addCustomAction}>
+            {t('common.confirm')}
+          </Button>
+          <Button onClick={handleCancelAddCustomAgent} className={styles.addCustomAction}>
+            {t('common.cancel')}
+          </Button>
+        </div>
+      ) : (
+        <Button
+          type="dashed"
+          icon={<PlusOutlined />}
+          onClick={() => setShowAddAgent(true)}
+          className={styles.fullWidthAddButton}
+        >
+          {t('opencode.ohMyOpenCode.addCustomAgent')}
+        </Button>
+      )}
+    </div>
+  );
+
+  const otherFieldsSectionContent = (
+    <div className={styles.contentSection}>
+      {otherFieldsTable}
+      <Form.Item labelCol={{ span: 24 }} wrapperCol={{ span: 24 }} className={styles.jsonEditorItem}>
+        <JsonEditor
+          value={otherFieldsValue}
+          onChange={(value) => {
+            if (value === null || value === undefined) {
+              otherFieldsRawRef.current = '';
+            } else if (typeof value === 'string') {
+              otherFieldsRawRef.current = value;
+            } else {
+              otherFieldsRawRef.current = JSON.stringify(value, null, 2);
+            }
+          }}
+          height={200}
+          minHeight={150}
+          maxHeight={400}
+          resizable
+          mode="text"
+          placeholder={`{
+  "tmux": {
+    "enabled": true,
+    "layout": "main-vertical",
+    "main_pane_size": 60
+  }
+}`}
+        />
+      </Form.Item>
+    </div>
+  );
+
+  const councilSectionWrapperClassName = styles.sectionSpacer;
 
   return (
     <Modal
+      className={styles.modal}
       title={isEdit
         ? t('opencode.ohMyOpenCodeSlim.editConfig')
         : t('opencode.ohMyOpenCodeSlim.addConfig')}
@@ -528,51 +1079,53 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
       ]}
       width={800}
     >
-      <Form
-        form={form}
-        layout="horizontal"
-        labelCol={{ span: labelCol }}
-        wrapperCol={{ span: wrapperCol }}
-        style={{ marginTop: 24 }}
-      >
-        {/* Hidden ID field for editing */}
-        <Form.Item name="id" hidden>
-          <Input />
-        </Form.Item>
-
-        <Form.Item
-          label={t('opencode.ohMyOpenCode.configName')}
-          name="name"
-          rules={[{ required: true, message: t('opencode.ohMyOpenCode.configNamePlaceholder') }]}
+      <div className={styles.content}>
+        <Form
+          className={styles.form}
+          form={form}
+          layout="horizontal"
+          labelCol={{ span: labelCol }}
+          wrapperCol={{ span: wrapperCol }}
         >
-          <Input placeholder={t('opencode.ohMyOpenCode.configNamePlaceholder')} />
-        </Form.Item>
+          <Form.Item name="id" hidden>
+            <Input />
+          </Form.Item>
 
-        <div className={styles.scrollArea}>
-          {/* 操作按钮行 */}
-          <div className={styles.batchLinkRow}>
-            <Button
-              type="link"
-              icon={<ImportOutlined />}
-              onClick={() => setShowImportJson(true)}
-              className={styles.batchLinkButton}
-            >
-              {t('opencode.ohMyOpenCode.importFromJson')}
-            </Button>
-            {isEdit && (
-              <Button
-                type="link"
-                icon={<SwapOutlined />}
-                onClick={() => setShowBatchReplace(!showBatchReplace)}
-                className={styles.batchLinkButton}
+          <div className={styles.scrollArea}>
+            <div className={styles.sectionCard}>
+              <Form.Item
+                className={styles.nameItem}
+                label={t('opencode.ohMyOpenCode.configName')}
+                name="name"
+                rules={[{ required: true, message: t('opencode.ohMyOpenCode.configNamePlaceholder') }]}
               >
-                {t('opencode.ohMyOpenCode.batchReplaceModel')}
-              </Button>
-            )}
-          </div>
-          {isEdit && (
-            <>
-              {showBatchReplace && (
+                <Input placeholder={t('opencode.ohMyOpenCode.configNamePlaceholder')} />
+              </Form.Item>
+            </div>
+
+            <div className={actionsCardClassName}>
+              <div className={styles.actionsToolbar}>
+                <div className={styles.actionsGroup}>
+                  <Button
+                    icon={<ImportOutlined />}
+                    onClick={() => setShowImportJson(true)}
+                    className={styles.actionButton}
+                  >
+                    {t('opencode.ohMyOpenCode.importFromJson')}
+                  </Button>
+                  {isEdit && (
+                    <Button
+                      icon={<SwapOutlined />}
+                      onClick={() => setShowBatchReplace(!showBatchReplace)}
+                      className={batchReplaceButtonClassName}
+                    >
+                      {t('opencode.ohMyOpenCode.batchReplaceModel')}
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {isEdit && showBatchReplace && (
                 <div className={styles.batchPanel}>
                   <Text type="secondary" className={styles.helperText}>
                     {t('opencode.ohMyOpenCode.batchReplaceHint')}
@@ -593,7 +1146,7 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
                           <Select
                             value={batchReplaceFromModel}
                             placeholder={t('opencode.ohMyOpenCode.batchReplaceFromPlaceholder')}
-                            options={modelOptions}
+                            options={batchReplaceFromModelOptions}
                             allowClear
                             showSearch
                             optionFilterProp="label"
@@ -609,9 +1162,9 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
                           <Select
                             value={batchReplaceFromVariant}
                             placeholder={t('opencode.ohMyOpenCode.batchReplaceFromVariantPlaceholder')}
-                            options={fromModelVariants.map((v) => ({ label: v, value: v }))}
+                            options={batchReplaceFromVariantOptions.map((v) => ({ label: v, value: v }))}
                             allowClear
-                            disabled={!batchReplaceFromModel || fromModelVariants.length === 0}
+                            disabled={!batchReplaceFromModel || batchReplaceFromVariantOptions.length === 0}
                             className={styles.batchSelect}
                             onChange={(value) => setBatchReplaceFromVariant(value)}
                           />
@@ -681,150 +1234,33 @@ const OhMyOpenCodeSlimConfigModal: React.FC<OhMyOpenCodeSlimConfigModalProps> = 
                   </div>
                 </div>
               )}
-            </>
-          )}
+            </div>
 
-          {/* Agent 模型配置 */}
-          <Collapse
-            defaultActiveKey={['agents']}
-            ghost
-            items={[
-              {
-                key: 'agents',
-                label: <Text strong>{t('opencode.ohMyOpenCode.agentModels')}</Text>,
-                children: (
-                  <>
-                    <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 12 }}>
-                      {t('opencode.ohMyOpenCode.agentModelsHint')}
-                    </Text>
+            <Collapse
+              className={styles.sectionCollapse}
+              defaultActiveKey={['agents']}
+              ghost
+              items={[{ key: 'agents', label: agentsSectionLabel, children: agentsSectionContent }]}
+            />
 
-                    {SLIM_AGENT_TYPES.map(renderBuiltInAgentItem)}
-                    
-                    {/* Custom Agents */}
-                    {customAgents.length > 0 && (
-                      <>
-                        <Divider style={{ margin: '12px 0', fontSize: 12 }}>
-                          {t('opencode.ohMyOpenCode.customAgents')}
-                        </Divider>
-                        {customAgents.map(renderCustomAgentItem)}
-                      </>
-                    )}
-                    
-                    {/* Add Custom Agent */}
-                    {showAddAgent ? (
-                      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-                        <Input
-                          placeholder={t('opencode.ohMyOpenCode.customAgentKeyPlaceholder')}
-                          value={newAgentKey}
-                          onChange={(e) => setNewAgentKey(e.target.value)}
-                          onPressEnter={handleAddCustomAgent}
-                          style={{ flex: 1 }}
-                        />
-                        <Button type="primary" onClick={handleAddCustomAgent}>
-                          {t('common.confirm')}
-                        </Button>
-                        <Button onClick={() => { setShowAddAgent(false); setNewAgentKey(''); }}>
-                          {t('common.cancel')}
-                        </Button>
-                      </div>
-                    ) : (
-                      <Button
-                        type="dashed"
-                        icon={<PlusOutlined />}
-                        onClick={() => setShowAddAgent(true)}
-                        style={{ width: '100%', marginTop: 12 }}
-                      >
-                        {t('opencode.ohMyOpenCode.addCustomAgent')}
-                      </Button>
-                    )}
-                  </>
-                ),
-              },
-            ]}
-          />
+            <div className={councilSectionWrapperClassName}>
+              <OhMyOpenCodeSlimCouncilForm
+                form={form}
+                modelOptions={modelOptions}
+                modelVariantsMap={modelVariantsMap}
+                councilOtherFieldsValidRef={councilOtherFieldsValidRef}
+              />
+            </div>
 
-          {/* 其他配置（JSON） */}
-          <Collapse
-            defaultActiveKey={[]}
-            style={{ marginTop: 8 }}
-            ghost
-            items={[
-              {
-                key: 'other',
-                label: <Text strong>{t('opencode.ohMyOpenCode.otherFields')}</Text>,
-                children: (
-                  <>
-                    <div style={{ marginBottom: 12, fontSize: 12 }}>
-                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-                        <thead>
-                          <tr style={{ backgroundColor: 'var(--color-bg-elevated)' }}>
-                            <th style={{ padding: '8px', textAlign: 'left', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.optionName')}</th>
-                            <th style={{ padding: '8px', textAlign: 'left', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.optionType')}</th>
-                            <th style={{ padding: '8px', textAlign: 'left', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.optionDefault')}</th>
-                            <th style={{ padding: '8px', textAlign: 'left', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.optionDesc')}</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          <tr>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>tmux.enabled</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>boolean</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>false</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.tmuxEnabledDesc')}</td>
-                          </tr>
-                          <tr style={{ backgroundColor: 'var(--color-bg-hover)' }}>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>tmux.layout</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>string</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>"main-vertical"</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.tmuxLayoutDesc')}</td>
-                          </tr>
-                          <tr>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>disabled_mcps</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>string[]</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>[]</td>
-                            <td style={{ padding: '8px', border: '1px solid var(--color-border-secondary)' }}>{t('opencode.ohMyOpenCodeSlim.disabledMcpsDesc')}</td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                    <Form.Item
-                      labelCol={{ span: 24 }}
-                      wrapperCol={{ span: 24 }}
-                    >
-                      <JsonEditor
-                        value={otherFieldsRef.current && Object.keys(otherFieldsRef.current).length > 0
-                          ? otherFieldsRef.current
-                          : undefined}
-                        onChange={(value) => {
-                          // Store raw string for submit-time validation
-                          if (value === null || value === undefined) {
-                            otherFieldsRawRef.current = '';
-                          } else if (typeof value === 'string') {
-                            otherFieldsRawRef.current = value;
-                          } else {
-                            otherFieldsRawRef.current = JSON.stringify(value, null, 2);
-                          }
-                        }}
-                        height={200}
-                        minHeight={150}
-                        maxHeight={400}
-                        resizable
-                        mode="text"
-                        placeholder={`{
-  "tmux": {
-    "enabled": true,
-    "layout": "main-vertical",
-    "main_pane_size": 60
-  }
-}`}
-                      />
-                    </Form.Item>
-                  </>
-                ),
-              },
-            ]}
-          />
-        </div>
-      </Form>
+            <Collapse
+              className={styles.sectionCollapse}
+              defaultActiveKey={[]}
+              ghost
+              items={[{ key: 'other', label: otherFieldsSectionLabel, children: otherFieldsSectionContent }]}
+            />
+          </div>
+        </Form>
+      </div>
 
       <ImportJsonConfigModal
         open={showImportJson}

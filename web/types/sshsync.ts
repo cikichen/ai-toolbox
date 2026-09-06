@@ -2,16 +2,20 @@
  * SSH Sync Types
  */
 
+import type { WslDirectModuleStatus } from './wslsync';
+
 /**
  * SSH connection preset
  */
+export type SSHAuthMethod = 'key' | 'password' | 'none';
+
 export interface SSHConnection {
   id: string;
   name: string;
   host: string;
   port: number;
   username: string;
-  authMethod: string; // "key" | "password"
+  authMethod: SSHAuthMethod;
   password: string;
   privateKeyPath: string;
   privateKeyContent: string;
@@ -22,15 +26,28 @@ export interface SSHConnection {
 /**
  * SSH file mapping (global, shared across all connections)
  */
+export const DEFAULT_SSH_DIRECTORY_EXCLUDES = [
+  '.git',
+  '.venv',
+  'venv',
+  'node_modules',
+  '__pycache__',
+  '.pytest_cache',
+  '.mypy_cache',
+  'cache',
+] as const;
+
 export interface SSHFileMapping {
   id: string;
   name: string;
-  module: string; // "opencode" | "claude" | "codex" | "openclaw"
+  module: string; // "opencode" | "claude" | "codex" | "grok" | "kimi" | "openclaw" | "geminicli"
   localPath: string;
   remotePath: string;
   enabled: boolean;
   isPattern: boolean;
   isDirectory: boolean;
+  directoryExcludes: string[];
+  cleanupPaths: string[];
 }
 
 /**
@@ -39,11 +56,14 @@ export interface SSHFileMapping {
 export interface SSHSyncConfig {
   enabled: boolean;
   activeConnectionId: string;
+  syncMcp: boolean;
+  syncSkills: boolean;
   fileMappings: SSHFileMapping[];
   connections: SSHConnection[];
   lastSyncTime?: string;
   lastSyncStatus: string; // "success" | "error" | "never"
   lastSyncError?: string;
+  moduleStatuses: WslDirectModuleStatus[];
 }
 
 /**
@@ -85,4 +105,5 @@ export interface SyncProgress {
   current: number;
   total: number;
   message: string;
+  currentFile?: string;
 }

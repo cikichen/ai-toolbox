@@ -1,5 +1,5 @@
 import React from 'react';
-import { Form, Modal, Select, Typography, message } from 'antd';
+import { Alert, Form, Modal, Select, Typography, message } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { setOpenClawAgentsDefaults } from '@/services/openclawApi';
 import JsonEditor from '@/components/common/JsonEditor';
@@ -11,6 +11,8 @@ interface Props {
   defaults: OpenClawAgentsDefaults | null;
   config: OpenClawConfig | null;
   onSaved: () => void;
+  /** Notified with the provider part of `model.primary` after a successful save. */
+  onProviderUsed?: (providerId: string) => void;
 }
 
 export interface AgentsDefaultsCardRef {
@@ -23,14 +25,34 @@ const formItemLayout = {
 };
 
 /** Keys managed by dedicated form fields — excluded from "more params" editor */
-const MANAGED_KEYS = new Set(['model', 'models']);
+const MANAGED_KEYS = new Set(['model', 'models', 'thinkingDefault']);
 
-const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ defaults, config, onSaved }, ref) => {
+/**
+ * OpenClaw 官方思考等级取值(agents.defaults.thinkingDefault),单值。
+ * 比 Hermes 多一档 `adaptive`(provider 托管的动态思考)。
+ */
+const OPENCLAW_THINKING_LEVELS = [
+  'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive', 'max', 'ultra',
+] as const;
+
+const OPENCLAW_THINKING_OPTIONS = OPENCLAW_THINKING_LEVELS.map((level) => ({ value: level, label: level }));
+
+/** 规范化思考等级输入;非字符串 / 空白 / 不在枚举内返回 undefined。 */
+const parseThinkingLevel = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return (OPENCLAW_THINKING_LEVELS as readonly string[]).includes(trimmed) ? trimmed : undefined;
+};
+
+const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ defaults, config, onSaved, onProviderUsed }, ref) => {
   const { t } = useTranslation();
 
   // Local editable state
   const [primaryModel, setPrimaryModel] = React.useState<string | undefined>(undefined);
   const [fallbacks, setFallbacks] = React.useState<string[]>([]);
+  const [thinkingLevel, setThinkingLevel] = React.useState<string | undefined>(undefined);
 
   // More params modal
   const [moreParamsOpen, setMoreParamsOpen] = React.useState(false);
@@ -41,34 +63,47 @@ const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ def
     if (defaults) {
       setPrimaryModel(defaults.model?.primary || undefined);
       setFallbacks(defaults.model?.fallbacks || []);
+      setThinkingLevel(parseThinkingLevel(defaults.thinkingDefault));
     }
   }, [defaults]);
 
   // Build model options from all providers
   const modelOptions = React.useMemo(() => {
     if (!config?.models?.providers) return [];
-    const options: { label: string; value: string }[] = [];
+    const groups = new Map<string, { label: string; options: { label: string; value: string }[] }>();
+
     for (const [providerId, provider] of Object.entries(config.models.providers)) {
+      const groupLabel = providerId;
+      const entry = groups.get(providerId) || { label: groupLabel, options: [] };
+
       for (const model of provider.models || []) {
         const fullId = `${providerId}/${model.id}`;
         const modelName = model.name || model.id;
-        options.push({
-          label: `${providerId} / ${modelName}`,
-          value: fullId,
-        });
+        // Keep provider prefix for each option to avoid same model name confusion.
+        entry.options.push({ label: `${providerId} / ${modelName}`, value: fullId });
       }
+
+      groups.set(providerId, entry);
     }
-    return options;
+
+    const result = Array.from(groups.values());
+    for (const g of result) {
+      g.options.sort((a, b) => a.label.localeCompare(b.label));
+    }
+    result.sort((a, b) => a.label.localeCompare(b.label));
+    return result;
   }, [config]);
 
   // Build the full defaults object from current state + extra params
   const buildDefaults = React.useCallback((overrides?: {
     primaryModel?: string | undefined;
     fallbacks?: string[];
+    thinkingLevel?: string | undefined;
     extra?: Record<string, unknown>;
   }): OpenClawAgentsDefaults => {
-    const pm = overrides?.primaryModel !== undefined ? overrides.primaryModel : primaryModel;
-    const fb = overrides?.fallbacks !== undefined ? overrides.fallbacks : fallbacks;
+    const pm = overrides && 'primaryModel' in overrides ? overrides.primaryModel : primaryModel;
+    const fb = overrides && 'fallbacks' in overrides ? overrides.fallbacks : fallbacks;
+    const tl = overrides && 'thinkingLevel' in overrides ? overrides.thinkingLevel : thinkingLevel;
 
     // Start from extra/unknown fields in defaults (excluding managed keys)
     const extraFields: Record<string, unknown> = {};
@@ -86,27 +121,41 @@ const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ def
 
     const result: OpenClawAgentsDefaults = {
       ...merged,
-      model: { primary: pm || '', fallbacks: fb },
+      model: { primary: pm || '', fallbacks: fb ?? [] },
       models: defaults?.models,
     };
 
+    if (tl) {
+      result.thinkingDefault = tl;
+    } else {
+      delete result.thinkingDefault;
+    }
+
     return result;
-  }, [defaults, primaryModel, fallbacks]);
+  }, [defaults, primaryModel, fallbacks, thinkingLevel]);
 
   const doSave = React.useCallback(async (overrides?: {
     primaryModel?: string | undefined;
     fallbacks?: string[];
+    thinkingLevel?: string | undefined;
     extra?: Record<string, unknown>;
   }) => {
     try {
       const newDefaults = buildDefaults(overrides);
       await setOpenClawAgentsDefaults(newDefaults);
+      // `model.primary` is "providerId/modelId"; empty or bare-model values
+      // carry no provider and are skipped.
+      const primary = newDefaults.model?.primary ?? '';
+      const separatorIndex = primary.lastIndexOf('/');
+      if (separatorIndex > 0) {
+        onProviderUsed?.(primary.slice(0, separatorIndex));
+      }
       onSaved();
     } catch (error) {
       console.error('Failed to save agents defaults:', error);
       message.error(t('common.error'));
     }
-  }, [buildDefaults, onSaved, t]);
+  }, [buildDefaults, onSaved, onProviderUsed, t]);
 
   // Select changes save immediately
   const handlePrimaryModelChange = (value: string | undefined) => {
@@ -117,6 +166,12 @@ const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ def
   const handleFallbacksChange = (value: string[]) => {
     setFallbacks(value);
     doSave({ fallbacks: value });
+  };
+
+  const handleThinkingLevelChange = (value: string | undefined) => {
+    const next = parseThinkingLevel(value);
+    setThinkingLevel(next);
+    doSave({ thinkingLevel: next });
   };
 
   // More params modal
@@ -151,20 +206,39 @@ const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ def
 
   return (
     <>
+      {defaults?.timeout !== undefined && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message={t('openclaw.agents.legacyTimeoutHint')}
+        />
+      )}
       <Form layout="horizontal" {...formItemLayout}>
-        {/* Primary Model */}
+        {/* Primary Model (left-aligned) + Default Thinking Level (inline, no label) */}
         <Form.Item label={<Text strong>{t('openclaw.agents.primaryModel')}</Text>}>
-          <Select
-            value={primaryModel}
-            onChange={handlePrimaryModelChange}
-            placeholder={t('openclaw.agents.primaryModelPlaceholder')}
-            allowClear
-            showSearch
-            options={modelOptions}
-            optionLabelProp="label"
-            style={{ width: '100%' }}
-            notFoundContent={t('openclaw.agents.noModels')}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <Select
+              value={primaryModel}
+              onChange={handlePrimaryModelChange}
+              placeholder={t('openclaw.agents.primaryModelPlaceholder')}
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              options={modelOptions}
+              optionLabelProp="label"
+              style={{ flex: 1 }}
+              notFoundContent={t('openclaw.agents.noModels')}
+            />
+            <Select
+              value={thinkingLevel}
+              onChange={handleThinkingLevelChange}
+              placeholder={t('openclaw.agents.thinkingDefaultPlaceholder')}
+              allowClear
+              options={OPENCLAW_THINKING_OPTIONS}
+              style={{ width: 200, flexShrink: 0 }}
+            />
+          </div>
         </Form.Item>
 
         {/* Fallbacks */}
@@ -176,6 +250,7 @@ const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ def
             placeholder={t('openclaw.agents.fallbacksPlaceholder')}
             allowClear
             showSearch
+            optionFilterProp="label"
             options={modelOptions}
             optionLabelProp="label"
             style={{ width: '100%' }}
@@ -193,7 +268,7 @@ const AgentsDefaultsCard = React.forwardRef<AgentsDefaultsCardRef, Props>(({ def
         okText={t('common.save')}
         cancelText={t('common.cancel')}
         width={600}
-        destroyOnClose
+        destroyOnHidden
       >
         <JsonEditor
           value={extraParams}

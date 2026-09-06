@@ -1,0 +1,355 @@
+.viewStack {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.inlineAlert {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-status-error-border);
+  border-radius: 8px;
+  background: var(--color-status-error-bg);
+  color: var(--color-status-error);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.filterBar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  overflow: visible;
+  padding: 0;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+.filterSection {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  min-height: 36px;
+  padding: 0 9px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+}
+
+.filterIcon {
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+}
+
+.filterSelect {
+  width: auto;
+  min-width: 86px;
+
+  :global(.ant-select-selector) {
+    padding: 0 4px !important;
+  }
+
+  :global(.ant-select-selection-item) {
+    color: var(--color-text-primary);
+    font-size: 13px;
+  }
+}
+
+.filterDivider {
+  width: 1px;
+  height: 16px;
+  flex: 0 0 auto;
+  margin: 0 4px;
+  background: var(--color-border);
+}
+
+.filterBar > .filterDivider {
+  display: none;
+}
+
+.filterActions {
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  min-height: 36px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+
+  .filterSection {
+    min-height: 30px;
+    padding: 0;
+    border: none;
+    background: transparent;
+  }
+
+  .filterDivider {
+    height: 20px;
+    margin: 0 2px;
+  }
+}
+
+.segmentScroller {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+.customRangePicker {
+  width: 260px;
+  min-width: 220px;
+}
+
+.refreshButton {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font: inherit;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    border-color 0.16s ease;
+
+  &:hover:not(:disabled) {
+    border-color: var(--color-border-secondary);
+    background: var(--color-bg-hover);
+    color: var(--color-text-primary);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+}
+
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.chartPanel,
+.dataPanel {
+  min-width: 0;
+  border-radius: 16px;
+  background: var(--color-bg-container);
+  border: 1px solid var(--color-border-card);
+  box-shadow: var(--shadow-card-sm);
+  overflow: hidden;
+
+  :global(.ant-table-thead > tr > th) {
+    background: transparent !important;
+  }
+
+  :global(.ant-table) {
+    background: transparent;
+  }
+
+  :global(.ant-table-container) {
+    border-inline: none !important;
+  }
+
+  :global(.ant-table-thead > tr > th) {
+    padding: 14px 16px;
+    border-bottom-color: var(--color-border);
+    color: var(--color-text-secondary);
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  :global(.ant-table-tbody > tr > td) {
+    padding: 14px 16px;
+    border-bottom-color: var(--color-border);
+    background: transparent;
+    color: var(--color-text-primary);
+    font-size: 13px;
+  }
+
+  :global(.ant-table-tbody > tr:last-child > td) {
+    border-bottom: none;
+  }
+
+  :global(.ant-table-tbody > tr:hover > td) {
+    background: var(--color-bg-hover) !important;
+  }
+}
+
+.chartPanel {
+  min-height: 410px;
+}
+
+.panelHeader {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-weight: 650;
+
+  span {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: 6px;
+  }
+
+}
+
+.panelIcon {
+  flex: 0 0 auto;
+  color: var(--ant-color-primary);
+}
+
+.chartBody {
+  height: 352px;
+  min-width: 0;
+  padding: 16px 20px 10px;
+
+  :global(.recharts-legend-item) {
+    cursor: pointer;
+  }
+}
+
+.legendLabel {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  transition:
+    color 0.16s ease,
+    text-decoration-color 0.16s ease;
+}
+
+.legendLabelHidden {
+  color: var(--color-text-tertiary);
+  text-decoration: line-through;
+  text-decoration-color: var(--color-text-tertiary);
+}
+
+.tableMainCell {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+
+  strong,
+  small {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: var(--color-text-primary);
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  small {
+    color: var(--color-text-tertiary);
+    font-size: 10px;
+  }
+}
+
+.spin {
+  animation: gatewayStatisticsSpin 0.78s linear infinite;
+}
+
+@keyframes gatewayStatisticsSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 900px) {
+  .statGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .filterBar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .filterSection,
+  .filterActions {
+    width: 100%;
+  }
+
+  .filterSection {
+    justify-content: flex-start;
+  }
+
+  .filterActions {
+    margin-left: 0;
+    justify-content: flex-end;
+
+    .filterSection {
+      width: auto;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+  }
+
+  .customRangePicker {
+    width: min(230px, 100%);
+    min-width: 0;
+  }
+
+  .refreshButton {
+    margin-left: 0;
+  }
+
+  .statGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .chartBody {
+    height: 300px;
+    padding: 12px 10px 8px;
+  }
+
+  .panelHeader {
+    padding-inline: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .refreshButton,
+  .spin {
+    transition: none;
+    animation: none;
+  }
+}

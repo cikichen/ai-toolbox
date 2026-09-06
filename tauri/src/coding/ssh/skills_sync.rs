@@ -10,14 +10,17 @@ use tauri::{AppHandle, Emitter};
 use super::commands::get_ssh_config_internal;
 use super::session::SshSession;
 use super::sync::{
-    check_remote_symlink_exists, create_remote_symlink, list_remote_dir, read_remote_file_raw,
-    remove_remote_path, sync_directory, write_remote_file,
+    check_remote_symlink_exists, create_remote_symlink, inspect_remote_path_kind, list_remote_dir,
+    read_remote_file_raw, remove_remote_managed_symlink, remove_remote_path,
+    sync_directory_with_progress, write_remote_file, RemotePathKind,
 };
-use super::types::SyncProgress;
+use super::types::{default_directory_excludes, SyncProgress};
+use crate::coding::runtime_location;
 use crate::coding::skills::central_repo::{resolve_central_repo_path, resolve_skill_central_path};
+use crate::coding::skills::content_hash::hash_dir;
 use crate::coding::skills::skill_store;
 use crate::coding::tools::builtin::BUILTIN_TOOLS;
-use crate::DbState;
+use crate::SqliteDbState;
 
 const SSH_CENTRAL_DIR: &str = "~/.ai-toolbox/skills";
 
@@ -36,6 +39,21 @@ fn get_remote_tool_skills_dir(tool_key: &str) -> Option<String> {
         })
 }
 
+async fn get_remote_tool_skills_dir_with_db(
+    db: &crate::db::SqliteDbState,
+    tool_key: &str,
+) -> Option<String> {
+    match tool_key {
+        "claude_code" | "codex" | "grok" | "kimi" | "opencode" | "openclaw" | "pi" | "oh_my_pi"
+        | "gemini_cli" => runtime_location::get_tool_skills_path_async(db, tool_key)
+            .await
+            .and_then(|path| path.to_str().and_then(runtime_location::parse_wsl_unc_path))
+            .map(|wsl| wsl.linux_path)
+            .or_else(|| get_remote_tool_skills_dir(tool_key)),
+        _ => get_remote_tool_skills_dir(tool_key),
+    }
+}
+
 /// Get all tool keys that support skills
 fn get_all_skill_tool_keys() -> Vec<&'static str> {
     BUILTIN_TOOLS
@@ -47,24 +65,26 @@ fn get_all_skill_tool_keys() -> Vec<&'static str> {
 
 /// Sync all skills to SSH remote (called on skills-changed event)
 pub async fn sync_skills_to_ssh(
-    state: &DbState,
+    state: &SqliteDbState,
     session: &SshSession,
     app: AppHandle,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
+    let db = state.db();
     let config = get_ssh_config_internal(&db, false).await?;
-    drop(db);
+    let _ = db;
 
     if !config.enabled {
-        info!(
-            "Skills SSH sync skipped: enabled={}",
-            config.enabled
-        );
+        info!("Skills SSH sync skipped: enabled={}", config.enabled);
         return Ok(());
     }
+    info!(
+        "Skills SSH sync start: active_connection_id={}, remote_central_dir={}",
+        config.active_connection_id, SSH_CENTRAL_DIR
+    );
 
     // Get all managed skills
     let skills = skill_store::get_managed_skills(state).await?;
+    let db = state.db();
     let central_dir = resolve_central_repo_path(&app, state)
         .await
         .map_err(|e| format!("{}", e))?;
@@ -85,26 +105,67 @@ pub async fn sync_skills_to_ssh(
             current: 0,
             total: total_skills,
             message: format!("Skills 同步: 0/{}", total_skills),
+            current_file: None,
         },
     );
 
     // 1. Get existing skills in remote central repo
-    let existing_remote_skills = list_remote_dir(session, SSH_CENTRAL_DIR).await.unwrap_or_default();
+    let existing_remote_skills = list_remote_dir(session, SSH_CENTRAL_DIR)
+        .await
+        .unwrap_or_default();
+    info!(
+        "Skills SSH sync remote central repo scan: existing_remote_skills={}",
+        existing_remote_skills.len()
+    );
 
     // 2. Collect local skill names
     let local_skill_names: HashSet<String> = skills.iter().map(|s| s.name.clone()).collect();
 
-    // 3. Delete skills in remote that no longer exist locally
+    // 3. Delete skills in remote that no longer exist locally.
+    // Only app-managed symlinks into the central repo are removed; real
+    // directories or foreign symlinks at the same name are left untouched.
     for remote_skill in &existing_remote_skills {
         if !local_skill_names.contains(remote_skill) {
+            log::trace!(
+                "Skills SSH sync removing orphan remote skill: skill_name={}",
+                remote_skill
+            );
             for tool_key in get_all_skill_tool_keys() {
-                if let Some(remote_skills_dir) = get_remote_tool_skills_dir(tool_key) {
+                if let Some(remote_skills_dir) =
+                    get_remote_tool_skills_dir_with_db(&db, tool_key).await
+                {
                     let link_path = format!("{}/{}", remote_skills_dir, remote_skill);
-                    let _ = remove_remote_path(session, &link_path).await;
+                    if let Err(error) =
+                        remove_remote_managed_symlink(session, &link_path, SSH_CENTRAL_DIR).await
+                    {
+                        log::warn!(
+                            "Skills SSH sync failed to remove orphan tool symlink: tool_key={}, skill_name={}, link_path={}, error={}",
+                            tool_key,
+                            remote_skill,
+                            link_path,
+                            error
+                        );
+                    } else if inspect_remote_path_kind(session, &link_path, SSH_CENTRAL_DIR).await
+                        == RemotePathKind::Foreign
+                    {
+                        log::warn!(
+                            "Skills SSH sync keeping non-app-managed path: tool_key={}, skill_name={}, link_path={}",
+                            tool_key,
+                            remote_skill,
+                            link_path
+                        );
+                    }
                 }
             }
             let skill_path = format!("{}/{}", SSH_CENTRAL_DIR, remote_skill);
-            let _ = remove_remote_path(session, &skill_path).await;
+            if let Err(error) = remove_remote_path(session, &skill_path).await {
+                log::warn!(
+                    "Skills SSH sync failed to remove orphan remote skill directory: skill_name={}, skill_path={}, error={}",
+                    remote_skill,
+                    skill_path,
+                    error
+                );
+            }
         }
     }
 
@@ -112,6 +173,7 @@ pub async fn sync_skills_to_ssh(
     let mut synced_count = 0;
     let mut all_errors: Vec<String> = vec![];
     for (idx, skill) in skills.iter().enumerate() {
+        let mut skill = skill.clone();
         let current_idx = (idx + 1) as u32;
 
         let _ = app.emit(
@@ -125,17 +187,47 @@ pub async fn sync_skills_to_ssh(
                     "Skills 同步: {}/{} - {}",
                     current_idx, total_skills, skill.name
                 ),
+                current_file: None,
             },
         );
 
         let source = resolve_skill_central_path(&skill.central_path, &central_dir);
         if !source.exists() {
-            info!(
+            log::warn!(
                 "Skills SSH sync: skip '{}', source not found: {}",
                 skill.name,
                 source.display()
             );
             continue;
+        }
+        if skill.source_type == "central" {
+            match hash_dir(&source) {
+                Ok(content_hash) => {
+                    if skill.content_hash.as_deref() != Some(content_hash.as_str()) {
+                        if let Err(error) = skill_store::update_skill_content_hash(
+                            state,
+                            &skill.id,
+                            Some(content_hash.clone()),
+                        )
+                        .await
+                        {
+                            log::warn!(
+                                "Skills SSH sync: failed to update content hash for '{}': {}",
+                                skill.name,
+                                error
+                            );
+                        }
+                        skill.content_hash = Some(content_hash);
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Skills SSH sync: failed to hash central Skill '{}': {}",
+                        skill.name,
+                        error
+                    );
+                }
+            }
         }
 
         let remote_target = format!("{}/{}", SSH_CENTRAL_DIR, skill.name);
@@ -150,17 +242,58 @@ pub async fn sync_skills_to_ssh(
         let local_hash = skill.content_hash.as_deref().unwrap_or("");
 
         let needs_update = remote_hash != local_hash;
+        log::trace!(
+            "Skills SSH sync evaluating skill: name={}, source={}, remote_target={}, enabled_tools={:?}, remote_hash_len={}, local_hash_len={}, needs_update={}",
+            skill.name,
+            source.display(),
+            remote_target,
+            skill.enabled_tools,
+            remote_hash.len(),
+            local_hash.len(),
+            needs_update
+        );
 
         if needs_update {
             let source_str = source.to_string_lossy().to_string();
-            info!(
+            log::trace!(
                 "Skills SSH sync: syncing '{}' from {} to {}",
-                skill.name, source_str, remote_target
+                skill.name,
+                source_str,
+                remote_target
             );
-            match sync_directory(&source_str, &remote_target, session).await {
+            let report_current_file = |current_file: String| {
+                let _ = app.emit(
+                    "ssh-sync-progress",
+                    SyncProgress {
+                        phase: "skills".to_string(),
+                        current_item: skill.name.clone(),
+                        current: current_idx,
+                        total: total_skills,
+                        message: format!(
+                            "Skills 同步: {}/{} - {}",
+                            current_idx, total_skills, skill.name
+                        ),
+                        current_file: Some(current_file),
+                    },
+                );
+            };
+
+            match sync_directory_with_progress(
+                &source_str,
+                &remote_target,
+                session,
+                &default_directory_excludes(),
+                Some(&report_current_file),
+            )
+            .await
+            {
                 Ok(_) => {
                     if let Err(e) = write_remote_file(session, &hash_file, local_hash).await {
-                        log::warn!("Skills SSH sync: failed to write hash for '{}': {}", skill.name, e);
+                        log::warn!(
+                            "Skills SSH sync: failed to write hash for '{}': {}",
+                            skill.name,
+                            e
+                        );
                     }
                     synced_count += 1;
                 }
@@ -171,35 +304,108 @@ pub async fn sync_skills_to_ssh(
                     continue;
                 }
             }
+        } else {
+            log::trace!(
+                "Skills SSH sync skipped content upload because hashes match: name={}, remote_target={}",
+                skill.name,
+                remote_target
+            );
         }
 
-        // Ensure symlinks for each enabled tool
+        // Ensure symlinks for each enabled tool. Only app-managed links are
+        // created or replaced; a real directory or foreign symlink at the same
+        // name is left untouched.
         for tool_key in &skill.enabled_tools {
-            if let Some(remote_skills_dir) = get_remote_tool_skills_dir(tool_key) {
+            if let Some(remote_skills_dir) = get_remote_tool_skills_dir_with_db(&db, tool_key).await
+            {
                 let link_path = format!("{}/{}", remote_skills_dir, skill.name);
-                if !check_remote_symlink_exists(session, &link_path, &remote_target).await {
-                    let _ = create_remote_symlink(session, &remote_target, &link_path).await;
+                match inspect_remote_path_kind(session, &link_path, SSH_CENTRAL_DIR).await {
+                    RemotePathKind::Missing => {
+                        if let Err(error) =
+                            create_remote_symlink(session, &remote_target, &link_path).await
+                        {
+                            log::warn!(
+                                "Skills SSH sync failed to create symlink: tool_key={}, skill_name={}, target={}, link_path={}, error={}",
+                                tool_key,
+                                skill.name,
+                                remote_target,
+                                link_path,
+                                error
+                            );
+                        }
+                    }
+                    RemotePathKind::Managed => {
+                        if !check_remote_symlink_exists(session, &link_path, &remote_target).await {
+                            if let Err(error) =
+                                create_remote_symlink(session, &remote_target, &link_path).await
+                            {
+                                log::warn!(
+                                    "Skills SSH sync failed to refresh symlink: tool_key={}, skill_name={}, target={}, link_path={}, error={}",
+                                    tool_key,
+                                    skill.name,
+                                    remote_target,
+                                    link_path,
+                                    error
+                                );
+                            }
+                        }
+                    }
+                    RemotePathKind::Foreign => {
+                        log::warn!(
+                            "Skills SSH sync keeping non-app-managed path: tool_key={}, skill_name={}, link_path={}",
+                            tool_key,
+                            skill.name,
+                            link_path
+                        );
+                    }
                 }
             }
         }
 
-        // Remove symlinks for tools that are no longer enabled
-        let enabled_set: HashSet<&str> =
-            skill.enabled_tools.iter().map(|s| s.as_str()).collect();
+        // Remove symlinks for tools that are no longer enabled (managed links only)
+        let enabled_set: HashSet<&str> = skill.enabled_tools.iter().map(|s| s.as_str()).collect();
         for tool_key in get_all_skill_tool_keys() {
             if !enabled_set.contains(tool_key) {
-                if let Some(remote_skills_dir) = get_remote_tool_skills_dir(tool_key) {
+                if let Some(remote_skills_dir) =
+                    get_remote_tool_skills_dir_with_db(&db, tool_key).await
+                {
                     let link_path = format!("{}/{}", remote_skills_dir, skill.name);
-                    let _ = remove_remote_path(session, &link_path).await;
+                    log::trace!(
+                        "Skills SSH sync removing disabled-tool symlink: tool_key={}, skill_name={}, link_path={}",
+                        tool_key,
+                        skill.name,
+                        link_path
+                    );
+                    if let Err(error) =
+                        remove_remote_managed_symlink(session, &link_path, SSH_CENTRAL_DIR).await
+                    {
+                        log::warn!(
+                            "Skills SSH sync failed to remove disabled-tool symlink: tool_key={}, skill_name={}, link_path={}, error={}",
+                            tool_key,
+                            skill.name,
+                            link_path,
+                            error
+                        );
+                    } else if inspect_remote_path_kind(session, &link_path, SSH_CENTRAL_DIR).await
+                        == RemotePathKind::Foreign
+                    {
+                        log::warn!(
+                            "Skills SSH sync keeping non-app-managed path: tool_key={}, skill_name={}, link_path={}",
+                            tool_key,
+                            skill.name,
+                            link_path
+                        );
+                    }
                 }
             }
         }
     }
 
     info!(
-        "Skills SSH sync completed: {} skills updated, {} total",
+        "Skills SSH sync completed: updated_skills={}, total_skills={}, errors={}",
         synced_count,
-        skills.len()
+        skills.len(),
+        all_errors.len()
     );
 
     if !all_errors.is_empty() {

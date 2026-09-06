@@ -2,10 +2,10 @@
 //!
 //! Provides standardized API for tray menu integration.
 
-use crate::coding::claude_code::apply_config_internal;
-use crate::coding::db_id::db_clean_id;
-use crate::db::DbState;
-use serde_json::Value;
+use crate::coding::proxy_gateway::{
+    cli_proxy, paths::ProxyGatewayPaths, provider_protocol, provider_switch, types::GatewayCliKey,
+    ProxyGatewayState,
+};
 use tauri::{AppHandle, Manager, Runtime};
 
 /// Item for provider selection in tray menu
@@ -28,74 +28,99 @@ pub struct TrayProviderItem {
 pub struct TrayProviderData {
     /// Title of the section
     pub title: String,
+    /// Currently selected provider display name (shown in submenu title)
+    pub current_display: String,
     /// Items for selection
     pub items: Vec<TrayProviderItem>,
+}
+
+fn find_provider_display_name(items: &[TrayProviderItem]) -> String {
+    items
+        .iter()
+        .find(|item| item.is_selected)
+        .map(|item| item.display_name.clone())
+        .unwrap_or_default()
+}
+
+fn gateway_provider_switch_locked<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.path()
+        .app_data_dir()
+        .map(ProxyGatewayPaths::new)
+        .map(|paths| cli_proxy::provider_switch_locked_by_manifest(&paths, GatewayCliKey::Claude))
+        .unwrap_or(false)
+}
+
+fn gateway_running<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let gateway_state = app.state::<ProxyGatewayState>();
+    gateway_state
+        .manager
+        .lock()
+        .map(|manager| manager.status().running)
+        .unwrap_or(false)
+}
+
+fn provider_disabled_for_tray(
+    provider_disabled: bool,
+    is_applied: bool,
+    category: &str,
+    gateway_active: bool,
+    gateway_running: bool,
+    provider_needs_proxy: bool,
+) -> bool {
+    provider_disabled
+        || (provider_needs_proxy && !gateway_running)
+        || (gateway_active && (!gateway_running || is_applied || category == "official"))
 }
 
 /// Get tray provider data for Claude Code
 pub async fn get_claude_code_tray_data<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<TrayProviderData, String> {
-    let state = app.state::<DbState>();
-    let db = state.0.lock().await;
-
-    // Query providers from database
-    let records_result: Result<Vec<Value>, _> = db
-        .query("SELECT *, type::string(id) as id FROM claude_provider")
-        .await
-        .map_err(|e| format!("Failed to query providers: {}", e))?
-        .take(0);
-
-    let mut items: Vec<TrayProviderItem> = Vec::new();
-
-    match records_result {
-        Ok(records) => {
-            for record in records {
-                if let (Some(raw_id), Some(name), Some(is_applied), sort_index) = (
-                    record.get("id").and_then(|v| v.as_str()),
-                    record.get("name").and_then(|v| v.as_str()),
-                    record.get("is_applied")
-                        .or_else(|| record.get("isApplied"))
-                        .and_then(|v| v.as_bool()),
-                    record
-                        .get("sort_index")
-                        .or_else(|| record.get("sortIndex"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                ) {
-                    let id = db_clean_id(raw_id);
-
-                    // Read is_disabled field
-                    let is_disabled = record
-                        .get("is_disabled")
-                        .or_else(|| record.get("isDisabled"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    items.push(TrayProviderItem {
-                        id,
-                        display_name: name.to_string(),
-                        is_selected: is_applied,
-                        is_disabled,
-                        sort_index,
-                    });
-                }
+    let providers = super::commands::list_claude_providers(app.state()).await?;
+    let gateway_switch_locked = gateway_provider_switch_locked(app);
+    let gateway_running = gateway_running(app);
+    let mut items: Vec<TrayProviderItem> = providers
+        .into_iter()
+        .filter(|provider| provider.id != "__local__")
+        .map(|provider| {
+            let provider_needs_proxy = provider_protocol::provider_needs_gateway_proxy(
+                GatewayCliKey::Claude,
+                &provider.category,
+                provider.meta.as_ref(),
+                &provider.settings_config,
+            );
+            TrayProviderItem {
+                id: provider.id,
+                display_name: provider.name,
+                is_selected: provider.is_applied,
+                is_disabled: provider_disabled_for_tray(
+                    provider.is_disabled,
+                    provider.is_applied,
+                    &provider.category,
+                    gateway_switch_locked,
+                    gateway_running,
+                    provider_needs_proxy,
+                ),
+                sort_index: provider.sort_index.unwrap_or(0) as i64,
             }
-        }
-        Err(e) => {
-            eprintln!("Failed to deserialize providers for tray: {}", e);
-        }
-    }
+        })
+        .collect();
 
     // Sort by sort_index
     items.sort_by_key(|c| c.sort_index);
 
+    let current_display = find_provider_display_name(&items);
+
     let data = TrayProviderData {
         title: "──── Claude Code ────".to_string(),
-        items: items.into_iter().map(|mut item| {
-            item.sort_index = 0; // Clear sort_index for tray display
-            item
-        }).collect(),
+        current_display,
+        items: items
+            .into_iter()
+            .map(|mut item| {
+                item.sort_index = 0; // Clear sort_index for tray display
+                item
+            })
+            .collect(),
     };
 
     Ok(data)
@@ -106,10 +131,8 @@ pub async fn apply_claude_code_provider<R: Runtime>(
     app: &AppHandle<R>,
     provider_id: &str,
 ) -> Result<(), String> {
-    let state = app.state::<DbState>();
-    let db = state.0.lock().await;
-
-    apply_config_internal(&db, app, provider_id, true).await?;
+    provider_switch::apply_or_switch_provider(app, GatewayCliKey::Claude, provider_id, true)
+        .await?;
 
     Ok(())
 }
@@ -118,4 +141,59 @@ pub async fn apply_claude_code_provider<R: Runtime>(
 /// Returns true - Claude Code is always visible as a core feature
 pub async fn is_enabled_for_tray<R: Runtime>(_app: &AppHandle<R>) -> bool {
     true
+}
+
+// ============================================================================
+// Prompt Tray Support
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct TrayPromptItem {
+    pub id: String,
+    pub display_name: String,
+    pub is_selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrayPromptData {
+    pub title: String,
+    pub current_display: String,
+    pub items: Vec<TrayPromptItem>,
+}
+
+fn find_prompt_display_name(items: &[TrayPromptItem]) -> String {
+    items
+        .iter()
+        .find(|item| item.is_selected)
+        .map(|item| item.display_name.clone())
+        .unwrap_or_default()
+}
+
+pub async fn get_claude_prompt_tray_data<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<TrayPromptData, String> {
+    let configs = super::commands::list_claude_prompt_configs(app.state()).await?;
+
+    let items: Vec<TrayPromptItem> = configs
+        .into_iter()
+        .filter(|config| config.id != "__local__")
+        .map(|config| TrayPromptItem {
+            id: config.id,
+            display_name: config.name,
+            is_selected: config.is_applied,
+        })
+        .collect();
+
+    Ok(TrayPromptData {
+        title: "全局提示词".to_string(),
+        current_display: find_prompt_display_name(&items),
+        items,
+    })
+}
+
+pub async fn apply_claude_prompt_config<R: Runtime>(
+    app: &AppHandle<R>,
+    config_id: &str,
+) -> Result<(), String> {
+    super::commands::apply_prompt_config_internal(app.state(), app, config_id, true).await
 }

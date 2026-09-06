@@ -1,7 +1,10 @@
-use serde_json::{json, Value};
-use super::types::{ClaudeCodeProvider, ClaudeCodeProviderContent, ClaudeCommonConfig};
+use super::types::{
+    ClaudeCodeProvider, ClaudeCodeProviderContent, ClaudeCommonConfig, ClaudePromptConfig,
+    ClaudePromptConfigContent,
+};
 use crate::coding::db_id::db_extract_id;
 use chrono::Local;
+use serde_json::{json, Value};
 
 // ============================================================================
 // Provider Adapter Functions
@@ -55,12 +58,25 @@ pub fn from_db_value_provider(value: Value) -> ClaudeCodeProvider {
         name: get_str_compat(&value, "name", "name", "Unnamed Provider"),
         category: get_str_compat(&value, "category", "category", "other"),
         settings_config: get_str_compat(&value, "settings_config", "settingsConfig", "{}"),
+        extra_settings_config: get_str_compat(
+            &value,
+            "extra_settings_config",
+            "extraSettingsConfig",
+            "{}",
+        ),
+        extra_settings_merge_strategy: value
+            .get("extra_settings_merge_strategy")
+            .or_else(|| value.get("extraSettingsMergeStrategy"))
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_value(Value::String(raw.to_string())).ok())
+            .unwrap_or_default(),
         source_provider_id: get_opt_str_compat(&value, "source_provider_id", "sourceProviderId"),
         website_url: get_opt_str_compat(&value, "website_url", "websiteUrl"),
         notes: get_opt_str_compat(&value, "notes", "notes"),
         icon: get_opt_str_compat(&value, "icon", "icon"),
         icon_color: get_opt_str_compat(&value, "icon_color", "iconColor"),
         sort_index: get_i64_compat(&value, "sort_index", "sortIndex"),
+        meta: value.get("meta").cloned(),
         is_applied: get_bool_compat(&value, "is_applied", "isApplied", false),
         is_disabled: get_bool_compat(&value, "is_disabled", "isDisabled", false),
         created_at: get_str_compat(&value, "created_at", "createdAt", ""),
@@ -89,6 +105,11 @@ pub fn from_db_value_common(value: Value) -> ClaudeCommonConfig {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        root_dir: value
+            .get("root_dir")
+            .or_else(|| value.get("rootDir"))
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string()),
         updated_at: value
             .get("updated_at")
             .or_else(|| value.get("updatedAt"))
@@ -102,11 +123,78 @@ pub fn from_db_value_common(value: Value) -> ClaudeCommonConfig {
 }
 
 /// Convert common config to database Value
-pub fn to_db_value_common(config: &str) -> Value {
+pub fn to_db_value_common(config: &str, root_dir: Option<&str>) -> Value {
     let now = Local::now().to_rfc3339();
-    json!({
+    let mut value = json!({
         "config": config,
         "updated_at": now
+    });
+
+    if let Some(root_dir) = root_dir.filter(|dir| !dir.trim().is_empty()) {
+        value["root_dir"] = json!(root_dir);
+    }
+
+    value
+}
+
+// ============================================================================
+// Prompt Adapter Functions
+// ============================================================================
+
+pub fn from_db_value_prompt(value: Value) -> ClaudePromptConfig {
+    ClaudePromptConfig {
+        id: db_extract_id(&value),
+        name: get_str_compat(&value, "name", "name", "Unnamed Prompt"),
+        content: get_str_compat(&value, "content", "content", ""),
+        is_applied: get_bool_compat(&value, "is_applied", "isApplied", false),
+        sort_index: get_i64_compat(&value, "sort_index", "sortIndex"),
+        created_at: get_opt_str_compat(&value, "created_at", "createdAt"),
+        updated_at: get_opt_str_compat(&value, "updated_at", "updatedAt"),
+    }
+}
+
+pub fn to_db_value_prompt(content: &ClaudePromptConfigContent) -> Value {
+    serde_json::to_value(content).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize Claude prompt content: {}", e);
+        json!({})
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::claude_code::types::ClaudeSettingsMergeStrategy;
+
+    #[test]
+    fn provider_without_merge_strategy_uses_provider_override_default() {
+        let provider = from_db_value_provider(json!({
+            "id": "legacy-provider",
+            "name": "Legacy",
+            "category": "custom",
+            "settings_config": "{}",
+            "extra_settings_config": "{}"
+        }));
+
+        assert_eq!(
+            provider.extra_settings_merge_strategy,
+            ClaudeSettingsMergeStrategy::ProviderOverridesCommon
+        );
+    }
+
+    #[test]
+    fn provider_reads_camel_case_merge_strategy() {
+        let provider = from_db_value_provider(json!({
+            "id": "camel-provider",
+            "name": "Camel",
+            "category": "custom",
+            "settingsConfig": "{}",
+            "extraSettingsConfig": "{}",
+            "extraSettingsMergeStrategy": "merge_common_and_provider"
+        }));
+
+        assert_eq!(
+            provider.extra_settings_merge_strategy,
+            ClaudeSettingsMergeStrategy::MergeCommonAndProvider
+        );
+    }
+}

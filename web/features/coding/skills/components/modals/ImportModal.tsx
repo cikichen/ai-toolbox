@@ -22,6 +22,9 @@ interface ImportModalProps {
   onSuccess: () => void;
 }
 
+/** Synthetic tool key for the CC Switch scan source (mirrors backend EXTRA_SKILL_SOURCES key). */
+const CC_SWITCH_TOOL_KEY = 'cc_switch';
+
 export const ImportModal: React.FC<ImportModalProps> = ({
   open,
   onClose,
@@ -31,6 +34,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
   const { onboardingPlan, loadOnboardingPlan, toolStatus } = useSkillsStore();
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const [selectedTools, setSelectedTools] = React.useState<string[]>([]);
+  const [followCcSwitchMarks, setFollowCcSwitchMarks] = React.useState(true);
   const [loading, setLoading] = React.useState(false);
   const [preferredTools, setPreferredTools] = React.useState<string[] | null>(null);
 
@@ -70,16 +74,16 @@ export const ImportModal: React.FC<ImportModalProps> = ({
     return allTools.filter((t) => t.installed || selectedTools.includes(t.id));
   }, [allTools, preferredTools, selectedTools]);
 
-  // Hidden tools: everything not in visible list, sorted by installed first
+  // Hidden dropdown only offers installed tools that are outside the preferred row.
   const hiddenTools = React.useMemo(() => {
-    const hidden = preferredTools && preferredTools.length > 0
-      ? allTools.filter((t) => !preferredTools.includes(t.id) && !selectedTools.includes(t.id))
-      : allTools.filter((t) => !t.installed && !selectedTools.includes(t.id));
-    // Sort: installed first
-    return [...hidden].sort((a, b) => {
-      if (a.installed === b.installed) return 0;
-      return a.installed ? -1 : 1;
-    });
+    if (preferredTools && preferredTools.length > 0) {
+      return allTools.filter((t) => (
+        t.installed
+        && !preferredTools.includes(t.id)
+        && !selectedTools.includes(t.id)
+      ));
+    }
+    return [];
   }, [allTools, preferredTools, selectedTools]);
 
   // Initialize selected tools based on preferredTools
@@ -114,6 +118,28 @@ export const ImportModal: React.FC<ImportModalProps> = ({
     });
     return paths;
   }, [groups]);
+
+  // Lookup table path -> variant, for per-source sync targets and badges.
+  const variantsByPath = React.useMemo(() => {
+    const map = new Map<string, (typeof groups)[number]['variants'][number]>();
+    groups.forEach((g) => {
+      g.variants.forEach((v) => map.set(v.path, v));
+    });
+    return map;
+  }, [groups]);
+
+  const toolLabel = (toolId: string): string =>
+    allTools.find((tool) => tool.id === toolId)?.label ?? toolId;
+
+  const installedToolIds = React.useMemo(
+    () => new Set(allTools.filter((tool) => tool.installed).map((tool) => tool.id)),
+    [allTools]
+  );
+
+  const selectedHasCcSwitch = React.useMemo(
+    () => Array.from(selected).some((path) => variantsByPath.get(path)?.tool === CC_SWITCH_TOOL_KEY),
+    [selected, variantsByPath]
+  );
 
   const handleToggle = (path: string) => {
     setSelected((prev) => {
@@ -173,13 +199,22 @@ export const ImportModal: React.FC<ImportModalProps> = ({
           }
         }
 
-        // Sync to target tools after successful import
-        if (result && selectedTools.length > 0) {
+        // Sync to target tools after successful import. CC Switch variants
+        // follow their per-skill marks when the toggle is on (unmarked ones
+        // sync to no tool); everything else uses the shared selection.
+        const variant = variantsByPath.get(path);
+        let toolsForSkill = selectedTools;
+        if (variant?.tool === CC_SWITCH_TOOL_KEY && followCcSwitchMarks) {
+          toolsForSkill = (variant.source_enabled_tools ?? []).filter((toolId) =>
+            installedToolIds.has(toolId)
+          );
+        }
+        if (result && toolsForSkill.length > 0) {
           await syncSkillToTools({
             skillId: result.skill_id,
             centralPath: result.central_path,
             skillName: result.name,
-            selectedTools: selectedTools,
+            selectedTools: toolsForSkill,
             allTools,
             t,
             onTargetExists: 'skip',
@@ -265,6 +300,15 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                       <div className={styles.variantInfo}>
                         <div className={styles.variantTool}>
                           {v.tool_display || v.tool}
+                          {(v.source_enabled_tools ?? []).length > 0 && (
+                            <span className={styles.markGroup}>
+                              {(v.source_enabled_tools ?? []).map((toolId) => (
+                                <span key={toolId} className={styles.markTag}>
+                                  {toolLabel(toolId)}
+                                </span>
+                              ))}
+                            </span>
+                          )}
                           {v.conflicting_tools && v.conflicting_tools.length > 0 && (
                             <Tooltip title={t('skills.conflictWith', { tools: v.conflicting_tools.join(', ') })}>
                               <span className={styles.conflictBadge}>
@@ -292,6 +336,23 @@ export const ImportModal: React.FC<ImportModalProps> = ({
             </div>
 
             <div className={addSkillStyles.toolsSection}>
+              {selectedHasCcSwitch && (
+                <div className={styles.followMarksRow}>
+                  <Checkbox
+                    checked={followCcSwitchMarks}
+                    onChange={(e) => setFollowCcSwitchMarks(e.target.checked)}
+                  >
+                    {t('skills.followCcSwitchMarks')}
+                  </Checkbox>
+                  <div className={styles.followMarksHint}>
+                    {t(
+                      followCcSwitchMarks
+                        ? 'skills.followCcSwitchMarksHintOn'
+                        : 'skills.followCcSwitchMarksHintOff'
+                    )}
+                  </div>
+                </div>
+              )}
               <div className={addSkillStyles.toolsLabel}>{t('skills.syncToTools')}</div>
               <div className={addSkillStyles.toolsHint}>{t('skills.syncToToolsHint')}</div>
               <div className={addSkillStyles.toolsGrid}>
@@ -314,24 +375,15 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                     menu={{
                       items: hiddenTools.map((tool) => ({
                         key: tool.id,
-                        disabled: !tool.installed,
                         label: (
                           <Checkbox
                             checked={selectedTools.includes(tool.id)}
-                            disabled={!tool.installed}
                             onClick={(e) => e.stopPropagation()}
                           >
                             {tool.label}
-                            {!tool.installed && (
-                              <span className={addSkillStyles.notInstalledTag}> {t('skills.notInstalled')}</span>
-                            )}
                           </Checkbox>
                         ),
-                        onClick: () => {
-                          if (tool.installed) {
-                            handleToolToggle(tool.id);
-                          }
-                        },
+                        onClick: () => handleToolToggle(tool.id),
                       })),
                     }}
                   >

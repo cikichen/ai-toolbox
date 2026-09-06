@@ -5,7 +5,7 @@
  */
 
 import { invoke } from '@tauri-apps/api/core';
-import type { OpenCodeConfig, OpenCodeProvider } from '@/types/opencode';
+import type { OpenCodeAgentConfig, OpenCodeConfig, OpenCodeProvider } from '@/types/opencode';
 
 /**
  * Configuration path information
@@ -13,6 +13,24 @@ import type { OpenCodeConfig, OpenCodeProvider } from '@/types/opencode';
 export interface ConfigPathInfo {
   path: string;
   source: 'custom' | 'env' | 'shell' | 'default';
+}
+
+export interface OpenCodeMarkdownAgent {
+  name: string;
+  path: string;
+  directory: string;
+  frontmatter: string;
+  prompt: string;
+  rawContent: string;
+  contentHash: string;
+  config?: OpenCodeAgentConfig;
+  parseError?: string;
+}
+
+export interface SaveOpenCodeMarkdownAgentRequest {
+  path: string;
+  expectedContentHash: string;
+  content: string;
 }
 
 /**
@@ -32,6 +50,23 @@ export type ReadConfigResult =
   | { status: 'notFound'; path: string }
   | { status: 'parseError'; path: string; error: string; contentPreview?: string }
   | { status: 'error'; error: string };
+
+/** Raw file contents for the OpenCode file-based preview modal. */
+export interface OpenCodePreviewData {
+  configPath: string;
+  /** Raw main OpenCode config file content (`opencode.json` / `opencode.jsonc`). */
+  configContent?: string | null;
+  authPath: string;
+  /** Raw `auth.json` file content. */
+  authContent?: string | null;
+}
+
+/**
+ * Read raw config + auth.json file contents for the file-based preview modal.
+ */
+export const getOpenCodePreview = async (): Promise<OpenCodePreviewData> => {
+  return await invoke<OpenCodePreviewData>('get_opencode_preview');
+};
 
 /**
  * Get OpenCode configuration file path
@@ -75,10 +110,35 @@ export const readOpenCodeConfig = async (): Promise<OpenCodeConfig | null> => {
 };
 
 /**
+ * Read current OpenCode providers from the active config file.
+ * Returns an empty object when config is missing or unreadable.
+ */
+export const readCurrentOpenCodeProviders = async (): Promise<Record<string, OpenCodeProvider>> => {
+  const config = await readOpenCodeConfig();
+  return config?.provider || {};
+};
+
+/**
  * Save OpenCode configuration file
  */
 export const saveOpenCodeConfig = async (config: OpenCodeConfig): Promise<void> => {
   await invoke('save_opencode_config', { config });
+};
+
+export const listOpenCodeMarkdownAgents = async (): Promise<OpenCodeMarkdownAgent[]> => {
+  return await invoke<OpenCodeMarkdownAgent[]>('list_opencode_markdown_agents');
+};
+
+export const saveOpenCodeMarkdownAgent = async (
+  request: SaveOpenCodeMarkdownAgentRequest,
+): Promise<OpenCodeMarkdownAgent> => {
+  return await invoke<OpenCodeMarkdownAgent>('save_opencode_markdown_agent', { request });
+};
+
+export const deleteOpenCodeMarkdownAgent = async (
+  request: Omit<SaveOpenCodeMarkdownAgentRequest, 'content'>,
+): Promise<void> => {
+  await invoke('delete_opencode_markdown_agent', { request });
 };
 
 /**
@@ -104,6 +164,8 @@ export interface FreeModel {
   providerId: string;       // Config key (e.g., "opencode")
   providerName: string;     // Display name (e.g., "OpenCode Zen")
   context?: number;
+  baseModelId?: string;
+  experimentalMode?: string;
 }
 
 /**
@@ -149,6 +211,8 @@ export interface UnifiedModelOption {
   providerId: string;
   modelId: string;
   isFree: boolean;      // Whether this is a free model
+  baseModelId?: string;
+  experimentalMode?: string;
 }
 
 /**
@@ -157,6 +221,20 @@ export interface UnifiedModelOption {
  */
 export const getOpenCodeUnifiedModels = async (): Promise<UnifiedModelOption[]> => {
   return await invoke<UnifiedModelOption[]>('get_opencode_unified_models');
+};
+
+const getPresetVariantKeys = (
+  variantKeysByPresetModel: Map<string, string[]>,
+  modelId: string
+): string[] | undefined => {
+  const directVariantKeys = variantKeysByPresetModel.get(modelId);
+  if (directVariantKeys) return directVariantKeys;
+
+  const lastSlashIndex = modelId.lastIndexOf('/');
+  if (lastSlashIndex < 0) return undefined;
+
+  const bareModelId = modelId.slice(lastSlashIndex + 1);
+  return variantKeysByPresetModel.get(bareModelId);
 };
 
 /**
@@ -176,6 +254,8 @@ export const buildModelVariantsMap = (
   presetModels?: Record<string, Array<{ id: string; variants?: Record<string, unknown> }>>
 ): Record<string, string[]> => {
   const variantsMap: Record<string, string[]> = {};
+  const variantKeysByConfiguredModel = new Map<string, string[]>();
+  const variantKeysByPresetModel = new Map<string, string[]>();
 
   // Get variants from config providers
   if (config?.provider) {
@@ -183,7 +263,10 @@ export const buildModelVariantsMap = (
       if (provider.models) {
         Object.entries(provider.models).forEach(([modelId, model]) => {
           if (model.variants && Object.keys(model.variants).length > 0) {
-            variantsMap[`${providerId}/${modelId}`] = Object.keys(model.variants);
+            const variantKeys = Object.keys(model.variants);
+            const fullModelId = `${providerId}/${modelId}`;
+            variantKeysByConfiguredModel.set(fullModelId, variantKeys);
+            variantsMap[fullModelId] = variantKeys;
           }
         });
       }
@@ -196,6 +279,7 @@ export const buildModelVariantsMap = (
       models.forEach((model) => {
         if (model.variants && Object.keys(model.variants).length > 0) {
           const variantKeys = Object.keys(model.variants);
+          variantKeysByPresetModel.set(model.id, variantKeys);
           // Match preset model ID with unified model IDs
           unifiedModels.forEach((um) => {
             if (um.modelId === model.id && !variantsMap[um.id]) {
@@ -206,6 +290,22 @@ export const buildModelVariantsMap = (
       });
     });
   }
+
+  // OpenCode expands models.dev experimental modes into virtual model IDs,
+  // e.g. gpt-5.5 + mode fast -> gpt-5.5-fast. Those virtual models inherit
+  // the base model variants, so the variant dropdown should remain available.
+  unifiedModels.forEach((um) => {
+    if (variantsMap[um.id]) return;
+    if (!um.baseModelId || !um.experimentalMode) return;
+
+    const baseUnifiedId = `${um.providerId}/${um.baseModelId}`;
+    const baseVariantKeys = variantsMap[baseUnifiedId]
+      ?? variantKeysByConfiguredModel.get(baseUnifiedId)
+      ?? getPresetVariantKeys(variantKeysByPresetModel, um.baseModelId);
+    if (baseVariantKeys && baseVariantKeys.length > 0) {
+      variantsMap[um.id] = baseVariantKeys;
+    }
+  });
 
   return variantsMap;
 };
@@ -243,6 +343,8 @@ export interface GetAuthProvidersResponse {
   standaloneProviders: OfficialProvider[];
   /** Official models from providers that ARE in custom config (merged) */
   mergedModels: Record<string, OfficialModel[]>;
+  /** Provider IDs that can resolve auth.json credential + default API base URL */
+  resolvedAuthProviderIds: string[];
   /** All custom provider IDs for reference */
   customProviderIds: string[];
 }
@@ -322,6 +424,7 @@ export interface OpenCodeFavoriteProvider {
 
 export interface OpenCodeDiagnosticsConfig {
   prompt: string;
+  defaultTestModelId?: string;
   temperature?: number;
   maxTokens?: number;
   maxOutputTokens?: number;
@@ -360,6 +463,50 @@ export const deleteFavoriteProvider = async (providerId: string): Promise<void> 
   await invoke('delete_opencode_favorite_provider', { providerId });
 };
 
+export interface AllApiHubProfileInfo {
+  profileName: string;
+  extensionId: string;
+  path: string;
+}
+
+export interface OpenCodeAllApiHubProvider {
+  providerId: string;
+  name: string;
+  npm: string;
+  baseUrl?: string;
+  requiresBrowserOpen: boolean;
+  isDisabled: boolean;
+  hasApiKey: boolean;
+  apiKeyPreview?: string;
+  balanceUsd?: number;
+  balanceCny?: number;
+  siteName?: string;
+  siteType?: string;
+  accountLabel: string;
+  sourceProfileName: string;
+  sourceExtensionId: string;
+  providerConfig: OpenCodeProvider;
+}
+
+export interface OpenCodeAllApiHubProvidersResult {
+  found: boolean;
+  profiles: AllApiHubProfileInfo[];
+  providers: OpenCodeAllApiHubProvider[];
+  message?: string;
+}
+
+export const listOpenCodeAllApiHubProviders = async (): Promise<OpenCodeAllApiHubProvidersResult> => {
+  return await invoke<OpenCodeAllApiHubProvidersResult>('list_opencode_all_api_hub_providers');
+};
+
+export const resolveOpenCodeAllApiHubProviders = async (
+  providerIds: string[]
+): Promise<OpenCodeAllApiHubProvider[]> => {
+  return await invoke<OpenCodeAllApiHubProvider[]>('resolve_opencode_all_api_hub_providers', {
+    request: { providerIds },
+  });
+};
+
 
 // ============================================================================
 // Connectivity Test Types and Functions
@@ -367,8 +514,10 @@ export const deleteFavoriteProvider = async (providerId: string): Promise<void> 
 
 export interface ConnectivityTestRequest {
   npm: string;
+  providerId?: string;
   baseUrl: string;
   apiKey?: string;
+  reasoningEffort?: string;
   headers?: Record<string, unknown>;
   prompt: string;
   temperature?: number;

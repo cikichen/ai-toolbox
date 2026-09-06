@@ -1,5 +1,22 @@
 # Skills 模块架构文档
 
+## 零、迁移期高优先级补充规则
+
+- Skills 的唯一源目录始终是中央仓库 `central_repo_path`。Claude/Codex/OpenCode/OpenClaw 或任何自定义工具当前运行时的 skills 目录都只是目标目录，不是同步源。
+- 中央仓库路径只有一个权威配置入口：`skill_settings:skills.central_repo_path`；缺失或为空时 fallback 到 `app_data_dir/skills`。`skill_preferences` 只保存 UI/工具偏好，绝不能读取、默认生成或写入 `central_repo_path`，避免 `~/.skills` 等脏偏好重新成为第二事实源。
+- `central_repo_path` 持久化必须优先使用可迁移路径：用户目录下保存为 `~/...`，配置目录/AppData 下保存为 `%APPDATA%/...`；读取时再解析到当前系统目录。不要把 `C:\Users\...`、`/Users/...`、`/home/...` 这类用户目录绝对路径作为新写入值，否则跨端备份恢复会指向旧机器用户路径。
+- 兼容旧 `central_repo_path` 绝对路径时不能把任意 `/home/<name>/...`、`/Users/<name>/...`、`C:\Users\<name>\...` 都改写到当前 HOME。真实存在的绝对路径要尊重原路径；只有明确的旧用户私有 Skills 路径（如 `.agents/skills`）才可按当前用户目录迁移解析。
+- `skill_settings` 和 `custom_tool` 必须直接读写 SQLite JSONB。新增或修改这两类入口时不能绕过共享 store 直接写 SurrealQL，否则会造成恢复、备份和旧库导入后的数据分叉。
+- `skills_sync_to_tool` 的语义始终是“中央仓库 -> 工具运行时 skills 目录”。后端必须先用 `skill_id` 读取 DB 中的 skill 记录，再通过 `resolve_central_repo_path` / `resolve_skill_central_path` 解析真实 source 与 name；前端传入的 `sourcePath/name` 只能作为兼容参数，不能作为事实源。如果工具当前配置落在 WSL，该目标目录可能解析成 `\\\\wsl.localhost\\...` UNC 路径，但源目录仍不变。
+- `management_enabled=false` 是后端必须维护的同步 invariant，不只是前端展示状态。任何会写工具目录的入口（`skills_sync_to_tool`、tray toggle、全量 resync、Inventory apply）都必须先确认 Skill 已启用；禁用 Skill 的唯一恢复路径是先 enable，再走明确的工具恢复/同步流程。
+- 禁用、取消同步、Inventory apply 禁用或默认禁用本地缺失项时，数据库里的 disabled/unsynced desired state 是主状态；工具目标目录清理只能 best-effort 记录 warning，不能因为旧 target 删除失败而阻止 DB 收敛。相反，Inventory apply 如果要新增工具同步，必须在替换 group registry 或更新 skill metadata 前完成源目录、工具安装和目标路径 overlap 预检。
+- 任何会写工具目录的同步入口，在创建、覆盖或删除目标路径前，必须先校验中央仓库 source 是可解析目录（`metadata` 跟随 symlink 后仍是目录）。broken/self symlink 或非目录 source 必须返回错误，不能把 DB/UI 关联写成 ok 却留下 runtime target broken。
+- 同步入口还必须在创建、覆盖或删除目标路径前，按解析 symlink 后的真实路径拒绝 `source == target`、target 位于 source 内、或 source 位于 target 内。尤其要防止工具 skills 父目录本身被 symlink 到中央仓库时，`~/.tool/skills/{name}` 实际解析成 `central_repo/{name}`，这会把中央源删掉或写成 self symlink。
+- 中央仓库路径迁移复制也必须执行同等源/目标重叠校验。不要允许把新中央目录选到旧仓库或某个 Skill 目录内部后递归复制，否则会产生 `foo/foo/...` 这类无限嵌套或半成品目录。
+- `skills_get_managed_skills` 会对中央仓库 source 做只读诊断，并通过 DTO `source_health/source_error` 暴露给前端。缺失、非目录、broken/self symlink 只标记为 warning 让用户手动恢复或重装，不自动删除、恢复或重同步，也不写回 `skill` 表。
+- WSL skills 同步和 SSH skills 同步都不是复用普通 file mappings；它们是独立链路，但源端仍然是中央仓库。
+- 对已经 `is_wsl_direct` 的内置工具，处理 WSL skills 同步时要优先判断“目标目录是否已直接在 WSL 内”，而不是只看当前 Windows 侧是否存在 UNC 显示路径。
+
 ## 一、模块概述
 
 Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从本地文件夹或 Git 仓库安装技能，并同步到多个 AI 编程工具（Claude Code、Cursor、Codex、OpenCode 等）。模块还支持技能发现、导入现有技能、系统托盘快捷菜单等功能。
@@ -13,7 +30,7 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
 | mod.rs | 模块导出 |
 | types.rs | 核心数据结构和 DTO 定义 |
 | adapter.rs | 数据库记录与 Rust 结构体的转换 |
-| skill_store.rs | SurrealDB 增删改查操作 |
+| skill_store.rs | Skills 主数据增删改查操作；已切到 SQLite JSONB |
 | commands.rs | Tauri 命令（前端 API 接口） |
 | installer.rs | 技能安装逻辑（本地/Git） |
 | sync_engine.rs | 文件同步引擎（符号链接/接合点/复制） |
@@ -42,7 +59,7 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
 
 ## 三、数据库表结构
 
-数据存储在 SurrealDB 中，采用宽表模式减少表关联。
+当前持久化路径必须直接读写 SQLite JSONB。旧 SurrealDB 仅在启动迁移时作为导入源，业务代码不要新增 SurrealQL 或双写。
 
 ### 3.1 skill 表（技能主表）
 
@@ -60,6 +77,12 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
 | last_sync_at | i64? | 最后同步时间戳 |
 | status | string | 状态：ok / error |
 | sort_index | i32 | 排序索引（拖拽排序用） |
+| user_group | string? | 旧版/兼容分组名称字段；新逻辑以 `group_id` 为准，写入时同步回填名称便于兼容读取 |
+| group_id | string? | 指向 `skill_group` 的稳定内部分组 ID；重命名 group 不迁移 skill，只更新 group 记录本身 |
+| user_note | string? | AI Toolbox 内部自定义备注，不写入 SKILL.md，不参与内容哈希 |
+| tags | array | 用户管理的 string 标签数组；AI Toolbox 内部元数据，adapter 缺省为空数组，不写入 SKILL.md、不参与内容哈希、不触发工具同步 |
+| management_enabled | bool | AI Toolbox 管理启用状态；不是 `status` 健康状态，false 表示 UX 禁用并从当前工具取消同步 |
+| disabled_previous_tools | array | 禁用前记录的工具绑定 key；重新启用时用于默认恢复勾选 |
 | enabled_tools | array | 已启用的工具列表，如 ["claude_code", "codex"] |
 | sync_details | object? | 每个工具的同步详情（嵌入式 JSON） |
 
@@ -78,8 +101,9 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | string | 固定为 "default" |
-| central_repo_path | string | 中央仓库路径，默认为应用数据目录/skills |
 | preferred_tools | array? | 首选工具列表 |
+| limit_add_more_to_preferred_tools | bool | 是否限制 Skill 卡片“添加更多”菜单仅显示首选工具（默认 false） |
+| default_view_mode | string | 进入 Skills 页面时的默认 UI 视图：`flat` / `grouped`，非法或缺失时回退 `flat` |
 | git_cache_cleanup_days | i32 | Git 缓存清理天数，默认 30 |
 | git_cache_ttl_secs | i32 | Git 缓存 TTL 秒数，默认 60 |
 | known_tool_versions | object? | 已知工具版本信息 |
@@ -108,6 +132,21 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
 | relative_detect_dir | string | 检测目录相对路径（用于判断是否安装） |
 | created_at | i64 | 创建时间戳 |
 
+### 3.5 skill_group 表（Skill 手动分组）
+
+`skill_group` 是 first-class 分组 registry，用于保存手动分组本身的元数据。它不是工具同步 Profile，也不改变中央仓库目录结构或任何工具目标路径。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | string | UUID，稳定内部主键；Inventory JSON 不暴露该字段 |
+| name | string | 分组名称；应用内唯一，Inventory JSON 通过该名称引用分组 |
+| note | string? | 分组备注，用于记录分组用途 |
+| sort_index | i32 | 分组排序 |
+| created_at | i64 | 创建时间戳 |
+| updated_at | i64 | 更新时间戳 |
+
+旧数据迁移：读取列表或分组时会将非空 `skill.user_group` 自动迁移为 `skill_group` 记录，并把对应 skill 写入稳定 `group_id`。迁移后业务归属以 `group_id` 为准，`user_group` 只作为兼容展示/旧数据回填字段。
+
 ## 四、详细流程说明
 
 ### 4.1 技能发现流程
@@ -119,15 +158,16 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
 **处理流程：**
 
 1. **获取中央仓库路径**
-   - 读取 skill_preferences 中的 central_repo_path
-   - 默认为应用数据目录/skills（如 Windows: `%APPDATA%/com.ai-toolbox/skills`）
+   - 读取 `skill_settings:skills.central_repo_path`
+   - 缺失或为空时 fallback 到应用数据目录/skills（如 Windows: `%APPDATA%/com.ai-toolbox/skills`）
+   - 不读取 `skill_preferences.central_repo_path`；该字段即使存在也只视为历史脏数据
 
 2. **获取已管理的目标路径**
    - 查询所有 skill 记录的 sync_details
    - 提取每个工具的 target_path 构建排除列表
 
 3. **遍历所有工具适配器**
-   - 包括 14 个内置工具 + 用户自定义工具
+   - 包括内置工具 + 用户自定义工具
    - 检查每个工具的 relative_detect_dir 是否存在（判断是否安装）
 
 4. **扫描已安装工具的 skills 目录**
@@ -135,21 +175,31 @@ Skills 模块提供 AI 编程工具技能的统一管理功能。用户可以从
    - 跳过特殊目录（如 Codex 的 .system）
    - 检测是否为符号链接/接合点，记录 link_target
 
-5. **过滤已管理的技能**
+5. **扫描额外第三方 skills 目录（EXTRA_SKILL_SOURCES）**
+   - 当前包含 CC Switch：`key = "cc_switch"`，`~/.cc-switch/skills`
+   - 目录存在则按与工具 skills 目录相同规则扫描；无独立「从 CCS 导入」按钮
+   - CC Switch 来源的目录会按目录名（大小写不敏感）匹配 CCS DB `skills` 表的 `directory` 列，读取 `enabled_*` 6 列（claude/codex/gemini/grokbuild/opencode/hermes → AI Toolbox 的 `claude_code`/`codex`/`gemini_cli`/`grok`/`opencode`/`hermes`）填充 `DetectedSkill.source_enabled_tools` 并透传到 `OnboardingVariant`；缺列或 NULL 按未标记处理，兼容 CCS 老库 schema。磁盘目录仍是发现事实源，DB 只做标记注解；无磁盘目录的 DB 元数据行不导入
+   - 不读 CCS `skill_repos` 表（仅 Git 书签）
+
+6. **扫描 Claude Code 插件 skills/**
+   - 合成 tool key `plugin::{plugin_id}`，`force_copy: true`
+
+7. **过滤已管理的技能**
    - 排除 link_target 指向中央仓库的技能
    - 排除已在 sync_details 中记录的目标路径
+   - 排除已管理 skill 名称（覆盖插件等路径不匹配场景）
 
-6. **计算内容哈希**
+8. **计算内容哈希**
    - 对每个发现的技能目录计算 SHA256 哈希
    - 用于检测不同工具中同名技能是否内容一致
 
-7. **按技能名称分组**
+9. **按技能名称分组**
    - 同名技能归为一组
    - 比较组内各变体的 fingerprint
    - 如果存在不同哈希值，标记 has_conflict = true
    - 记录每个变体的 conflicting_tools 列表
 
-8. **返回 OnboardingPlan**
+10. **返回 OnboardingPlan**
    - total_tools_scanned: 扫描的工具数量
    - total_skills_found: 发现的技能总数
    - groups: 分组后的技能列表
@@ -388,34 +438,66 @@ skills-git-cache/
    - source_revision: 新版本号
    - updated_targets: 重新同步的工具列表
 
+### 4.6.1 一键更新全部与定时自动更新
+
+为了复用单 skill 更新链路，`skills_update_managed` 的函数体被抽成内部函数 `update_managed_skill_internal(app, state, skill_id)`（含 `source_type=="central"` 分支），命令本身只做薄包装 + emit `skills-changed`。
+
+**一键更新全部：** `skills_update_all` / 内部共享 `update_all_skills_internal(app, state, emit_progress)`。
+
+- 遍历 `skill_store::get_managed_skills` 全部记录（含 `management_enabled=false`；禁用项 enabled_tools 为空，更新只刷新中央仓库内容、不重同步工具，安全）。
+- 逐个调用 `update_managed_skill_internal`，**顺序串行**执行（复用 git_fetcher 全局锁的串行语义，避免并发拉取同一 repo 缓存）。
+- 单个 skill 失败仅记入 `errors`，不中断其余；结束后 emit 一次 `skills-changed` 供 WSL/SSH 后续链路消费。
+- 返回 `UpdateAllResultDto { total, updated, errors }`。
+- **进度事件：** 手动触发（`skills_update_all` 命令）传 `emit_progress=true`，循环开始前及每个 skill 更新前 emit `skills-update-progress`（payload `SkillsUpdateProgress { current, total, skill_id, name, message }`），前端监听该事件在独立进度弹窗里展示「正在更新：xxx (3/10)」+ 进度条。定时任务传 `false`，不 emit，保持静默。
+
+**定时自动更新（cron）：** 新模块 `auto_update.rs`，`auto_update::start(app)` 在 lib.rs setup 中与 `auth_refresh::start` 一同启动，用 `AtomicBool` 保证单进程只启动一次。
+
+- 配置存于 `skill_preferences`：`auto_update_enabled` / `auto_update_schedule`（5 字段 cron `分 时 日 月 周`，默认 `"0 3 * * *"`）。`auto_update::start` 每 tick 读 `skill_store::get_skill_preferences` 判断。
+- **Source of Truth：** 统一以 cron 表达式作为唯一调度事实。前端"每天定点 HH:MM"只是把时间转成 `"mm hh * * *"` 的便捷入口，不是第二套存储；预览与执行共用 `cron_utils::parse_cron` / `next_n_occurrences`（`croner`，`find_next_occurrence(&Local::now(), false)` 本地时区计算）。
+- 调度：启动约 60s 后若 enabled 先跑一次 startup pass（`last_run = now`）；之后每 60s tick 一次，`cron.find_next_occurrence(&last_run, false) <= now` 时执行 `update_all_skills_internal` 并更新 `last_run = now`。
+- 复用同一个 `update_all_skills_internal`（定时调用传 `emit_progress=false`，不发进度事件）；**定时场景只 `log::debug`，静默失败，不弹 UI 打扰用户**。非法 schedule 仅 debug 跳过（保存命令已用 `parse_cron` 校验，属兜底）。配置变更在下一 tick（≤60s）生效，无需重启。
+- **Gotcha：** `skills_set_auto_update` 保存前必须校验 cron 可解析，避免 enabled 状态下持久化坏表达式；`skills_preview_auto_update_schedule` 的 count 钳制 1..=100（默认 10）。
+
+**更新替换前保护（installer::update_managed_skill_from_source）：** staging 构建完成后先与现有 central 目录做内容哈希比对，哈希一致直接跳过 swap：不重写目录、不重同步工具（`updated_targets` 为空），但仍然 `upsert_skill` 刷新 DB 行的 `updated_at`、把新拉的 git `source_revision` 落库、并归一 `status="ok"`，使该路径与其余三个刷新入口统一为「成功即改时间、失败不写库」；`central_path` 顺手 `to_relative_central_path` 归一。避免定时任务每次 tick 无谓重写目录、也避免"源内容未变"仍覆盖 mtime。哈希不一致需要替换时，先把旧 central 内容复制到 `{app_data}/skills-backup/{skill_id}-{ts}`（每 skill 保留最新 5 份）再删除重建；用户经 symlink 工具目录直接改写的 central 内容因此可恢复，备份失败只 warn 不阻断更新。
+
 ### 4.7 工具同步流程
 
 将技能同步到指定工具。
 
 **入口函数：** `skills_sync_to_tool`
 
+**先记住这个约束：**
+- Skills 的源目录始终来自中央仓库 `central_repo_path`。
+- Claude/Codex/OpenCode/OpenClaw 的运行时 skills 目录只是同步目标，不是源。
+- 当这些工具的配置目录改成 WSL 路径时，目标目录可能会被解析成 `\\\\wsl.localhost\\...`，但同步源仍然是中央仓库。
+
 **处理流程：**
 
 1. **获取工具适配器**
-   - 先查找内置工具
-   - 再查找自定义工具
-   - 未找到返回错误
+    - 先查找内置工具
+    - 再查找自定义工具
+    - 未找到返回错误
 
-2. **检查工具安装状态**
-   - 自定义工具跳过检查
-   - 内置工具检查 relative_detect_dir 是否存在
-   - 未安装返回 `TOOL_NOT_INSTALLED|{key}|{path}` 错误
+2. **获取 Skill 事实源**
+   - 只用 `skill_id` 查询 `skill` 表得到 `name/central_path/management_enabled`
+   - 用 `resolve_central_repo_path` + `resolve_skill_central_path` 得到真实中央仓库 source
+   - 不信任前端 payload 里的 `sourcePath/name`；这些字段只为旧前端/旧调用方保持 API 兼容
 
-3. **解析目标路径**
-   - 获取工具的 relative_skills_dir
-   - 拼接 HOME 目录得到绝对路径
-   - 目标：tool_skills_dir/{skill_name}
+3. **检查工具安装状态**
+    - 自定义工具跳过检查
+    - 内置工具检查 relative_detect_dir 是否存在
+    - 未安装返回 `TOOL_NOT_INSTALLED|{key}|{path}` 错误
 
-4. **检查目标是否存在**
-   - 如果存在且 overwrite=false，返回 `TARGET_EXISTS|{path}` 错误
-   - 如果存在且 overwrite=true，删除后继续
+4. **解析目标路径**
+    - 获取工具的 relative_skills_dir
+    - 拼接 HOME 目录得到绝对路径
+    - 目标：tool_skills_dir/{skill_name}
 
-5. **选择同步模式并执行**
+5. **检查目标是否存在**
+    - 如果存在且 overwrite=false，返回 `TARGET_EXISTS|{path}` 错误
+    - 如果存在且 overwrite=true，删除后继续
+
+6. **选择同步模式并执行**
 
    **Cursor 工具：**
    - 强制使用 copy 模式
@@ -431,14 +513,19 @@ skills-git-cache/
      - 递归复制目录内容
      - 跳过 .git 目录
 
-6. **记录同步结果**
-   - 更新 skill 表的 sync_details
-   - 添加工具到 enabled_tools 数组
-   - 设置同步时间戳
+7. **记录同步结果**
+    - 更新 skill 表的 sync_details
+    - 添加工具到 enabled_tools 数组
+    - 设置同步时间戳
 
-7. **返回 SyncResult**
+8. **返回 SyncResult**
    - mode_used: 实际使用的同步模式
    - target_path: 目标路径
+
+**和配置路径联动的特殊点：**
+- `runtime_location::get_tool_skills_path_async` 会根据模块当前配置目录，动态解析 Claude/Codex/OpenCode/OpenClaw 的 skills 目标目录。
+- 如果模块配置目录是 WSL UNC 路径，目标目录也会变成对应的 WSL UNC 路径。
+- 各模块保存配置时会先记录 `previous_skills_path`，再在保存后调用 `resync_all_skills_if_tool_path_changed`。这一步的目的不是改中央仓库，而是把所有已管理 skill 重新同步到新的工具目标目录，并清理旧目标记录。
 
 ### 4.8 取消同步流程
 
@@ -463,10 +550,53 @@ skills-git-cache/
    - 处理路径不存在的情况（静默成功）
 
 4. **更新数据库**
-   - 从 sync_details 中移除该工具记录
-   - 从 enabled_tools 数组中移除该工具
+    - 从 sync_details 中移除该工具记录
+    - 从 enabled_tools 数组中移除该工具
 
-### 4.9 技能删除流程
+### 4.9 Skill 管理禁用/恢复流程
+
+`management_enabled` 是 AI Toolbox 内部管理状态，不能复用 `status`。`status` 仍表示 skill 内容或同步健康状态（如 ok/error）。
+
+**禁用入口：** `skills_set_management_enabled(skillId, false)` 或 Inventory apply 中 `enabled=false`。
+
+**处理流程：**
+
+1. 先读取当前 `enabled_tools` / `sync_details`。
+2. 将当前工具绑定保存到 `disabled_previous_tools`；如果当前没有绑定但已有历史记录，则保留历史记录。
+3. 删除每个当前同步目标路径。
+4. 将 `management_enabled=false`，并清空 `enabled_tools` / `sync_details`。
+5. 不改变 `group_id` / `user_group`，不删除中央仓库内容，不改写 `SKILL.md`。
+
+**恢复入口：** `skills_set_management_enabled(skillId, true)` 只恢复管理启用状态并返回历史工具列表；前端必须让用户确认要恢复哪些历史工具，再复用已有 `skills_sync_to_tool` 链路恢复同步。不要在 Inventory 导入阶段新增工具可用性阻断逻辑；未安装工具仍由现有 `TOOL_NOT_INSTALLED|...` 语义处理。
+
+### 4.10 Skill Inventory JSON 导入导出流程
+
+Inventory JSON 是完整管理清单，用于重排 AI Toolbox 元数据，不是 skill 内容备份，也不是局部 patch。
+
+**导出入口：** `skills_export_inventory_file`（主 UI 使用）/ `skills_export_inventory`（兼容旧的字符串返回）
+
+- 导出全部 skill，包括 `management_enabled=false` 或当前 UI 筛选隐藏的 skill。
+- 主 UI 不再把完整 JSON 塞进 textarea 或剪贴板，而是直接写入用户目录下的 `~/skill-group-{timestamp}.json`，避免大清单在界面里卡顿或难以复制。
+- groups 只包含 `name/note/order`，不包含内部 `group_id`。
+- skills 包含 `id/name/group/user_note/tags/order/enabled/enabled_tools/previous_enabled_tools/source_type/source_ref/central_path/content_hash`。
+- `tags` 以 `#[serde(default)]` 默认空数组导出/导入；apply 时 matched skill 用 JSON 的 `tags` 整体覆盖（未提供则不覆盖），新装/默认禁用路径写空数组。tags 是用户管理元数据，与 `user_note` 同语义，见 §8.3。
+- 不导出 `description`。description 仅用于 UI 展示，来自中央仓库 `SKILL.md` frontmatter 缓存解析。
+
+**预览/应用入口：** `skills_preview_inventory_import_file` / `skills_apply_inventory_import_file`（主 UI 使用）/ 字符串版本命令（兼容旧调用）
+
+- `schema_version` 当前为 1；不兼容版本应返回明确错误。
+- group name 必须非空且唯一；重复名称会导致 skill 的 group 引用不可唯一解析，必须阻断 apply。
+- skill 匹配策略：`id` 优先；否则用 `name + source_ref/central_path` 兜底；`content_hash` 只用于内容变化提示，不能作为唯一匹配键。
+- apply 以 JSON groups 重建 `skill_group` registry，并在后端映射到新的内部 `group_id`。
+- 本地存在但 JSON 未匹配到的 skill 不物理删除；完整清单语义下默认禁用，并在预览/确认中展示 `default_disable_count`。
+- apply 是 desired-state 语义：matched 且 `enabled=true` 的 skill 必须按 JSON 的 `enabled_tools` 对当前工具绑定做增删对齐；matched 且 `enabled=false` 的 skill 必须取消当前同步并记录历史工具；本地存在但 JSON 未匹配到的 skill 默认禁用时还必须清空 `group_id/user_group`，避免完整重建 group registry 后留下孤儿分组引用。
+- 整理 prompt 应引导 agent 使用文件读写工具读取导出的 JSON 文件并另存/写回可导入文件，不要求用户手动粘贴大段 JSON。
+
+### 4.11 SKILL.md description 展示缓存
+
+`ManagedSkillDto.description` 来自中央仓库 `SKILL.md` frontmatter 的 `description` 字段，不持久化到 `skill` 表，也不进入 Inventory JSON。缓存 key 应至少包含 `central_path` 与 `content_hash`；如果后续新增更细粒度失效策略，可再引入 `SKILL.md` mtime，但不要把 description 写成 DB 事实源。
+
+### 4.12 技能删除流程
 
 完全删除一个管理的技能。
 
@@ -493,11 +623,21 @@ skills-git-cache/
    - 如果有删除失败的目标，返回警告信息
    - 列出无法清理的路径
 
+### 4.13 详情面板文档读取（只读）
+
+`skills_get_skill_documents` 供前端 Skill 详情面板预览中央仓库 `SKILL.md` / `README.md`。
+
+- 只读命令：从 `skill` 表按 `skill_id` 定位记录，再用 `resolve_skill_central_path` 解析中央仓库路径读取文件；不写数据库、不改中央仓库、不触发同步。
+- 文件读取做截断保护（约 128KiB 内容上限，超大文件只标记 `truncated` 不上传全文），避免大文件拖垮 UI。
+- 不允许把该命令改写成写路径；详情面板属于展示层，编辑/禁用/同步仍走既有命令。
+
 ## 五、功能模块详解
 
 ### 5.1 工具适配器 (tool_adapters.rs)
 
-内置支持 14 个 AI 编程工具：
+内置工具清单由共享模块 `crate::coding::tools::BUILTIN_TOOLS` 统一提供，Skills 不允许再维护一份平行的内置工具枚举或 key 映射。
+
+当前内置支持的 Skills 工具如下：
 
 | 工具 Key | 显示名称 | Skills 目录 | 检测目录 |
 |----------|----------|-------------|----------|
@@ -513,10 +653,24 @@ skills-git-cache/
 | gemini_cli | Gemini CLI | ~/.gemini/skills | ~/.gemini |
 | github_copilot | GitHub Copilot | ~/.copilot/skills | ~/.copilot |
 | openclaw | OpenClaw | ~/.openclaw/skills | ~/.openclaw |
+| qoder_work | QoderWork | ~/.qoderwork/skills | ~/.qoderwork |
+| qoder | Qoder | ~/.qoder/skills | %APPDATA%/Qoder |
 | droid | Droid | ~/.factory/skills | ~/.factory |
 | windsurf | Windsurf | ~/.codeium/windsurf/skills | ~/.codeium/windsurf |
+| trae | TRAE IDE | ~/.trae/skills | ~/.trae |
+| trae_cn | TRAE CN | ~/.trae-cn/skills | ~/.trae-cn |
+| qclaw | QClaw | ~/.qclaw/skills | ~/.qclaw |
+| easyclaw | EasyClaw | ~/.easyclaw/skills | ~/.easyclaw |
+| autoclaw | AutoClaw | ~/.openclaw-autoclaw/skills | ~/.openclaw-autoclaw |
 
 工具检测逻辑：检测目录存在即认为工具已安装。
+
+补充内置工具适配器时的规则（2026-08 从 skills-manager 参考项目对齐时确立）：
+
+- 新条目加在共享 `BUILTIN_TOOLS`（`tauri/src/coding/tools/builtin.rs`）即可全链路生效；Skills 适配器、检测、导入发现都动态消费该清单，不要在 Skills 模块再维护平行列表。
+- 只确认了 skills 目录、未核实 MCP 配置文件路径的工具，必须保持 `mcp_* = None`（skills-only），并加集成测试锁住该决策，防止后续误填猜测路径。
+- **禁止把读取共享目录的工具加成独立同步目标**：Cline/Warp 读 `~/.agents/skills`（已被 `shared_agents` 覆盖），Kimi/Replit 读 `~/.config/agents/skills`（与 `amp` 相同）。两个 key 指向同一物理目录会造成双写，取消其中一个的同步会删除另一个的文件。这类工具依赖现有共享条目即可，不单独建条目。
+- AutoClaw 的家目录是 `~/.openclaw-autoclaw`（不是 `.autoclaw`），照抄参考项目路径时注意。
 
 ### 5.2 同步引擎 (sync_engine.rs)
 
@@ -531,15 +685,18 @@ skills-git-cache/
 - 复制时跳过 .git 目录
 - 顶层符号链接会被解析后复制实际内容
 - Windows 上 Git 存储的文本符号链接也会被正确处理
+- 实际同步前先校验 source 是可解析目录；校验必须早于 target 覆盖/删除，避免中央仓库坏链接导致有效工具目录被误删，或把 broken/self symlink 同步成“成功”。
 
 ### 5.3 托盘支持 (tray_support.rs)
 
 菜单结构：
 ```
-──── Skills ────
+Skills  ▸
   my-skill-1  ▸  [✓ Claude Code, ✓ Codex, ○ OpenCode]
   my-skill-2  ▸  [✓ Claude Code, ○ Codex]
 ```
+
+Skills 列表统一放在单个顶层子菜单中，避免技能数量增长时挤占整个托盘菜单。
 
 事件处理：
 - 事件 ID 格式：`skill_tool_{skill_id}_{tool_key}`
@@ -603,9 +760,12 @@ description: "可选的描述"
 ### 8.3 中央仓库
 
 - 默认路径：应用数据目录/skills（如 `%APPDATA%/com.ai-toolbox/skills`）
-- 可在设置中自定义
+- 可在设置中自定义；自定义值写入 SQLite `skill_settings` 的固定记录 `skills`， `skill_settings:skills`。写入必须通过 MERGE 语义保留同表的 Git cache 等其他字段
+- `skill_preferences` 不承载中央仓库路径，保存默认视图、首选工具、托盘显示、installed tools 缓存等偏好时不得传播或修复 `central_repo_path`
 - 存储技能的原始内容
 - 工具目录通过链接或复制引用
+- WSL/SSH 自动同步时，源目录仍然是中央仓库；不要把工具运行时目录误判成同步源
+- 用户备注、手动分组、标签（tags）、管理启用状态都属于 AI Toolbox 管理元数据，不属于中央仓库文件内容。分组事实源分拆为 `skill_group` + `skill.group_id`，`user_group` 仅为兼容名称；tags 与 user_note 同语义，都是纯元数据。更新、同步、WSL/SSH 后续链路不能因为这些元数据变化而改写 `SKILL.md` 或发起技能内容同步。
 
 ### 8.4 代理支持
 
@@ -626,6 +786,43 @@ description: "可选的描述"
 | symlink | 自动同步 | 无额外占用 | Unix: 无 / Windows: 管理员 |
 | junction | 自动同步 | 无额外占用 | 无 |
 | copy | 需手动重新同步 | 完整副本 | 无 |
+
+### 8.7 WSL 与 SSH 的 Skills 链路分工
+
+- 本地 `skills_sync_to_tool`
+  - 负责把中央仓库同步到每个工具当前运行时目录。
+  - 目标路径由 `runtime_location::get_tool_skills_path_async` 动态解析，可能是本机路径，也可能是 `\\\\wsl.localhost\\...`。
+
+- WSL 自动同步
+  - 监听 `skills-changed`。
+  - 负责把中央仓库内容同步到 WSL 侧统一中央仓库 `~/.ai-toolbox/skills`，再给各工具目录建立符号链接。
+  - 对于已经 `is_wsl_direct` 的内置工具，应跳过该工具目录的额外链接维护，避免和该工具已经直接运行在 WSL 内的目录重复写入。
+  - Claude Code 本机自定义根目录只改变本机运行时 skills 目标，例如 `<custom-root>/skills`；普通 WSL 侧工具目录仍按 Claude 默认 `~/.claude/skills` 维护。只有 Claude 当前运行时本身是 WSL Direct 自定义根目录时，目标才跟随该 Linux 根目录。
+
+- SSH 自动同步
+  - 也监听 `skills-changed`，但不走 file mappings。
+  - 负责把中央仓库内容同步到 SSH 远端的统一中央仓库 `~/.ai-toolbox/skills`，再给远端工具目录建立符号链接。
+  - 排查 SSH 问题时，不要只看 SSH 同步设置页展示的 file mappings，因为 skills 根本不是走那条链路。
+
+- 最常见的误判
+  - 误把工具运行时 skills 目录当成源目录。
+  - 误以为 SSH/WSL skills 同步复用了 file mappings。
+  - 只看 UI 展示路径就判断同步真实读写路径，没有继续核对 `central_repo_path`、运行时目标目录和远端目标目录三者是否一致。
+
+### 8.8 4 个内置工具在 WSL 自定义配置下对 Skills 的影响
+
+- 这里的 4 个工具是：OpenCode、Claude Code、Codex、OpenClaw。
+- `runtime_location` 会先解析每个工具当前的**生效配置路径**，然后再判断它是不是 `\\\\wsl.localhost\\...`。
+- 一旦某个工具被判定为 `is_wsl_direct=true`：
+  - 该工具的运行时 skills 目录也会跟着切到对应的 WSL UNC 路径。
+  - `skills_sync_to_tool` 仍然从中央仓库取源，只是同步目标改成了这份 WSL UNC 路径。
+  - WSL 自动同步在给 WSL 统一中央仓库建工具链接时，应跳过这个工具，避免对已经直接运行在 WSL 内的工具目录重复维护。
+
+- 4 个工具对“生效配置路径”的解析方式不同：
+  - OpenCode、OpenClaw：以配置文件路径为核心，再从该文件位置派生 skills 目录。
+  - Claude Code、Codex：以根目录为核心，再从根目录派生配置文件、prompt、skills 等路径。
+
+- 所以排查 “为什么 Skills 目标目录变成 WSL” 时，不要只看 Skills 模块本身，要回头确认对应 tab 的配置路径是否已经被 `runtime_location` 判定为 WSL direct。
 
 ## 九、前后端通信
 
@@ -655,11 +852,28 @@ description: "可选的描述"
 | skills_sync_to_tool | 同步技能到工具 |
 | skills_unsync_from_tool | 取消同步 |
 | skills_update_managed | 更新技能（从源重新拉取） |
+| skills_update_all | 更新全部：遍历所有 managed skill 逐个从源更新，聚合结果，单点失败不阻断其余 |
+| skills_get_auto_update | 获取定时自动更新配置（enabled / schedule cron 表达式） |
+| skills_set_auto_update | 保存定时自动更新配置（保存前校验 cron 可解析） |
+| skills_preview_auto_update_schedule | 计算 cron 表达式最近 N 次触发时间（本地时区，count 1..=100 默认 10） |
 | skills_delete_managed | 删除技能 |
 | skills_get_onboarding_plan | 获取技能发现计划 |
 | skills_import_existing | 导入现有技能 |
+| skills_get_groups | 获取 first-class skill 分组 |
+| skills_save_group | 新增或更新 skill 分组，要求名称唯一 |
+| skills_delete_group | 删除分组，并将组内 skill 移到未分组；不改变管理启用状态 |
+| skills_batch_update_group | 批量移动 skill 到指定 group_id |
+| skills_set_management_enabled | 设置管理启用/禁用状态；禁用时记录历史工具并取消同步 |
+| skills_export_inventory | 导出完整 Skill Inventory JSON |
+| skills_export_inventory_file | 导出完整 Skill Inventory JSON 到 `~/skill-group-{timestamp}.json` |
+| skills_preview_inventory_import | 预览 Inventory JSON 导入影响 |
+| skills_preview_inventory_import_file | 从 JSON 文件预览 Inventory 导入影响 |
+| skills_apply_inventory_import | 应用 Inventory JSON 完整清单导入 |
+| skills_apply_inventory_import_file | 从 JSON 文件应用 Inventory 完整清单导入 |
 | skills_get_preferred_tools | 获取首选工具 |
 | skills_set_preferred_tools | 设置首选工具 |
+| skills_get_limit_add_more_to_preferred_tools | 获取“添加更多仅显示常用工具”开关 |
+| skills_set_limit_add_more_to_preferred_tools | 设置“添加更多仅显示常用工具”开关 |
 | skills_get_show_in_tray | 获取托盘显示设置 |
 | skills_set_show_in_tray | 设置托盘显示 |
 | skills_reorder | 重新排序技能 |

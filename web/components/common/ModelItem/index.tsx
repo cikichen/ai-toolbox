@@ -1,28 +1,38 @@
 import React from 'react';
-import { Button, Space, Typography, Popconfirm } from 'antd';
-import { EditOutlined, DeleteOutlined, HolderOutlined, CopyOutlined } from '@ant-design/icons';
+import { Button, Space, Typography, Popconfirm, Checkbox } from 'antd';
+import { EditOutlined, DeleteOutlined, HolderOutlined, CopyOutlined, CheckCircleOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { ModelDisplayData, I18nPrefix } from '@/components/common/ProviderCard/types';
+import styles from './styles.module.less';
 
 const { Text } = Typography;
 
 interface ModelItemProps {
   model: ModelDisplayData;
-  
+
   /** Whether the item is draggable */
   draggable?: boolean;
   /** Unique ID for sortable (defaults to model.id) */
   sortableId?: string;
-  
+
   /** Callbacks */
   onEdit?: () => void;
   onCopy?: () => void;
   onDelete?: () => void;
-  
+  onSetPrimary?: () => void;
+  selectionMode?: boolean;
+  selected?: boolean;
+  onSelectChange?: (selected: boolean) => void;
+
   /** i18n prefix for translations */
   i18nPrefix?: I18nPrefix;
+  /**
+   * When true, content fill is transparent so a selected parent card tint shows
+   * through. Borders stay. Used by Grok multi-model lists.
+   */
+  transparentBackground?: boolean;
 }
 
 /**
@@ -35,10 +45,15 @@ const ModelItem: React.FC<ModelItemProps> = ({
   onEdit,
   onCopy,
   onDelete,
+  onSetPrimary,
+  selectionMode = false,
+  selected = false,
+  onSelectChange,
   i18nPrefix = 'settings',
+  transparentBackground = false,
 }) => {
   const { t } = useTranslation();
-  
+
   const {
     attributes,
     listeners,
@@ -46,7 +61,7 @@ const ModelItem: React.FC<ModelItemProps> = ({
     transform,
     transition,
     isDragging,
-  } = useSortable({ 
+  } = useSortable({
     id: sortableId || model.id,
     disabled: !draggable,
   });
@@ -55,8 +70,8 @@ const ModelItem: React.FC<ModelItemProps> = ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    background: 'var(--color-bg-container)',
-    border: '1px solid var(--color-border-secondary)',
+    background: transparentBackground ? 'transparent' : 'var(--color-bg-container)',
+    border: selected ? '1px solid var(--ant-color-primary)' : '1px solid var(--color-border-secondary)',
     borderRadius: 4,
     padding: '8px 12px',
     display: 'flex',
@@ -65,9 +80,14 @@ const ModelItem: React.FC<ModelItemProps> = ({
   };
 
   const hasLimits = model.contextLimit !== undefined || model.outputLimit !== undefined;
+  const showPrimaryAction = !selectionMode && onSetPrimary;
 
   return (
-    <div ref={setNodeRef} style={style}>
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={styles.container}
+    >
       {draggable && (
         <div
           {...attributes}
@@ -82,6 +102,14 @@ const ModelItem: React.FC<ModelItemProps> = ({
         </div>
       )}
 
+      {selectionMode && onSelectChange && (
+        <Checkbox
+          checked={selected}
+          onChange={(event) => onSelectChange(event.target.checked)}
+          aria-label={t(`${i18nPrefix}.model.selectModel`, { name: model.name })}
+        />
+      )}
+
       <div style={{ flex: 1 }}>
         <div>
           <Text strong style={{ fontSize: 13 }}>
@@ -90,6 +118,11 @@ const ModelItem: React.FC<ModelItemProps> = ({
           <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
             ({model.id})
           </Text>
+          {model.isPrimary && (
+            <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+              · {t(`${i18nPrefix}.model.currentPrimary`)}
+            </Text>
+          )}
         </div>
         {hasLimits && (
           <div style={{ marginTop: 2 }}>
@@ -103,13 +136,27 @@ const ModelItem: React.FC<ModelItemProps> = ({
       </div>
 
       <Space>
-        {onEdit && (
+        {showPrimaryAction && (
+          <Button
+            className={styles.primaryAction}
+            size="small"
+            type="text"
+            icon={<CheckCircleOutlined />}
+            onClick={onSetPrimary}
+            disabled={model.isPrimary}
+          >
+            {model.isPrimary
+              ? t(`${i18nPrefix}.model.alreadyPrimary`)
+              : t(`${i18nPrefix}.model.setAsPrimary`)}
+          </Button>
+        )}
+        {!selectionMode && onEdit && (
           <Button size="small" type="text" icon={<EditOutlined />} onClick={onEdit} />
         )}
-        {onCopy && (
+        {!selectionMode && onCopy && (
           <Button size="small" type="text" icon={<CopyOutlined />} onClick={onCopy} />
         )}
-        {onDelete && (
+        {!selectionMode && onDelete && (
           <Popconfirm
             title={t(`${i18nPrefix}.model.deleteModel`)}
             description={t(`${i18nPrefix}.model.confirmDelete`, { name: model.name })}

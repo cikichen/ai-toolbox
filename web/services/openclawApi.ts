@@ -11,8 +11,10 @@ import type {
   OpenClawCommonConfig,
   OpenClawAgentsDefaults,
   OpenClawEnvConfig,
+  OpenClawHealthWarning,
   OpenClawToolsConfig,
   ReadOpenClawConfigResult,
+  OpenClawProviderConfig,
 } from '@/types/openclaw';
 
 /**
@@ -116,4 +118,69 @@ export const getOpenClawTools = async (): Promise<OpenClawToolsConfig | null> =>
  */
 export const setOpenClawTools = async (tools: OpenClawToolsConfig): Promise<void> => {
   await invoke('set_openclaw_tools', { tools });
+};
+
+/**
+ * Scan OpenClaw config for health warnings
+ */
+export const scanOpenClawConfigHealth = async (): Promise<OpenClawHealthWarning[]> => {
+  return await invoke<OpenClawHealthWarning[]>('scan_openclaw_config_health');
+};
+
+/**
+ * Probe and open the OpenClaw Control UI; rejects when the gateway is offline.
+ */
+export const openOpenClawWebUi = async (path?: string): Promise<void> => {
+  await invoke('open_openclaw_web_ui', { path });
+};
+
+/**
+ * Launch the OpenClaw gateway (`openclaw gateway`) in a user terminal.
+ */
+export const launchOpenClawGateway = async (): Promise<void> => {
+  await invoke('launch_openclaw_gateway');
+};
+
+export interface AllApiHubProfileInfo {
+  profileName: string;
+  extensionId: string;
+  path: string;
+}
+
+export interface OpenClawAllApiHubProvider {
+  providerId: string;
+  name: string;
+  baseUrl?: string;
+  apiProtocol: string;
+  requiresBrowserOpen: boolean;
+  isDisabled: boolean;
+  hasApiKey: boolean;
+  apiKeyPreview?: string;
+  balanceUsd?: number;
+  balanceCny?: number;
+  siteName?: string;
+  siteType?: string;
+  accountLabel: string;
+  sourceProfileName: string;
+  sourceExtensionId: string;
+  config: OpenClawProviderConfig;
+}
+
+export interface OpenClawAllApiHubProvidersResult {
+  found: boolean;
+  profiles: AllApiHubProfileInfo[];
+  providers: OpenClawAllApiHubProvider[];
+  message?: string;
+}
+
+export const listOpenClawAllApiHubProviders = async (): Promise<OpenClawAllApiHubProvidersResult> => {
+  return await invoke<OpenClawAllApiHubProvidersResult>('list_openclaw_all_api_hub_providers');
+};
+
+export const resolveOpenClawAllApiHubProviders = async (
+  providerIds: string[]
+): Promise<OpenClawAllApiHubProvider[]> => {
+  return await invoke<OpenClawAllApiHubProvider[]>('resolve_openclaw_all_api_hub_providers', {
+    request: { providerIds },
+  });
 };

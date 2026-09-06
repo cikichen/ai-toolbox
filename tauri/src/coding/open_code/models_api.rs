@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::db::DbState;
+use crate::db::SqliteDbState;
 use crate::http_client;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -22,6 +22,8 @@ pub enum ApiType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchModelsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub base_url: String,
     pub api_key: Option<String>,
     pub headers: Option<serde_json::Value>,
@@ -113,6 +115,45 @@ pub struct FetchModelsResponse {
     pub total: usize,
 }
 
+fn parse_anthropic_models_response(response_text: &str) -> Result<Vec<FetchedModel>, String> {
+    match serde_json::from_str::<AnthropicModelsResponse>(response_text) {
+        Ok(anthropic_response) => Ok(anthropic_response
+            .data
+            .into_iter()
+            .map(|model| {
+                let name = model
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| model.id.clone());
+                FetchedModel {
+                    id: model.id,
+                    name: Some(name),
+                    owned_by: Some("anthropic".to_string()),
+                    created: None,
+                }
+            })
+            .collect()),
+        Err(anthropic_error) => {
+            match serde_json::from_str::<OpenAIModelsResponse>(response_text) {
+                Ok(openai_response) => Ok(openai_response
+                    .data
+                    .into_iter()
+                    .map(|model| FetchedModel {
+                        id: model.id.clone(),
+                        name: Some(model.id),
+                        owned_by: model.owned_by,
+                        created: model.created.and_then(|value| value.as_i64()),
+                    })
+                    .collect()),
+                Err(openai_error) => Err(format!(
+                    "Failed to parse Anthropic-compatible response: Anthropic format: {}; OpenAI format: {}",
+                    anthropic_error, openai_error
+                )),
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Connectivity Test Types
 // ============================================================================
@@ -121,8 +162,12 @@ pub struct FetchModelsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ConnectivityTestRequest {
     pub npm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub base_url: String,
     pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub headers: Option<Value>,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,7 +211,49 @@ pub struct ConnectivityTestResponse {
     pub results: Vec<ConnectivityTestResult>,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedProviderRequest {
+    base_url: String,
+    api_key: Option<String>,
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string)
+}
+
+fn resolve_provider_request(
+    provider_id: Option<&str>,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> ResolvedProviderRequest {
+    let resolved_base_url = normalize_optional_string(Some(base_url))
+        .or_else(|| provider_id.and_then(super::free_models::resolve_provider_api_base_url))
+        .unwrap_or_default();
+
+    let resolved_api_key = normalize_optional_string(api_key)
+        .or_else(|| provider_id.and_then(super::free_models::resolve_auth_credential));
+
+    ResolvedProviderRequest {
+        base_url: resolved_base_url,
+        api_key: resolved_api_key,
+    }
+}
+
 /// Build models endpoint URL based on API type and SDK type
+fn normalize_google_models_base_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let last_segment = base.rsplit('/').next().unwrap_or(base);
+
+    if matches!(last_segment, "v1" | "v1alpha" | "v1beta") {
+        base.to_string()
+    } else {
+        format!("{}/v1beta", base)
+    }
+}
+
 fn build_models_url(
     base_url: &str,
     api_type: &ApiType,
@@ -179,53 +266,64 @@ fn build_models_url(
         ApiType::OpenaiCompat => {
             format!("{}/models", base)
         }
-        ApiType::Native => {
-            match sdk_type {
-                Some("@ai-sdk/google") => {
-                    let models_url = format!("{}/models", base);
-                    if let Some(key) = api_key {
-                        if !key.is_empty() {
-                            return format!("{}?key={}", models_url, key);
-                        }
+        ApiType::Native => match sdk_type {
+            Some("@ai-sdk/google") => {
+                let base = normalize_google_models_base_url(base);
+                let models_url = format!("{}/models", base);
+                if let Some(key) = api_key {
+                    if !key.is_empty() {
+                        return format!("{}?key={}", models_url, key);
                     }
-                    models_url
                 }
-                _ => {
-                    format!("{}/models", base)
-                }
+                models_url
             }
-        }
+            _ => {
+                format!("{}/models", base)
+            }
+        },
     }
 }
 
 /// Fetch models list from provider API
 #[tauri::command]
 pub async fn fetch_provider_models(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     request: FetchModelsRequest,
 ) -> Result<FetchModelsResponse, String> {
+    let resolved_request = resolve_provider_request(
+        request.provider_id.as_deref(),
+        &request.base_url,
+        request.api_key.as_deref(),
+    );
+
     // Create HTTP client with timeout and proxy support
     let client = http_client::client_with_timeout(&state, 30).await?;
 
     // Build request URL based on API type and SDK type
     // Use custom_url if provided, otherwise calculate it
     let url = if let Some(custom) = &request.custom_url {
-        if !custom.is_empty() {
-            custom.clone()
+        if !custom.trim().is_empty() {
+            custom.trim().to_string()
         } else {
+            if resolved_request.base_url.is_empty() {
+                return Err("Missing base URL".to_string());
+            }
             build_models_url(
-                &request.base_url,
+                &resolved_request.base_url,
                 &request.api_type,
                 request.sdk_type.as_deref(),
-                request.api_key.as_deref(),
+                resolved_request.api_key.as_deref(),
             )
         }
     } else {
+        if resolved_request.base_url.is_empty() {
+            return Err("Missing base URL".to_string());
+        }
         build_models_url(
-            &request.base_url,
+            &resolved_request.base_url,
             &request.api_type,
             request.sdk_type.as_deref(),
-            request.api_key.as_deref(),
+            resolved_request.api_key.as_deref(),
         )
     };
 
@@ -242,19 +340,24 @@ pub async fn fetch_provider_models(
             // Google Native: API key is in URL, no Authorization header
         }
         Some("@ai-sdk/anthropic") if matches!(request.api_type, ApiType::Native) => {
-            // Anthropic Native: use Bearer token
-            if let Some(api_key) = &request.api_key {
+            // Anthropic Native: keep the standard Authorization Bearer header so
+            // proxies that only forward Authorization keep working. Anthropic-compatible
+            // gateways such as New API accept Bearer and return either the Anthropic or
+            // the OpenAI model-list schema, both handled by parse_anthropic_models_response.
+            if let Some(api_key) = &resolved_request.api_key {
                 if !api_key.is_empty() {
-                    req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+                    req_builder =
+                        req_builder.header("Authorization", format!("Bearer {}", api_key));
                     req_builder = req_builder.header("anthropic-version", "2023-06-01");
                 }
             }
         }
         _ => {
             // OpenAI Compatible or others: use Bearer token
-            if let Some(api_key) = &request.api_key {
+            if let Some(api_key) = &resolved_request.api_key {
                 if !api_key.is_empty() {
-                    req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+                    req_builder =
+                        req_builder.header("Authorization", format!("Bearer {}", api_key));
                 }
             }
         }
@@ -314,32 +417,28 @@ pub async fn fetch_provider_models(
                 .collect()
         }
         (ApiType::Native, Some("@ai-sdk/anthropic")) => {
-            // Parse Anthropic response format
-            let anthropic_response: AnthropicModelsResponse = response
-                .json()
+            // Anthropic-compatible gateways may expose either the Anthropic model
+            // list schema or the OpenAI-compatible schema. Read the body once and
+            // accept both so authentication and schema quirks do not make discovery
+            // fail when inference itself is compatible.
+            let response_text = response
+                .text()
                 .await
-                .map_err(|e| format!("Failed to parse Anthropic response: {}", e))?;
+                .map_err(|e| format!("Failed to read Anthropic response: {}", e))?;
 
-            anthropic_response
-                .data
-                .into_iter()
-                .map(|m| {
-                    let name = m.display_name.clone().unwrap_or_else(|| m.id.clone());
-                    FetchedModel {
-                        id: m.id.clone(),
-                        name: Some(name),
-                        owned_by: Some("anthropic".to_string()),
-                        created: None,
-                    }
-                })
-                .collect()
+            parse_anthropic_models_response(&response_text)?
         }
         _ => {
             // Parse OpenAI compatible response format
-            let response_text = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+            let response_text = response
+                .text()
+                .await
+                .map_err(|e| format!("Failed to read response: {}", e))?;
 
             // Try OpenAI format first, then Google format as fallback
-            if let Ok(openai_response) = serde_json::from_str::<OpenAIModelsResponse>(&response_text) {
+            if let Ok(openai_response) =
+                serde_json::from_str::<OpenAIModelsResponse>(&response_text)
+            {
                 openai_response
                     .data
                     .into_iter()
@@ -350,12 +449,18 @@ pub async fn fetch_provider_models(
                         created: m.created.and_then(|v| v.as_i64()),
                     })
                     .collect()
-            } else if let Ok(google_response) = serde_json::from_str::<GoogleModelsResponse>(&response_text) {
+            } else if let Ok(google_response) =
+                serde_json::from_str::<GoogleModelsResponse>(&response_text)
+            {
                 google_response
                     .models
                     .into_iter()
                     .map(|m| {
-                        let id = m.name.strip_prefix("models/").unwrap_or(&m.name).to_string();
+                        let id = m
+                            .name
+                            .strip_prefix("models/")
+                            .unwrap_or(&m.name)
+                            .to_string();
                         FetchedModel {
                             id: id.clone(),
                             name: m.display_name.or(Some(id)),
@@ -365,7 +470,10 @@ pub async fn fetch_provider_models(
                     })
                     .collect()
             } else {
-                return Err(format!("Failed to parse models response. Response was: {}", response_text));
+                return Err(format!(
+                    "Failed to parse models response. Response was: {}",
+                    response_text
+                ));
             }
         }
     };
@@ -474,7 +582,11 @@ fn build_connectivity_url(
         "@ai-sdk/openai" => format!("{}/responses", base),
         "@ai-sdk/google" => {
             let normalized_model = model_id.strip_prefix("models/").unwrap_or(model_id);
-            let action = if stream { "streamGenerateContent" } else { "generateContent" };
+            let action = if stream {
+                "streamGenerateContent"
+            } else {
+                "generateContent"
+            };
             let url = format!("{}/models/{}:{}", base, normalized_model, action);
             if let Some(key) = api_key {
                 if !key.is_empty() {
@@ -596,6 +708,13 @@ fn build_default_body(
                 ],
                 "stream": stream_enabled,
             });
+            if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
+                if !reasoning_effort.trim().is_empty() {
+                    body["reasoning"] = json!({
+                        "effort": reasoning_effort.trim()
+                    });
+                }
+            }
             if let Some(temperature) = request.temperature {
                 body["temperature"] = json!(temperature);
             }
@@ -723,12 +842,24 @@ async fn run_connectivity_test_for_model(
     let mut request_headers = BTreeMap::new();
     if is_anthropic {
         request_headers.insert("Accept".to_string(), "application/json".to_string());
-        request_headers.insert("Accept-Encoding".to_string(), "gzip, deflate, br, zstd".to_string());
+        request_headers.insert(
+            "Accept-Encoding".to_string(),
+            "gzip, deflate, br, zstd".to_string(),
+        );
         request_headers.insert("Connection".to_string(), "keep-alive".to_string());
         request_headers.insert("Content-Type".to_string(), "application/json".to_string());
-        request_headers.insert("User-Agent".to_string(), "claude-cli/2.1.19 (external, cli)".to_string());
-        request_headers.insert("anthropic-beta".to_string(), "interleaved-thinking-2025-05-14".to_string());
-        request_headers.insert("anthropic-dangerous-direct-browser-access".to_string(), "true".to_string());
+        request_headers.insert(
+            "User-Agent".to_string(),
+            "claude-cli/2.1.19 (external, cli)".to_string(),
+        );
+        request_headers.insert(
+            "anthropic-beta".to_string(),
+            "interleaved-thinking-2025-05-14".to_string(),
+        );
+        request_headers.insert(
+            "anthropic-dangerous-direct-browser-access".to_string(),
+            "true".to_string(),
+        );
         request_headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
     }
 
@@ -870,14 +1001,38 @@ async fn run_connectivity_test_for_model(
 
 #[tauri::command]
 pub async fn test_provider_model_connectivity(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     request: ConnectivityTestRequest,
 ) -> Result<ConnectivityTestResponse, String> {
     let timeout_secs = request.timeout_secs.unwrap_or(30);
     let client = http_client::client_with_timeout(&state, timeout_secs).await?;
+    let resolved_request = resolve_provider_request(
+        request.provider_id.as_deref(),
+        &request.base_url,
+        request.api_key.as_deref(),
+    );
+    let mut request = request;
+    request.base_url = resolved_request.base_url;
+    request.api_key = resolved_request.api_key;
 
     let mut results = Vec::new();
     for model_id in &request.model_ids {
+        if request.base_url.trim().is_empty() {
+            results.push(ConnectivityTestResult {
+                model_id: model_id.clone(),
+                status: "error".to_string(),
+                first_byte_ms: None,
+                total_ms: None,
+                error_message: Some("Missing Base URL".to_string()),
+                request_url: String::new(),
+                request_headers: json!({}),
+                request_body: json!({}),
+                response_headers: None,
+                response_body: None,
+            });
+            continue;
+        }
+
         let result = run_connectivity_test_for_model(&client, &request, model_id).await;
         results.push(result);
     }
@@ -899,13 +1054,23 @@ mod tests {
 
         // Base URL with /v1
         assert_eq!(
-            build_models_url("https://api.openai.com/v1", &ApiType::OpenaiCompat, None, None),
+            build_models_url(
+                "https://api.openai.com/v1",
+                &ApiType::OpenaiCompat,
+                None,
+                None
+            ),
             "https://api.openai.com/v1/models"
         );
 
         // Base URL with trailing slash
         assert_eq!(
-            build_models_url("https://api.openai.com/v1/", &ApiType::OpenaiCompat, None, None),
+            build_models_url(
+                "https://api.openai.com/v1/",
+                &ApiType::OpenaiCompat,
+                None,
+                None
+            ),
             "https://api.openai.com/v1/models"
         );
 
@@ -923,6 +1088,28 @@ mod tests {
 
     #[test]
     fn test_build_models_url_native_google() {
+        // Google Native model listing uses Gemini API v1beta by default when no version is present.
+        assert_eq!(
+            build_models_url(
+                "https://generativelanguage.googleapis.com",
+                &ApiType::Native,
+                Some("@ai-sdk/google"),
+                None
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+
+        // Custom Gemini API gateways commonly expose the same root URL that Gemini CLI stores in GOOGLE_GEMINI_BASE_URL.
+        assert_eq!(
+            build_models_url(
+                "https://gemini.example.com",
+                &ApiType::Native,
+                Some("@ai-sdk/google"),
+                Some("test-api-key")
+            ),
+            "https://gemini.example.com/v1beta/models?key=test-api-key"
+        );
+
         // Google Native with /v1beta
         assert_eq!(
             build_models_url(
@@ -944,6 +1131,17 @@ mod tests {
             ),
             "https://generativelanguage.googleapis.com/v1beta/models?key=test-api-key"
         );
+
+        // Google Native with explicit /v1 should keep the caller-provided version.
+        assert_eq!(
+            build_models_url(
+                "https://generativelanguage.googleapis.com/v1",
+                &ApiType::Native,
+                Some("@ai-sdk/google"),
+                Some("test-api-key")
+            ),
+            "https://generativelanguage.googleapis.com/v1/models?key=test-api-key"
+        );
     }
 
     #[test]
@@ -958,6 +1156,47 @@ mod tests {
             ),
             "https://api.anthropic.com/v1/models"
         );
+    }
+
+    #[test]
+    fn test_parse_anthropic_models_response() {
+        let models = parse_anthropic_models_response(
+            r#"{
+                "data": [{
+                    "id": "claude-sonnet-4-6",
+                    "type": "model",
+                    "display_name": "Claude Sonnet 4.6"
+                }]
+            }"#,
+        )
+        .expect("Anthropic model list should parse");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4-6");
+        assert_eq!(models[0].name.as_deref(), Some("Claude Sonnet 4.6"));
+        assert_eq!(models[0].owned_by.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn test_parse_openai_compatible_models_response_for_anthropic_gateway() {
+        let models = parse_anthropic_models_response(
+            r#"{
+                "object": "list",
+                "data": [{
+                    "id": "claude-sonnet-4-6",
+                    "object": "model",
+                    "created": 1626777600,
+                    "owned_by": "claude"
+                }]
+            }"#,
+        )
+        .expect("OpenAI-compatible model list should parse");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4-6");
+        assert_eq!(models[0].name.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(models[0].owned_by.as_deref(), Some("claude"));
+        assert_eq!(models[0].created, Some(1626777600));
     }
 
     #[test]

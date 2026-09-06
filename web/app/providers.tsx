@@ -1,11 +1,28 @@
 import React from 'react';
-import { ConfigProvider, Spin, App, theme as antdTheme, Button, Modal, Progress, Typography, Space } from 'antd';
+import { ConfigProvider, Spin, App, theme as antdTheme, Button, Modal, Typography, Space } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
 import { emit, listen } from '@tauri-apps/api/event';
+import { TRAY_CONFIG_REFRESH_EVENT } from '@/constants/configEvents';
+import UpdateProgressModal from '@/components/common/UpdateProgressModal';
+import DeepLinkImportDialog from '@/features/shared/deepLink/DeepLinkImportDialog';
+import { useDeepLinkImport } from '@/features/shared/deepLink/useDeepLinkImport';
+import type { DeepLinkErrorPayload } from '@/services/deeplinkApi';
 import { useAppStore, useSettingsStore } from '@/stores';
 import { useThemeStore } from '@/stores/themeStore';
-import { checkForUpdates, openExternalUrl, setWindowBackgroundColor, installUpdate, GITHUB_REPO, type UpdateInfo } from '@/services';
+import {
+  checkForUpdates,
+  openExternalUrl,
+  setWindowBackgroundColor,
+  installUpdate,
+  loadCachedPresetModels,
+  fetchRemotePresetModels,
+  loadCachedGatewayProviderProfiles,
+  fetchRemoteGatewayProviderProfiles,
+  fetchRemoteModelPricing,
+  GITHUB_REPO,
+  type UpdateInfo,
+} from '@/services';
 import { restartApp } from '@/services/settingsApi';
 import i18n from '@/i18n';
 
@@ -21,24 +38,26 @@ const antdLocales = {
 /**
  * Inner component that uses App.useApp() to get theme-aware notification
  */
-const { Text } = Typography;
+/**
+ * Globally-mounted deep-link import dialog: listens for `deep-link-import` /
+ * `deep-link-error` events from the backend and shows a confirmation modal
+ * (with a masked API key) before persisting via `import_from_deeplink_unified`.
+ * The hook marks the frontend listener ready and drains a cold-start pending
+ * request after the listeners are attached.
+ */
+const DeepLinkImportMount: React.FC = () => {
+  const { message } = App.useApp();
 
-// 格式化文件大小
-const formatFileSize = (bytes: number) => {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
+  const onError = React.useCallback(
+    (error: DeepLinkErrorPayload) => {
+      message.error(`${i18n.t('common.deepLink.parseError')}: ${error.error}`);
+    },
+    [message],
+  );
 
-// 格式化下载速度
-const formatSpeed = (bytesPerSecond: number) => {
-  if (bytesPerSecond === 0) return '0 B/s';
-  const k = 1024;
-  const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-  const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
-  return parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  const { request, dismiss } = useDeepLinkImport(onError);
+
+  return <DeepLinkImportDialog request={request} onDismiss={dismiss} />;
 };
 
 const AppInitializer: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -149,7 +168,9 @@ const AppInitializer: React.FC<{ children: React.ReactNode }> = ({ children }) =
         if (info.hasUpdate) {
           notification.info({
             message: i18n.t('settings.about.newVersion'),
-            description: i18n.t('settings.about.updateAvailable', { version: info.latestVersion }),
+            description: info.scoopInstall
+              ? i18n.t('settings.about.scoopUpdateHint', { version: info.latestVersion })
+              : i18n.t('settings.about.updateAvailable', { version: info.latestVersion }),
             btn: (
               <Space>
                 <Button
@@ -161,13 +182,11 @@ const AppInitializer: React.FC<{ children: React.ReactNode }> = ({ children }) =
                 >
                   {i18n.t('settings.about.viewReleaseNotes')}
                 </Button>
-                <Button
-                  type="primary"
-                  size="small"
-                  onClick={() => handleInstallUpdate(info)}
-                >
-                  {i18n.t('settings.about.goToDownload')}
-                </Button>
+                {!info.scoopInstall && (
+                  <Button type="primary" size="small" onClick={() => handleInstallUpdate(info)}>
+                    {i18n.t('settings.about.goToDownload')}
+                  </Button>
+                )}
               </Space>
             ),
             duration: 10,
@@ -182,16 +201,23 @@ const AppInitializer: React.FC<{ children: React.ReactNode }> = ({ children }) =
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notification]);
 
-  // Listen for config changes from tray menu
+  // Keep a global fallback for tray-driven config changes so inactive pages and
+  // subpanels that do not maintain their own listeners still resync to disk state.
   React.useEffect(() => {
     let unlisten: (() => void) | undefined;
 
     const setupListener = async () => {
       try {
         unlisten = await listen<string>('config-changed', async (event) => {
-          const configType = event.payload;
-          if (configType === 'tray') {
-            window.location.reload();
+          if (event.payload === 'tray') {
+            const refreshEvent = new CustomEvent(TRAY_CONFIG_REFRESH_EVENT, {
+              cancelable: true,
+            });
+            window.dispatchEvent(refreshEvent);
+
+            if (!refreshEvent.defaultPrevented) {
+              window.location.reload();
+            }
           }
         });
       } catch (error) {
@@ -211,47 +237,17 @@ const AppInitializer: React.FC<{ children: React.ReactNode }> = ({ children }) =
   return (
     <>
       {children}
+      {/* Deep-link (`aitoolbox://`) provider import confirmation */}
+      <DeepLinkImportMount />
       {/* Update Progress Modal */}
-      <Modal
-        title={i18n.t('settings.about.downloadingUpdate')}
+      <UpdateProgressModal
         open={updateModalOpen}
-        closable={false}
-        footer={null}
-        centered
-      >
-        <div style={{ padding: '20px 0' }}>
-          <Progress
-            percent={updateProgress}
-            status="active"
-            strokeColor={{
-              '0%': '#108ee9',
-              '100%': '#87d068',
-            }}
-          />
-          <div style={{ marginTop: 16 }}>
-            {updateStatus === 'downloading' && (
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <Text type="secondary" style={{ fontSize: 14 }}>
-                  {formatFileSize(updateDownloaded)} / {formatFileSize(updateTotal)}
-                </Text>
-                <Text style={{ color: '#1890ff', fontSize: 14, fontWeight: 500 }}>
-                  {formatSpeed(updateSpeed)}
-                </Text>
-              </div>
-            )}
-            {updateStatus === 'installing' && (
-              <Text type="secondary" style={{ fontSize: 14 }}>
-                {i18n.t('settings.about.installingUpdate')}
-              </Text>
-            )}
-            {updateStatus === 'started' && (
-              <Text type="secondary" style={{ fontSize: 14 }}>
-                {i18n.t('settings.about.downloadingUpdate')}
-              </Text>
-            )}
-          </div>
-        </div>
-      </Modal>
+        progress={updateProgress}
+        status={updateStatus}
+        speed={updateSpeed}
+        downloaded={updateDownloaded}
+        total={updateTotal}
+      />
     </>
   );
 };
@@ -262,6 +258,16 @@ export const Providers: React.FC<ProvidersProps> = ({ children }) => {
   const { mode, resolvedTheme, isInitialized: themeInitialized, initTheme, updateResolvedTheme } = useThemeStore();
 
   const isLoading = !appInitialized || !settingsInitialized || !themeInitialized;
+  const antdLocale = antdLocales[language];
+  const modalConfig = React.useMemo(() => ({
+    centered: true,
+  }), []);
+  const antdThemeConfig = React.useMemo(() => ({
+    algorithm: resolvedTheme === 'dark' ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
+    token: {
+      colorPrimary: '#1890ff',
+    },
+  }), [resolvedTheme]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -290,6 +296,12 @@ export const Providers: React.FC<ProvidersProps> = ({ children }) => {
       await initApp();
       await initSettings();
       await initTheme();
+      // Load preset models: local cache first (fast), then remote (background)
+      await loadCachedPresetModels();
+      await loadCachedGatewayProviderProfiles();
+      fetchRemotePresetModels();
+      fetchRemoteGatewayProviderProfiles();
+      fetchRemoteModelPricing().catch(() => {});
     };
     init();
   }, [initApp, initSettings, initTheme]);
@@ -333,6 +345,24 @@ export const Providers: React.FC<ProvidersProps> = ({ children }) => {
     }
   }, [language, appInitialized]);
 
+  React.useEffect(() => {
+    ConfigProvider.config({
+      holderRender: (modalChildren) => (
+        <ConfigProvider
+          locale={antdLocale}
+          modal={modalConfig}
+          theme={antdThemeConfig}
+        >
+          {modalChildren}
+        </ConfigProvider>
+      ),
+    });
+
+    return () => {
+      ConfigProvider.config({ holderRender: undefined });
+    };
+  }, [antdLocale, antdThemeConfig, modalConfig]);
+
   if (isLoading) {
     return (
       <div
@@ -351,13 +381,9 @@ export const Providers: React.FC<ProvidersProps> = ({ children }) => {
 
   return (
     <ConfigProvider
-      locale={antdLocales[language]}
-      theme={{
-        algorithm: resolvedTheme === 'dark' ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
-        token: {
-          colorPrimary: '#1890ff',
-        },
-      }}
+      locale={antdLocale}
+      modal={modalConfig}
+      theme={antdThemeConfig}
     >
       <App>
         <AppInitializer>

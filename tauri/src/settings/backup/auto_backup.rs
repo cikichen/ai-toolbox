@@ -5,9 +5,9 @@ use tauri::{Emitter, Manager};
 
 use super::utils::{create_backup_zip, get_db_path};
 use super::webdav::{delete_webdav_backup_internal, list_webdav_backups_internal};
-use crate::db::DbState;
+use crate::db::SqliteDbState;
 use crate::http_client;
-use crate::settings::adapter;
+use crate::settings::store;
 
 /// Start the auto-backup scheduler as a background task
 pub fn start_auto_backup_scheduler(app_handle: tauri::AppHandle) {
@@ -30,15 +30,19 @@ pub fn start_auto_backup_scheduler(app_handle: tauri::AppHandle) {
 
 /// Read settings from DB and check if auto-backup should run
 async fn check_and_perform_backup(app_handle: &tauri::AppHandle) -> Result<(), String> {
-    let db_state = app_handle.state::<DbState>();
-    let settings = read_settings(&db_state).await?;
+    let db_state = app_handle.state::<SqliteDbState>();
+    let sqlite_state = app_handle.state::<SqliteDbState>();
+    let settings = store::load_settings_from_sqlite_state(&sqlite_state)?;
 
     if !settings.auto_backup_enabled {
         return Ok(());
     }
 
     // Check if backup is due
-    if !is_backup_due(&settings.last_auto_backup_time, settings.auto_backup_interval_days) {
+    if !is_backup_due(
+        &settings.last_auto_backup_time,
+        settings.auto_backup_interval_days,
+    ) {
         return Ok(());
     }
 
@@ -55,7 +59,7 @@ async fn check_and_perform_backup(app_handle: &tauri::AppHandle) -> Result<(), S
                     info!("Auto-backup completed successfully");
 
                     let now = Utc::now().to_rfc3339();
-                    update_last_auto_backup_time(&db_state, &now).await?;
+                    update_last_auto_backup_time(&sqlite_state, &db_state, &now).await?;
                     let _ = app_handle.emit("auto-backup-completed", &now);
 
                     if settings.auto_backup_max_keep > 0 {
@@ -78,7 +82,7 @@ async fn check_and_perform_backup(app_handle: &tauri::AppHandle) -> Result<(), S
 
                     // Update last_auto_backup_time even on failure to prevent retry every 10 minutes
                     let now = Utc::now().to_rfc3339();
-                    update_last_auto_backup_time(&db_state, &now).await?;
+                    update_last_auto_backup_time(&sqlite_state, &db_state, &now).await?;
                     let _ = app_handle.emit("auto-backup-failed", &e);
                 }
             }
@@ -97,7 +101,7 @@ async fn check_and_perform_backup(app_handle: &tauri::AppHandle) -> Result<(), S
                     info!("Auto-backup (local) completed successfully");
 
                     let now = Utc::now().to_rfc3339();
-                    update_last_auto_backup_time(&db_state, &now).await?;
+                    update_last_auto_backup_time(&sqlite_state, &db_state, &now).await?;
                     let _ = app_handle.emit("auto-backup-completed", &now);
 
                     if settings.auto_backup_max_keep > 0 {
@@ -114,7 +118,7 @@ async fn check_and_perform_backup(app_handle: &tauri::AppHandle) -> Result<(), S
 
                     // Update last_auto_backup_time even on failure to prevent retry every 10 minutes
                     let now = Utc::now().to_rfc3339();
-                    update_last_auto_backup_time(&db_state, &now).await?;
+                    update_last_auto_backup_time(&sqlite_state, &db_state, &now).await?;
                     let _ = app_handle.emit("auto-backup-failed", &e);
                 }
             }
@@ -122,28 +126,6 @@ async fn check_and_perform_backup(app_handle: &tauri::AppHandle) -> Result<(), S
             Ok(())
         }
         _ => Ok(()),
-    }
-}
-
-/// Read AppSettings from database
-async fn read_settings(
-    db_state: &DbState,
-) -> Result<crate::settings::types::AppSettings, String> {
-    let db = db_state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT * OMIT id FROM settings:`app` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query settings: {}", e))?;
-
-    let records: Vec<serde_json::Value> = result
-        .take(0)
-        .map_err(|e| format!("Failed to parse settings: {}", e))?;
-
-    if let Some(record) = records.first() {
-        Ok(adapter::from_db_value(record.clone()))
-    } else {
-        Ok(crate::settings::types::AppSettings::default())
     }
 }
 
@@ -166,11 +148,18 @@ fn is_backup_due(last_time: &Option<String>, interval_days: u32) -> bool {
 /// Perform a WebDAV backup
 async fn perform_webdav_backup(
     app_handle: &tauri::AppHandle,
-    db_state: &DbState,
+    db_state: &SqliteDbState,
     settings: &crate::settings::types::AppSettings,
 ) -> Result<(), String> {
     let db_path = get_db_path(app_handle)?;
-    let zip_data = create_backup_zip(app_handle, &db_path)?;
+    let zip_data = create_backup_zip(
+        app_handle,
+        &db_path,
+        settings.backup_image_assets_enabled,
+        settings.backup_cli_config_files_enabled,
+        &settings.backup_file_filter_rules,
+    )
+    .await?;
 
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
     let host = settings.webdav.host_label.trim();
@@ -221,7 +210,14 @@ async fn perform_local_backup(
     settings: &crate::settings::types::AppSettings,
 ) -> Result<(), String> {
     let db_path = get_db_path(app_handle)?;
-    let zip_data = create_backup_zip(app_handle, &db_path)?;
+    let zip_data = create_backup_zip(
+        app_handle,
+        &db_path,
+        settings.backup_image_assets_enabled,
+        settings.backup_cli_config_files_enabled,
+        &settings.backup_file_filter_rules,
+    )
+    .await?;
 
     let backup_dir = std::path::Path::new(&settings.local_backup_path);
     if !backup_dir.exists() {
@@ -240,22 +236,18 @@ async fn perform_local_backup(
     Ok(())
 }
 
-/// Update last_auto_backup_time in database directly
-async fn update_last_auto_backup_time(db_state: &DbState, time: &str) -> Result<(), String> {
-    let db = db_state.0.lock().await;
-    let time_owned = time.to_string();
-
-    db.query("UPDATE settings:`app` SET last_auto_backup_time = $time")
-        .bind(("time", time_owned))
-        .await
-        .map_err(|e| format!("Failed to update last_auto_backup_time: {}", e))?;
-
-    Ok(())
+/// Update last_auto_backup_time in SQLite.
+async fn update_last_auto_backup_time(
+    sqlite_state: &SqliteDbState,
+    _db_state: &SqliteDbState,
+    time: &str,
+) -> Result<(), String> {
+    store::update_last_auto_backup_time_in_sqlite_state(sqlite_state, time)
 }
 
 /// Cleanup old WebDAV backups, keeping only the latest `max_keep` files
 async fn cleanup_old_webdav_backups(
-    db_state: &DbState,
+    db_state: &SqliteDbState,
     url: &str,
     username: &str,
     password: &str,
@@ -325,11 +317,7 @@ fn cleanup_old_local_backups(backup_path: &str, max_keep: u32) -> Result<(), Str
 
     for entry in to_delete {
         if let Err(e) = std::fs::remove_file(entry.path()) {
-            warn!(
-                "Failed to delete old backup {:?}: {}",
-                entry.file_name(),
-                e
-            );
+            warn!("Failed to delete old backup {:?}: {}", entry.file_name(), e);
         }
     }
 

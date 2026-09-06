@@ -1,0 +1,2075 @@
+import React from 'react';
+import { Modal, Form, Input, Button, Typography, Select, Collapse, Space, message, Divider } from 'antd';
+import { MoreOutlined, PlusOutlined, DeleteOutlined, SwapOutlined, ImportOutlined } from '@ant-design/icons';
+import { useTranslation } from 'react-i18next';
+import {
+  OH_MY_OPENAGENT_AGENTS,
+  OH_MY_OPENAGENT_CATEGORIES,
+  type OhMyOpenAgentAgentConfig,
+  type OhMyOpenAgentCategoryDefinition,
+} from '@/types/ohMyOpenAgent';
+import { getOpenAgentDisplayName, getOpenAgentDescription, getOpenAgentRecommendedModel, getOpenAgentCategoryDescription, getOpenAgentCategoryDisplayName, getOpenAgentCategoryRecommendedModel } from '@/services/ohMyOpenAgentApi';
+import JsonEditor from '@/components/common/JsonEditor';
+import {
+  applyBatchReplaceModel,
+  collectBatchReplaceSourceUsage,
+} from './batchReplaceModelUtils';
+import ImportJsonConfigModal from './ImportJsonConfigModal';
+import { type ImportedConfigData } from './importJsonConfigUtils';
+import styles from './OhMyOpenAgentConfigModal.module.less';
+
+const { Text } = Typography;
+
+const getCategoryDefinitions = (): OhMyOpenAgentCategoryDefinition[] => OH_MY_OPENAGENT_CATEGORIES;
+type ModelOption = { label: string; value: string; disabled?: boolean };
+type ModelOptionGroup = { label: string; options: ModelOption[] };
+type GroupedModelOptions = Array<ModelOption | ModelOptionGroup>;
+
+const getOpenAgentBatchReplaceReasoningFieldName = (modelFieldName: string) =>
+  `${modelFieldName}_reasoning`;
+
+const getOpenAgentBatchReplaceModelsFieldName = (modelFieldName: string) =>
+  `${modelFieldName}_models`;
+
+/** A model chain entry — either a bare model id string or a per-entry override
+ *  object (`{ model, reasoning, ... }`). Upstream `2026-08-reasoning-unification`
+ *  emits the primary entry as an object carrying `reasoning`; older/manual
+ *  configs may use plain strings. */
+type ModelChainEntry = string | Record<string, unknown>;
+
+/** Coerce a single `models` chain entry into its model id string. Returns
+ *  undefined for non-string / malformed entries so callers can drop them. */
+function modelChainEntryToId(entry: ModelChainEntry | undefined): string | undefined {
+  if (typeof entry === 'string') return entry;
+  if (entry && typeof entry === 'object') {
+    const model = (entry as Record<string, unknown>).model;
+    if (typeof model === 'string') return model;
+  }
+  return undefined;
+}
+
+/** Split a unified `models` chain (primary at index 0, rest are fallbacks) into
+ *  the pieces the form fields expect. The primary entry may carry its own
+ *  `reasoning` (canonical upstream shape); per-fallback overrides are dropped
+ *  since the form only edits model ids. */
+function splitModelChain(rawModels: unknown): {
+  primaryModel?: string;
+  primaryReasoning?: string;
+  restModels: string[];
+} {
+  if (!Array.isArray(rawModels) || rawModels.length === 0) return { restModels: [] };
+  const primary = rawModels[0] as ModelChainEntry;
+  const primaryModel = modelChainEntryToId(primary);
+  let primaryReasoning: string | undefined;
+  if (primary && typeof primary === 'object') {
+    const reasoning = (primary as Record<string, unknown>).reasoning;
+    if (typeof reasoning === 'string' && reasoning) primaryReasoning = reasoning;
+  }
+  const restModels = (rawModels.slice(1) as ModelChainEntry[])
+    .map(modelChainEntryToId)
+    .filter((m): m is string => typeof m === 'string');
+  return { primaryModel, primaryReasoning, restModels };
+}
+
+// Map agent keys to lowercase for backward compatibility with old configs
+function normalizeAgentKey(key: string): string {
+  return key.toLowerCase();
+}
+
+interface OhMyOpenAgentConfigModalProps {
+  open: boolean;
+  isEdit: boolean;
+  initialValues?: {
+    id?: string;
+    name: string;
+    agents?: Record<string, OhMyOpenAgentAgentConfig | undefined> | null;
+    categories?: Record<string, OhMyOpenAgentAgentConfig | undefined> | null;
+    otherFields?: Record<string, unknown>;
+  };
+  modelOptions: GroupedModelOptions;
+  /** Map of model ID to its variant keys, e.g., { "opencode/openai/gpt-5": ["high", "medium", "low"] } */
+  modelVariantsMap?: Record<string, string[]>;
+  /** Dual-write `variant` alongside canonical `reasoning` when saving. Works around
+   *  upstream issue #6614 (effort lost on task() delegation under the `reasoning` key). */
+  dualWriteReasoningVariant?: boolean;
+  onCancel: () => void;
+  onSuccess: (values: OhMyOpenAgentConfigFormValues) => void;
+}
+
+export interface OhMyOpenAgentConfigFormValues {
+  id?: string;
+  name: string;
+  agents: Record<string, OhMyOpenAgentAgentConfig | undefined>;
+  categories: Record<string, OhMyOpenAgentAgentConfig | undefined>;
+  otherFields?: Record<string, unknown>;
+}
+
+const OhMyOpenAgentConfigModal: React.FC<OhMyOpenAgentConfigModalProps> = ({
+  open,
+  isEdit,
+  initialValues,
+  modelOptions,
+  modelVariantsMap = {},
+  dualWriteReasoningVariant = false,
+  onCancel,
+  onSuccess,
+}) => {
+  const { t } = useTranslation();
+  const [form] = Form.useForm();
+  const [loading, setLoading] = React.useState(false);
+  const [categoriesCollapsed, setCategoriesCollapsed] = React.useState(false);
+
+  // Track which agents/categories have advanced settings expanded
+  const [expandedAgents, setExpandedAgents] = React.useState<Record<string, boolean>>({});
+  const [expandedCategories, setExpandedCategories] = React.useState<Record<string, boolean>>({});
+
+  // Custom agents and categories (user-defined)
+  const [customAgents, setCustomAgents] = React.useState<string[]>([]);
+  const [customCategories, setCustomCategories] = React.useState<string[]>([]);
+  const [newAgentKey, setNewAgentKey] = React.useState('');
+  const [newCategoryKey, setNewCategoryKey] = React.useState('');
+  const [showAddAgent, setShowAddAgent] = React.useState(false);
+  const [showAddCategory, setShowAddCategory] = React.useState(false);
+  const [showBatchReplace, setShowBatchReplace] = React.useState(false);
+  const [showImportJson, setShowImportJson] = React.useState(false);
+
+  // Batch replace model state
+  const [batchReplaceFromModel, setBatchReplaceFromModel] = React.useState<string | undefined>(undefined);
+  const [batchReplaceToModel, setBatchReplaceToModel] = React.useState<string | undefined>(undefined);
+  const [batchReplaceFromVariant, setBatchReplaceFromVariant] = React.useState<string | undefined>(undefined);
+  const [batchReplaceToVariant, setBatchReplaceToVariant] = React.useState<string | undefined>(undefined);
+
+  const toModelVariants = React.useMemo(
+    () => (batchReplaceToModel ? modelVariantsMap[batchReplaceToModel] ?? [] : []),
+    [batchReplaceToModel, modelVariantsMap]
+  );
+
+  // Store advanced settings values in refs to avoid re-renders
+  const advancedSettingsRef = React.useRef<Record<string, Record<string, unknown>>>({});
+  const advancedSettingsRawRef = React.useRef<Record<string, string>>({});
+
+  const categoryAdvancedSettingsRef = React.useRef<Record<string, Record<string, unknown>>>({});
+  const categoryAdvancedSettingsRawRef = React.useRef<Record<string, string>>({});
+  const unknownCategoriesRef = React.useRef<Record<string, OhMyOpenAgentAgentConfig>>({});
+
+  const otherFieldsRef = React.useRef<Record<string, unknown>>({});
+  const otherFieldsRawRef = React.useRef<string>('');
+  const otherFieldsValidRef = React.useRef(true);
+
+  // Track if modal has been initialized to avoid re-initialization on parent re-renders
+  const initializedRef = React.useRef(false);
+  const prevOpenRef = React.useRef(false);
+
+  // Agent types from centralized constant
+  const allAgentKeys = React.useMemo(() => OH_MY_OPENAGENT_AGENTS.map((agent) => agent.key), []);
+  const categoryDefinitions = React.useMemo(() => getCategoryDefinitions(), []);
+  const categoryKeys = React.useMemo(
+    () => categoryDefinitions.map((category) => category.key),
+    [categoryDefinitions]
+  );
+  const builtInAgentKeys = React.useMemo(
+    () => allAgentKeys.filter((agentKey) => !(agentKey.startsWith('__') && agentKey.endsWith('__'))),
+    [allAgentKeys]
+  );
+  const batchReplaceModelFieldNames = React.useMemo(
+    () => [
+      ...builtInAgentKeys.map((agentKey) => `agent_${agentKey}`),
+      ...customAgents.map((agentKey) => `agent_${agentKey}`),
+      ...categoryKeys.map((categoryKey) => `category_${categoryKey}`),
+      ...customCategories.map((categoryKey) => `category_${categoryKey}`),
+    ],
+    [builtInAgentKeys, customAgents, categoryKeys, customCategories]
+  );
+  const watchedFormValues = Form.useWatch([], form) as Record<string, unknown> | undefined;
+  const batchReplaceSourceUsage = React.useMemo(() => {
+    return collectBatchReplaceSourceUsage({
+      values: watchedFormValues ?? {},
+      modelFieldNames: batchReplaceModelFieldNames,
+      getVariantFieldName: getOpenAgentBatchReplaceReasoningFieldName,
+      getFallbackFieldName: getOpenAgentBatchReplaceModelsFieldName,
+    });
+  }, [batchReplaceModelFieldNames, watchedFormValues]);
+  const batchReplaceFromModelOptions = React.useMemo<GroupedModelOptions>(() => {
+    return Array.from(batchReplaceSourceUsage.usedModels)
+      .sort((left, right) => left.localeCompare(right))
+      .map((modelId) => ({
+        label: modelId,
+        value: modelId
+      }));
+  }, [batchReplaceSourceUsage.usedModels]);
+  const batchReplaceFromVariantOptions = React.useMemo(() => {
+    if (!batchReplaceFromModel) {
+      return [];
+    }
+
+    return Array.from(batchReplaceSourceUsage.variantsByModel.get(batchReplaceFromModel) ?? [])
+      .sort((left, right) => left.localeCompare(right));
+  }, [batchReplaceFromModel, batchReplaceSourceUsage.variantsByModel]);
+
+  React.useEffect(() => {
+    if (!batchReplaceFromModel) {
+      setBatchReplaceFromVariant(undefined);
+      return;
+    }
+    if (!batchReplaceSourceUsage.usedModels.has(batchReplaceFromModel)) {
+      setBatchReplaceFromModel(undefined);
+      setBatchReplaceFromVariant(undefined);
+      return;
+    }
+    if (batchReplaceFromVariant && !batchReplaceFromVariantOptions.includes(batchReplaceFromVariant)) {
+      setBatchReplaceFromVariant(undefined);
+    }
+  }, [
+    batchReplaceFromModel,
+    batchReplaceFromVariant,
+    batchReplaceFromVariantOptions,
+    batchReplaceSourceUsage.usedModels,
+  ]);
+
+  const labelCol = 6;
+  const wrapperCol = 18;
+
+  // Initialize form values - only when modal opens (not on every parent re-render)
+  React.useEffect(() => {
+    prevOpenRef.current = open;
+
+    // Reset initialized flag when modal closes
+    if (!open) {
+      initializedRef.current = false;
+      return;
+    }
+
+    // Skip if already initialized (prevents overwriting user input on parent re-renders)
+    if (initializedRef.current) {
+      return;
+    }
+
+    initializedRef.current = true;
+
+    // Always reset form and refs first to prevent stale values from previous edits
+    // (e.g., fallback_models/ultrawork leaking between different config profiles)
+    form.resetFields();
+    advancedSettingsRef.current = {};
+    advancedSettingsRawRef.current = {};
+    categoryAdvancedSettingsRef.current = {};
+    categoryAdvancedSettingsRawRef.current = {};
+    unknownCategoriesRef.current = {};
+    otherFieldsRef.current = {};
+    otherFieldsRawRef.current = '';
+    otherFieldsValidRef.current = true;
+
+    if (initialValues) {
+      // Parse agent models and advanced settings from config
+      const agentFields: Record<string, string | undefined> = {};
+      const categoryFields: Record<string, string | undefined> = {};
+
+      // Built-in agent key set for detecting custom agents
+      const builtInAgentKeySet = new Set(allAgentKeys);
+      const detectedCustomAgents: string[] = [];
+
+      // Process all agents (built-in + custom)
+      if (initialValues.agents) {
+        Object.entries(initialValues.agents).forEach(([agentType, agent]) => {
+          if (!agent) return;
+
+          // Normalize agent key to lowercase for backward compatibility
+          const normalizedAgentType = normalizeAgentKey(agentType);
+
+          // Extract model. Prefer the unified `models` chain (primary at index 0,
+          // rest become fallbacks); fall back to a plain `model` string + legacy
+          // `fallback_models` so older configs round-trip correctly.
+          const rawModels = (agent as Record<string, unknown>).models;
+          if (Array.isArray(rawModels) && rawModels.length > 0) {
+            const chain = splitModelChain(rawModels);
+            if (chain.primaryModel) {
+              agentFields[`agent_${normalizedAgentType}`] = chain.primaryModel;
+            }
+            if (chain.restModels.length > 0) {
+              agentFields[`agent_${normalizedAgentType}_models`] = chain.restModels as unknown as string;
+            }
+            // Reasoning nested on the primary entry (canonical upstream shape) wins
+            // over a stray top-level reasoning/variant below.
+            if (chain.primaryReasoning) {
+              agentFields[`agent_${normalizedAgentType}_reasoning`] = chain.primaryReasoning;
+            }
+          } else if (typeof agent.model === 'string' && agent.model) {
+            agentFields[`agent_${normalizedAgentType}`] = agent.model;
+          }
+
+          // Extract reasoning (canonical) or legacy variant — only fill when the
+          // `models` primary didn't already carry one.
+          if (!agentFields[`agent_${normalizedAgentType}_reasoning`]) {
+            const reasoningValue = (agent as Record<string, unknown>).reasoning;
+            if (typeof reasoningValue === 'string' && reasoningValue) {
+              agentFields[`agent_${normalizedAgentType}_reasoning`] = reasoningValue;
+            } else if (typeof agent.variant === 'string' && agent.variant) {
+              agentFields[`agent_${normalizedAgentType}_reasoning`] = agent.variant;
+            }
+          }
+
+          // Extract fallback_models (normalize string to string[]) — only when a
+          // `models` chain wasn't already consumed above.
+          if (!Array.isArray(rawModels)) {
+            const rawFallback = (agent as Record<string, unknown>).fallback_models;
+            if (rawFallback) {
+              const fallbackArr = Array.isArray(rawFallback) ? rawFallback as string[] : [rawFallback as string];
+              agentFields[`agent_${normalizedAgentType}_models`] = fallbackArr as unknown as string;
+            }
+          }
+
+          // Extract ultrawork
+          const rawUltrawork = (agent as Record<string, unknown>).ultrawork;
+          if (rawUltrawork && typeof rawUltrawork === 'object') {
+            const uw = rawUltrawork as Record<string, unknown>;
+            if (typeof uw.model === 'string' && uw.model) {
+              agentFields[`agent_${normalizedAgentType}_ultrawork_model`] = uw.model;
+            }
+            const uwReasoning = uw.reasoning;
+            if (typeof uwReasoning === 'string' && uwReasoning) {
+              agentFields[`agent_${normalizedAgentType}_ultrawork_reasoning`] = uwReasoning;
+            } else if (typeof uw.variant === 'string' && uw.variant) {
+              agentFields[`agent_${normalizedAgentType}_ultrawork_reasoning`] = uw.variant;
+            }
+          }
+
+          // Extract advanced fields (everything except model/fallback_models/models/ultrawork) and store in ref
+          // variant is included here as fallback for when modelVariantsMap doesn't have the model
+          const advancedConfig: Record<string, unknown> = {};
+          const agentExcludeKeys = new Set(['model', 'fallback_models', 'models', 'ultrawork', 'reasoning', 'variant']);
+          Object.keys(agent).forEach((key) => {
+            if (!agentExcludeKeys.has(key) && agent[key as keyof OhMyOpenAgentAgentConfig] !== undefined) {
+              advancedConfig[key] = agent[key as keyof OhMyOpenAgentAgentConfig];
+            }
+          });
+
+          advancedSettingsRef.current[normalizedAgentType] = advancedConfig;
+
+          // Track custom agents (compare with normalized key)
+          if (!builtInAgentKeySet.has(normalizedAgentType)) {
+            detectedCustomAgents.push(normalizedAgentType);
+          }
+        });
+      }
+
+      setCustomAgents(detectedCustomAgents);
+
+      const categoryKeySet = new Set(categoryKeys);
+      const detectedCustomCategories: string[] = [];
+
+      // Process all categories (built-in + custom)
+      if (initialValues.categories) {
+        Object.entries(initialValues.categories).forEach(([categoryKey, category]) => {
+          if (!category) return;
+
+          // Extract model. Prefer unified `models` chain (primary at index 0,
+          // rest become fallbacks); fall back to plain `model` + legacy `fallback_models`.
+          const rawCatModels = (category as Record<string, unknown>).models;
+          if (Array.isArray(rawCatModels) && rawCatModels.length > 0) {
+            const chain = splitModelChain(rawCatModels);
+            if (chain.primaryModel) {
+              categoryFields[`category_${categoryKey}`] = chain.primaryModel;
+            }
+            if (chain.restModels.length > 0) {
+              categoryFields[`category_${categoryKey}_models`] = chain.restModels as unknown as string;
+            }
+            if (chain.primaryReasoning) {
+              categoryFields[`category_${categoryKey}_reasoning`] = chain.primaryReasoning;
+            }
+          } else if (typeof category.model === 'string' && category.model) {
+            categoryFields[`category_${categoryKey}`] = category.model;
+          }
+
+          // Extract reasoning (canonical) or legacy variant — only fill when the
+          // `models` primary didn't already carry one.
+          if (!categoryFields[`category_${categoryKey}_reasoning`]) {
+            const catReasoning = (category as Record<string, unknown>).reasoning;
+            if (typeof catReasoning === 'string' && catReasoning) {
+              categoryFields[`category_${categoryKey}_reasoning`] = catReasoning;
+            } else if (typeof category.variant === 'string' && category.variant) {
+              categoryFields[`category_${categoryKey}_reasoning`] = category.variant;
+            }
+          }
+
+          // Extract fallback_models (normalize string to string[]) — only when a
+          // `models` chain wasn't already consumed above.
+          if (!Array.isArray(rawCatModels)) {
+            const rawCatFallback = (category as Record<string, unknown>).fallback_models;
+            if (rawCatFallback) {
+              const fallbackArr = Array.isArray(rawCatFallback) ? rawCatFallback as string[] : [rawCatFallback as string];
+              categoryFields[`category_${categoryKey}_models`] = fallbackArr as unknown as string;
+            }
+          }
+
+          // Extract advanced fields (everything except model/fallback_models/models) and store in ref
+          // variant is included here as fallback for when modelVariantsMap doesn't have the model
+          const advancedConfig: Record<string, unknown> = {};
+          const catExcludeKeys = new Set(['model', 'fallback_models', 'models', 'reasoning', 'variant']);
+          Object.keys(category).forEach((key) => {
+            if (!catExcludeKeys.has(key) && category[key as keyof OhMyOpenAgentAgentConfig] !== undefined) {
+              advancedConfig[key] = category[key as keyof OhMyOpenAgentAgentConfig];
+            }
+          });
+
+          categoryAdvancedSettingsRef.current[categoryKey] = advancedConfig;
+
+          // Track custom categories
+          if (!categoryKeySet.has(categoryKey)) {
+            detectedCustomCategories.push(categoryKey);
+          }
+        });
+      }
+
+      setCustomCategories(detectedCustomCategories);
+      unknownCategoriesRef.current = {}; // No longer needed, we handle custom categories explicitly
+
+      form.setFieldsValue({
+        id: initialValues.id,
+        name: initialValues.name,
+        ...agentFields,
+        ...categoryFields,
+        otherFields: initialValues.otherFields || {},
+      });
+
+      otherFieldsRef.current = initialValues.otherFields || {};
+      otherFieldsRawRef.current = initialValues.otherFields && Object.keys(initialValues.otherFields).length > 0
+        ? JSON.stringify(initialValues.otherFields, null, 2)
+        : '';
+    } else {
+      // Reset custom agents and categories
+      setCustomAgents([]);
+      setCustomCategories([]);
+    }
+    setExpandedAgents({}); // Collapse all on open
+    setExpandedCategories({}); // Collapse all categories on open
+    setCategoriesCollapsed(false); // Categories expanded by default
+    setShowAddAgent(false);
+    setShowAddCategory(false);
+    setShowBatchReplace(false);
+    setShowImportJson(false); setNewAgentKey('');
+    setNewCategoryKey('');
+  }, [open, initialValues, form, allAgentKeys, categoryKeys]);
+
+  const handleSubmit = async () => {
+    try {
+      const values = await form.validateFields();
+      setLoading(true);
+
+      // Validate otherFields JSON at submit time
+      if (!otherFieldsValidRef.current) {
+        message.error(t('opencode.ohMyOpenCode.invalidJson'));
+        setLoading(false);
+        return;
+      }
+
+      const otherFieldsRaw = otherFieldsRawRef.current.trim();
+      let parsedOtherFields: Record<string, unknown> = {};
+      if (otherFieldsRaw !== '') {
+        try {
+          parsedOtherFields = JSON.parse(otherFieldsRaw);
+          if (typeof parsedOtherFields !== 'object' || parsedOtherFields === null || Array.isArray(parsedOtherFields)) {
+            message.error(t('opencode.ohMyOpenCode.invalidJson'));
+            setLoading(false);
+            return;
+          }
+        } catch {
+          message.error(t('opencode.ohMyOpenCode.invalidJson'));
+          setLoading(false);
+          return;
+        }
+      } else if (otherFieldsRef.current && Object.keys(otherFieldsRef.current).length > 0) {
+        // Fall back to the object ref if raw string was never edited by the user
+        parsedOtherFields = otherFieldsRef.current as Record<string, unknown>;
+      }
+
+      // Validate and parse all agent advanced settings at submit time (built-in + custom)
+      const allAgentKeysWithCustom = [...allAgentKeys, ...customAgents];
+      const parsedAdvancedSettings: Record<string, Record<string, unknown>> = {};
+      for (const agentType of allAgentKeysWithCustom) {
+        const rawAdvanced = advancedSettingsRawRef.current[agentType]?.trim() || '';
+        if (rawAdvanced !== '') {
+          try {
+            const parsed = JSON.parse(rawAdvanced);
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+              message.error(t('opencode.ohMyOpenCode.invalidJson'));
+              setLoading(false);
+              return;
+            }
+            parsedAdvancedSettings[agentType] = parsed;
+          } catch {
+            message.error(t('opencode.ohMyOpenCode.invalidJson'));
+            setLoading(false);
+            return;
+          }
+        } else if (advancedSettingsRef.current[agentType] && Object.keys(advancedSettingsRef.current[agentType]).length > 0) {
+          // Fall back to the object ref if raw string was never edited by the user
+          parsedAdvancedSettings[agentType] = advancedSettingsRef.current[agentType];
+        }
+      }
+
+      // Validate and parse all category advanced settings at submit time (built-in + custom)
+      const allCategoryKeysWithCustom = [...categoryKeys, ...customCategories];
+      const parsedCategorySettings: Record<string, Record<string, unknown>> = {};
+      for (const categoryKey of allCategoryKeysWithCustom) {
+        const rawAdvanced = categoryAdvancedSettingsRawRef.current[categoryKey]?.trim() || '';
+        if (rawAdvanced !== '') {
+          try {
+            const parsed = JSON.parse(rawAdvanced);
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+              message.error(t('opencode.ohMyOpenCode.invalidJson'));
+              setLoading(false);
+              return;
+            }
+            parsedCategorySettings[categoryKey] = parsed;
+          } catch {
+            message.error(t('opencode.ohMyOpenCode.invalidJson'));
+            setLoading(false);
+            return;
+          }
+        } else if (categoryAdvancedSettingsRef.current[categoryKey] && Object.keys(categoryAdvancedSettingsRef.current[categoryKey]).length > 0) {
+          // Fall back to the object ref if raw string was never edited by the user
+          parsedCategorySettings[categoryKey] = categoryAdvancedSettingsRef.current[categoryKey];
+        }
+      }
+
+      // Build agents object with merged advanced settings (built-in + custom)
+      const agents: Record<string, OhMyOpenAgentAgentConfig | undefined> = {};
+      allAgentKeysWithCustom.forEach((agentType) => {
+        // Skip separator entries
+        if (agentType.startsWith('__') && agentType.endsWith('__')) return;
+
+        const modelFieldName = `agent_${agentType}` as keyof typeof values;
+        const variantFieldName = `agent_${agentType}_reasoning` as keyof typeof values;
+        const fallbackFieldName = `agent_${agentType}_models` as keyof typeof values;
+        const ultraworkModelFieldName = `agent_${agentType}_ultrawork_model` as keyof typeof values;
+        const ultraworkVariantFieldName = `agent_${agentType}_ultrawork_reasoning` as keyof typeof values;
+
+        const modelValue = values[modelFieldName];
+        const variantValue = values[variantFieldName];
+        const fallbackValue = values[fallbackFieldName] as unknown as string[] | undefined;
+        const ultraworkModelValue = values[ultraworkModelFieldName] as string | undefined;
+        const ultraworkVariantValue = values[ultraworkVariantFieldName] as string | undefined;
+        const advancedValue = parsedAdvancedSettings[agentType];
+
+        // Remove reasoning/variant/fallback_models/models/ultrawork from advancedValue
+        // since they're managed by dedicated form fields. `variant`/`fallback_models`
+        // are legacy spellings kept here so an advanced editor carrying old keys does
+        // not double-write them alongside the canonical fields below.
+        const {
+          reasoning: _ar,
+          variant: _av,
+          fallback_models: _afb,
+          models: _am,
+          ultrawork: _auw,
+          ...advancedWithoutManaged
+        } = (advancedValue || {}) as Record<string, unknown>;
+
+        // Build the model field. Upstream `2026-08-reasoning-unification` collapses
+        // `model` + `fallback_models` into an ordered `models` chain (primary first),
+        // so we emit that shape when fallbacks exist; a lone primary stays a plain
+        // `model` string to avoid needless structural churn. A fallback chain with
+        // no primary is preserved as a `models` array rather than dropped.
+        let modelField: Record<string, unknown> = {};
+        let reasoningField: Record<string, unknown> = {};
+        const hasFallback = !!fallbackValue && fallbackValue.length > 0;
+        if (modelValue && hasFallback) {
+          modelField = { models: [modelValue, ...fallbackValue] };
+        } else if (modelValue) {
+          modelField = { model: modelValue };
+        } else if (hasFallback) {
+          modelField = { models: [...fallbackValue] };
+        }
+        if (variantValue) {
+          reasoningField = dualWriteReasoningVariant
+            ? { reasoning: variantValue, variant: variantValue }
+            : { reasoning: variantValue };
+        }
+
+        // Build ultrawork object if either model or reasoning is set
+        let ultraworkField: Record<string, unknown> = {};
+        if (ultraworkModelValue || ultraworkVariantValue) {
+          const uw: Record<string, string> = {};
+          if (ultraworkModelValue) uw.model = ultraworkModelValue;
+          if (ultraworkVariantValue) {
+            uw.reasoning = ultraworkVariantValue;
+            if (dualWriteReasoningVariant) uw.variant = ultraworkVariantValue;
+          }
+          ultraworkField = { ultrawork: uw };
+        }
+
+        // Only create agent config if model is set OR reasoning is set OR advanced settings exist OR new fields exist
+        if (modelValue || variantValue || (advancedWithoutManaged && Object.keys(advancedWithoutManaged).length > 0) || fallbackValue?.length || ultraworkModelValue || ultraworkVariantValue) {
+          agents[agentType] = {
+            ...advancedWithoutManaged,
+            ...reasoningField,
+            ...modelField,
+            ...ultraworkField,
+          } as OhMyOpenAgentAgentConfig;
+        } else {
+          agents[agentType] = undefined;
+        }
+      });
+
+      // Build categories object with merged advanced settings (built-in + custom)
+      const categories: Record<string, OhMyOpenAgentAgentConfig | undefined> = {};
+      allCategoryKeysWithCustom.forEach((categoryKey) => {
+        const modelFieldName = `category_${categoryKey}` as keyof typeof values;
+        const variantFieldName = `category_${categoryKey}_reasoning` as keyof typeof values;
+        const fallbackFieldName = `category_${categoryKey}_models` as keyof typeof values;
+
+        const modelValue = values[modelFieldName];
+        const variantValue = values[variantFieldName];
+        const fallbackValue = values[fallbackFieldName] as unknown as string[] | undefined;
+        const advancedValue = parsedCategorySettings[categoryKey];
+
+        // Remove reasoning/variant/fallback_models/models from advancedValue since
+        // they're managed by dedicated form fields. `variant`/`fallback_models` are
+        // legacy spellings kept here for the same reason as the agent branch above.
+        const {
+          reasoning: _cr,
+          variant: _cv,
+          fallback_models: _cfb,
+          models: _cm,
+          ...advancedWithoutManaged
+        } = (advancedValue || {}) as Record<string, unknown>;
+
+        // Emit preferred `models` chain when fallbacks exist (mirrors upstream
+        // reasoning-unification output); otherwise keep a plain `model` string.
+        // A fallback chain with no primary is preserved as a `models` array
+        // rather than dropped.
+        let modelField: Record<string, unknown> = {};
+        let reasoningField: Record<string, unknown> = {};
+        const hasFallback = !!fallbackValue && fallbackValue.length > 0;
+        if (modelValue && hasFallback) {
+          modelField = { models: [modelValue, ...fallbackValue] };
+        } else if (modelValue) {
+          modelField = { model: modelValue };
+        } else if (hasFallback) {
+          modelField = { models: [...fallbackValue] };
+        }
+        if (variantValue) {
+          reasoningField = dualWriteReasoningVariant
+            ? { reasoning: variantValue, variant: variantValue }
+            : { reasoning: variantValue };
+        }
+
+        // Only create category config if model is set OR reasoning is set OR advanced settings exist OR fallback exists
+        if (modelValue || variantValue || (advancedWithoutManaged && Object.keys(advancedWithoutManaged).length > 0) || fallbackValue?.length) {
+          categories[categoryKey] = {
+            ...advancedWithoutManaged,
+            ...reasoningField,
+            ...modelField,
+          } as OhMyOpenAgentAgentConfig;
+        } else {
+          categories[categoryKey] = undefined;
+        }
+      });
+
+      const result: OhMyOpenAgentConfigFormValues = {
+        name: values.name,
+        agents,
+        categories, // Now includes custom categories directly
+        otherFields: Object.keys(parsedOtherFields).length > 0 ? parsedOtherFields : undefined,
+      };
+
+      // Include id when editing (read from form values which were set from initialValues)
+      if (isEdit && values.id) {
+        result.id = values.id;
+      }
+
+      onSuccess(result);
+      form.resetFields();
+    } catch (error) {
+      console.error('Form validation error:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleAdvancedSettings = (agentType: string) => {
+    setExpandedAgents(prev => ({
+      ...prev,
+      [agentType]: !prev[agentType],
+    }));
+  };
+
+  const toggleCategorySettings = (categoryKey: string) => {
+    setExpandedCategories(prev => ({
+      ...prev,
+      [categoryKey]: !prev[categoryKey],
+    }));
+  };
+
+  // Handle adding custom agent
+  const handleAddCustomAgent = () => {
+    const key = newAgentKey.trim();
+    if (!key) {
+      message.warning(t('opencode.ohMyOpenCode.customAgentKeyRequired'));
+      return;
+    }
+    // Check for duplicates
+    const allKeys = [...allAgentKeys, ...customAgents];
+    if (allKeys.includes(key)) {
+      message.warning(t('opencode.ohMyOpenCode.customAgentKeyDuplicate'));
+      return;
+    }
+    setCustomAgents(prev => [...prev, key]);
+    setNewAgentKey('');
+    setShowAddAgent(false);
+    // Initialize refs for the new agent
+    advancedSettingsRef.current[key] = {};
+    advancedSettingsRawRef.current[key] = '';
+  };
+
+  // Handle removing custom agent
+  const handleRemoveCustomAgent = (agentKey: string) => {
+    setCustomAgents(prev => prev.filter(k => k !== agentKey));
+    // Clear form field
+    form.setFieldValue(`agent_${agentKey}`, undefined);
+    // Clear refs
+    delete advancedSettingsRef.current[agentKey];
+    delete advancedSettingsRawRef.current[agentKey];
+  };
+
+  // Handle adding custom category
+  const handleAddCustomCategory = () => {
+    const key = newCategoryKey.trim();
+    if (!key) {
+      message.warning(t('opencode.ohMyOpenCode.customCategoryKeyRequired'));
+      return;
+    }
+    // Check for duplicates
+    const allKeys = [...categoryKeys, ...customCategories];
+    if (allKeys.includes(key)) {
+      message.warning(t('opencode.ohMyOpenCode.customCategoryKeyDuplicate'));
+      return;
+    }
+    setCustomCategories(prev => [...prev, key]);
+    setNewCategoryKey('');
+    setShowAddCategory(false);
+    // Initialize refs for the new category
+    categoryAdvancedSettingsRef.current[key] = {};
+    categoryAdvancedSettingsRawRef.current[key] = '';
+  };
+
+  // Handle removing custom category
+  const handleRemoveCustomCategory = (categoryKey: string) => {
+    setCustomCategories(prev => prev.filter(k => k !== categoryKey));
+    // Clear form field
+    form.setFieldValue(`category_${categoryKey}`, undefined);
+    // Clear refs
+    delete categoryAdvancedSettingsRef.current[categoryKey];
+    delete categoryAdvancedSettingsRawRef.current[categoryKey];
+  };
+
+  const handleBatchReplaceModel = () => {
+    const fromModel = batchReplaceFromModel;
+    const toModel = batchReplaceToModel;
+
+    if (!fromModel || !toModel) {
+      message.warning(t('opencode.ohMyOpenCode.batchReplaceRequired'));
+      return;
+    }
+
+    const sourceVariants = batchReplaceFromVariantOptions;
+    if (batchReplaceFromVariant && !sourceVariants.includes(batchReplaceFromVariant)) {
+      message.warning(t('opencode.ohMyOpenCode.batchReplaceInvalidFromVariant'));
+      return;
+    }
+
+    const targetVariants = modelVariantsMap[toModel] ?? [];
+    if (batchReplaceToVariant && !targetVariants.includes(batchReplaceToVariant)) {
+      message.warning(t('opencode.ohMyOpenCode.batchReplaceInvalidToVariant'));
+      return;
+    }
+
+    if (fromModel === toModel) {
+      message.warning(t('opencode.ohMyOpenCode.batchReplaceSameModel'));
+      return;
+    }
+
+    const values = form.getFieldsValue(true) as Record<string, unknown>;
+    const { updateValues, replacedCount, clearedVariantCount } = applyBatchReplaceModel({
+      values,
+      modelFieldNames: batchReplaceModelFieldNames,
+      fromModel,
+      toModel,
+      fromVariant: batchReplaceFromVariant,
+      toVariant: batchReplaceToVariant,
+      targetVariants,
+      getVariantFieldName: getOpenAgentBatchReplaceReasoningFieldName,
+      getFallbackFieldName: getOpenAgentBatchReplaceModelsFieldName,
+    });
+
+    if (replacedCount === 0) {
+      message.warning(t('opencode.ohMyOpenCode.batchReplaceNoMatch'));
+      return;
+    }
+
+    form.setFieldsValue(updateValues);
+
+    if (clearedVariantCount > 0) {
+      message.success(t('opencode.ohMyOpenCode.batchReplaceSuccessWithVariantReset', {
+        count: replacedCount,
+        variantCount: clearedVariantCount,
+      }));
+      return;
+    }
+
+    message.success(t('opencode.ohMyOpenCode.batchReplaceSuccess', { count: replacedCount }));
+  };
+
+  const handleImportJson = (data: ImportedConfigData, _mode: 'core' | 'full') => {
+    const updateValues: Record<string, string | undefined> = {};
+    const builtInAgentKeySet = new Set(allAgentKeys);
+    const builtInCategoryKeySet = new Set(categoryKeys);
+    const newCustomAgents: string[] = [];
+    const newCustomCategories: string[] = [];
+    let agentCount = 0;
+    let categoryCount = 0;
+
+    // Process agents
+    if (data.agents) {
+      Object.entries(data.agents).forEach(([agentType, agentConfig]) => {
+        if (!agentConfig || typeof agentConfig !== 'object') return;
+        const normalizedAgentConfig = agentConfig as Record<string, unknown>;
+
+        // Detect custom agents
+        if (!builtInAgentKeySet.has(agentType) && !customAgents.includes(agentType) && !newCustomAgents.includes(agentType)) {
+          newCustomAgents.push(agentType);
+        }
+
+        // Set model field. Prefer unified `models` chain (primary at index 0,
+        // rest become fallbacks); fall back to plain `model` + legacy `fallback_models`.
+        const rawAgentModels = normalizedAgentConfig.models;
+        if (Array.isArray(rawAgentModels) && rawAgentModels.length > 0) {
+          const chain = splitModelChain(rawAgentModels);
+          if (chain.primaryModel) {
+            updateValues[`agent_${agentType}`] = chain.primaryModel;
+          }
+          if (chain.restModels.length > 0) {
+            updateValues[`agent_${agentType}_models`] = chain.restModels as unknown as string;
+          }
+          if (chain.primaryReasoning) {
+            updateValues[`agent_${agentType}_reasoning`] = chain.primaryReasoning;
+          }
+        } else if (typeof normalizedAgentConfig.model === 'string' && normalizedAgentConfig.model) {
+          updateValues[`agent_${agentType}`] = normalizedAgentConfig.model;
+        }
+
+        // Set reasoning field (canonical) or legacy variant — only fill when the
+        // `models` primary didn't already carry one.
+        if (!updateValues[`agent_${agentType}_reasoning`]) {
+          const agentReasoning = normalizedAgentConfig.reasoning;
+          if (typeof agentReasoning === 'string' && agentReasoning) {
+            updateValues[`agent_${agentType}_reasoning`] = agentReasoning;
+          } else if (typeof normalizedAgentConfig.variant === 'string' && normalizedAgentConfig.variant) {
+            updateValues[`agent_${agentType}_reasoning`] = normalizedAgentConfig.variant;
+          }
+        }
+
+        // Set fallback_models field (normalize string to string[]) — only when a
+        // `models` chain wasn't already consumed above.
+        if (!Array.isArray(rawAgentModels)) {
+          const rawFallback = normalizedAgentConfig.fallback_models;
+          if (rawFallback) {
+            const fallbackArr = Array.isArray(rawFallback) ? rawFallback as string[] : [rawFallback as string];
+            updateValues[`agent_${agentType}_models`] = fallbackArr as unknown as string;
+          }
+        }
+
+        // Set ultrawork fields
+        const rawUltrawork = normalizedAgentConfig.ultrawork;
+        if (rawUltrawork && typeof rawUltrawork === 'object') {
+          const uw = rawUltrawork as Record<string, unknown>;
+          if (typeof uw.model === 'string' && uw.model) {
+            updateValues[`agent_${agentType}_ultrawork_model`] = uw.model;
+          }
+          const uwReasoning = uw.reasoning;
+          if (typeof uwReasoning === 'string' && uwReasoning) {
+            updateValues[`agent_${agentType}_ultrawork_reasoning`] = uwReasoning;
+          } else if (typeof uw.variant === 'string' && uw.variant) {
+            updateValues[`agent_${agentType}_ultrawork_reasoning`] = uw.variant;
+          }
+        }
+
+        // Store advanced settings (everything except model/fallback_models/models/ultrawork)
+        const agentExcludeKeys = new Set(['model', 'fallback_models', 'models', 'ultrawork']);
+        const advancedConfig: Record<string, unknown> = {};
+        Object.keys(normalizedAgentConfig).forEach((key) => {
+          if (!agentExcludeKeys.has(key)) {
+            advancedConfig[key] = normalizedAgentConfig[key];
+          }
+        });
+        if (Object.keys(advancedConfig).length > 0) {
+          advancedSettingsRef.current[agentType] = advancedConfig;
+          advancedSettingsRawRef.current[agentType] = JSON.stringify(advancedConfig, null, 2);
+        }
+
+        agentCount++;
+      });
+    }
+
+    // Process categories
+    if (data.categories) {
+      Object.entries(data.categories).forEach(([categoryKey, categoryConfig]) => {
+        if (!categoryConfig || typeof categoryConfig !== 'object') return;
+        const normalizedCategoryConfig = categoryConfig as Record<string, unknown>;
+
+        // Detect custom categories
+        if (!builtInCategoryKeySet.has(categoryKey) && !customCategories.includes(categoryKey) && !newCustomCategories.includes(categoryKey)) {
+          newCustomCategories.push(categoryKey);
+        }
+
+        // Set model field. Prefer unified `models` chain (primary at index 0,
+        // rest become fallbacks); fall back to plain `model` + legacy `fallback_models`.
+        const rawCatModels = normalizedCategoryConfig.models;
+        if (Array.isArray(rawCatModels) && rawCatModels.length > 0) {
+          const chain = splitModelChain(rawCatModels);
+          if (chain.primaryModel) {
+            updateValues[`category_${categoryKey}`] = chain.primaryModel;
+          }
+          if (chain.restModels.length > 0) {
+            updateValues[`category_${categoryKey}_models`] = chain.restModels as unknown as string;
+          }
+          if (chain.primaryReasoning) {
+            updateValues[`category_${categoryKey}_reasoning`] = chain.primaryReasoning;
+          }
+        } else if (typeof normalizedCategoryConfig.model === 'string' && normalizedCategoryConfig.model) {
+          updateValues[`category_${categoryKey}`] = normalizedCategoryConfig.model;
+        }
+
+        // Set reasoning field (canonical) or legacy variant — only fill when the
+        // `models` primary didn't already carry one.
+        if (!updateValues[`category_${categoryKey}_reasoning`]) {
+          const catReasoning = normalizedCategoryConfig.reasoning;
+          if (typeof catReasoning === 'string' && catReasoning) {
+            updateValues[`category_${categoryKey}_reasoning`] = catReasoning;
+          } else if (typeof normalizedCategoryConfig.variant === 'string' && normalizedCategoryConfig.variant) {
+            updateValues[`category_${categoryKey}_reasoning`] = normalizedCategoryConfig.variant;
+          }
+        }
+
+        // Set fallback_models field (normalize string to string[]) — only when a
+        // `models` chain wasn't already consumed above.
+        if (!Array.isArray(rawCatModels)) {
+          const rawCatFallback = normalizedCategoryConfig.fallback_models;
+          if (rawCatFallback) {
+            const fallbackArr = Array.isArray(rawCatFallback) ? rawCatFallback as string[] : [rawCatFallback as string];
+            updateValues[`category_${categoryKey}_models`] = fallbackArr as unknown as string;
+          }
+        }
+
+        // Store advanced settings (everything except model/fallback_models/models)
+        const catExcludeKeys = new Set(['model', 'fallback_models', 'models']);
+        const advancedConfig: Record<string, unknown> = {};
+        Object.keys(normalizedCategoryConfig).forEach((key) => {
+          if (!catExcludeKeys.has(key)) {
+            advancedConfig[key] = normalizedCategoryConfig[key];
+          }
+        });
+        if (Object.keys(advancedConfig).length > 0) {
+          categoryAdvancedSettingsRef.current[categoryKey] = advancedConfig;
+          categoryAdvancedSettingsRawRef.current[categoryKey] = JSON.stringify(advancedConfig, null, 2);
+        }
+
+        categoryCount++;
+      });
+    }
+
+    // Process otherFields
+    if (data.otherFields && Object.keys(data.otherFields).length > 0) {
+      otherFieldsRef.current = data.otherFields;
+      otherFieldsRawRef.current = JSON.stringify(data.otherFields, null, 2);
+    }
+
+    // Add custom agents/categories
+    if (newCustomAgents.length > 0) {
+      setCustomAgents(prev => [...prev, ...newCustomAgents]);
+      // Initialize refs for new custom agents
+      newCustomAgents.forEach((key) => {
+        if (!advancedSettingsRef.current[key]) advancedSettingsRef.current[key] = {};
+        if (!advancedSettingsRawRef.current[key]) advancedSettingsRawRef.current[key] = '';
+      });
+    }
+    if (newCustomCategories.length > 0) {
+      setCustomCategories(prev => [...prev, ...newCustomCategories]);
+      newCustomCategories.forEach((key) => {
+        if (!categoryAdvancedSettingsRef.current[key]) categoryAdvancedSettingsRef.current[key] = {};
+        if (!categoryAdvancedSettingsRawRef.current[key]) categoryAdvancedSettingsRawRef.current[key] = '';
+      });
+    }
+
+    // Apply form values
+    form.setFieldsValue(updateValues);
+
+    const categoryPart = categoryCount > 0 ? `、${categoryCount} ${t('opencode.ohMyOpenCode.categories')}` : '';
+    message.success(t('opencode.ohMyOpenCode.importFromJsonSuccess', { agentCount, categoryPart }));
+    setShowImportJson(false);
+  };
+
+  const buildModelPlaceholder = (
+    recommendedModel?: string,
+    showRecommendedOnly = false,
+  ): string => {
+    if (!recommendedModel) {
+      return t('opencode.ohMyOpenCode.selectModel');
+    }
+    if (showRecommendedOnly) {
+      return recommendedModel;
+    }
+    return t('opencode.ohMyOpenCode.selectModelWithRecommended', {
+      model: recommendedModel,
+    });
+  };
+
+  // Render agent item (built-in agents)
+  const renderAgentItem = (agentType: string) => {
+    const recommendedModel = getOpenAgentRecommendedModel(agentType, t);
+    const placeholder = buildModelPlaceholder(
+      recommendedModel,
+      agentType === 'Sisyphus-Junior',
+    );
+
+    return (
+      <div key={agentType}>
+        <Form.Item
+          label={getOpenAgentDisplayName(agentType, t).split(' ')[0]}
+          tooltip={getOpenAgentDescription(agentType, t)}
+          style={{ marginBottom: expandedAgents[agentType] ? 8 : 12 }}
+        >
+          <Form.Item
+            noStyle
+            shouldUpdate={(prevValues, currentValues) =>
+              prevValues[`agent_${agentType}`] !== currentValues[`agent_${agentType}`] ||
+              prevValues[`agent_${agentType}_reasoning`] !== currentValues[`agent_${agentType}_reasoning`]
+            }
+          >
+            {({ getFieldValue }) => {
+              const selectedModel = getFieldValue(`agent_${agentType}`);
+              const currentVariant = getFieldValue(`agent_${agentType}_reasoning`);
+              const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
+              const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
+              const variantOptions = [...mapVariants];
+              if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
+                variantOptions.unshift(currentVariant);
+              }
+
+              return (
+                <Space.Compact style={{ width: '100%' }}>
+                  <Form.Item name={`agent_${agentType}`} noStyle>
+                    <Select
+                      placeholder={placeholder}
+                      options={modelOptions}
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      style={{ width: hasVariants ? 'calc(100% - 32px - 120px)' : 'calc(100% - 32px)' }}
+                      onChange={(newModel) => {
+                        const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                        if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
+                          form.setFieldValue(`agent_${agentType}_reasoning`, undefined);
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                  {hasVariants && (
+                    <Form.Item name={`agent_${agentType}_reasoning`} noStyle>
+                      <Select
+                        placeholder="reasoning"
+                        options={variantOptions.map((v) => ({ label: v, value: v }))}
+                        allowClear
+                        style={{ width: 120 }}
+                      />
+                    </Form.Item>
+                  )}
+                  <Button
+                    icon={<MoreOutlined />}
+                    onClick={() => toggleAdvancedSettings(agentType)}
+                    type={expandedAgents[agentType] ? 'primary' : 'default'}
+                    title={t('opencode.ohMyOpenCode.advancedSettings')}
+                  />
+                </Space.Compact>
+              );
+            }}
+          </Form.Item>
+        </Form.Item>
+
+        {/* Fallback models & Ultrawork - shown only when model is set */}
+        <Form.Item
+          noStyle
+          shouldUpdate={(prevValues, currentValues) =>
+            prevValues[`agent_${agentType}`] !== currentValues[`agent_${agentType}`]
+          }
+        >
+          {({ getFieldValue }) => {
+            const selectedModel = getFieldValue(`agent_${agentType}`);
+            if (!selectedModel) return null;
+
+            return (
+              <Form.Item
+                wrapperCol={{ offset: labelCol, span: wrapperCol }}
+                style={{ marginBottom: expandedAgents[agentType] ? 0 : 4 }}
+              >
+                <div className={styles.subFieldsPanel}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                    <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.fallbackModelsLabel')}</span>
+                    <Form.Item name={`agent_${agentType}_models`} noStyle>
+                      <Select
+                        mode="tags"
+                        variant="filled"
+                        placeholder={t('opencode.ohMyOpenCode.fallbackModelsPlaceholder')}
+                        options={modelOptions}
+                        allowClear
+                        showSearch
+                        optionFilterProp="label"
+                        style={{ flex: 1 }}
+                      />
+                    </Form.Item>
+                  </div>
+                  <Form.Item
+                    noStyle
+                    shouldUpdate={(prev, cur) =>
+                      prev[`agent_${agentType}_ultrawork_model`] !== cur[`agent_${agentType}_ultrawork_model`] ||
+                      prev[`agent_${agentType}_ultrawork_reasoning`] !== cur[`agent_${agentType}_ultrawork_reasoning`]
+                    }
+                  >
+                    {({ getFieldValue: getUwFieldValue }) => {
+                      const uwModel = getUwFieldValue(`agent_${agentType}_ultrawork_model`);
+                      const uwVariant = getUwFieldValue(`agent_${agentType}_ultrawork_reasoning`);
+                      const uwMapVariants = uwModel ? modelVariantsMap[uwModel] ?? [] : [];
+                      const uwHasVariants = uwMapVariants.length > 0 || (typeof uwVariant === 'string' && uwVariant);
+                      const uwVariantOptions = [...uwMapVariants];
+                      if (typeof uwVariant === 'string' && uwVariant && !uwVariantOptions.includes(uwVariant)) {
+                        uwVariantOptions.unshift(uwVariant);
+                      }
+
+                      return (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.ultraworkLabel')}</span>
+                          <Space.Compact style={{ flex: 1 }}>
+                            <Form.Item name={`agent_${agentType}_ultrawork_model`} noStyle>
+                              <Select
+                                variant="filled"
+                                placeholder={t('opencode.ohMyOpenCode.ultraworkModelPlaceholder')}
+                                options={modelOptions}
+                                allowClear
+                                showSearch
+                                optionFilterProp="label"
+                                style={{ width: uwHasVariants ? 'calc(100% - 120px)' : '100%' }}
+                                onChange={(newModel) => {
+                                  const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                                  if (newVariants.length === 0 || (uwVariant && !newVariants.includes(uwVariant))) {
+                                    form.setFieldValue(`agent_${agentType}_ultrawork_reasoning`, undefined);
+                                  }
+                                }}
+                              />
+                            </Form.Item>
+                            {uwHasVariants && (
+                              <Form.Item name={`agent_${agentType}_ultrawork_reasoning`} noStyle>
+                                <Select
+                                  variant="filled"
+                                  placeholder="reasoning"
+                                  options={uwVariantOptions.map((v) => ({ label: v, value: v }))}
+                                  allowClear
+                                  style={{ width: 120 }}
+                                />
+                              </Form.Item>
+                            )}
+                          </Space.Compact>
+                        </div>
+                      );
+                    }}
+                  </Form.Item>
+                </div>
+              </Form.Item>
+            );
+          }}
+        </Form.Item>
+
+        {expandedAgents[agentType] && (
+          <Form.Item
+            extra={<Text type="secondary" style={{ fontSize: 11, marginTop: 4, display: 'inline-block' }}>{t('opencode.ohMyOpenCode.advancedSettingsHint')}</Text>}
+            style={{ marginBottom: 20 }}
+            wrapperCol={{ offset: labelCol, span: wrapperCol }}
+          >
+            <JsonEditor
+              value={advancedSettingsRef.current[agentType] && Object.keys(advancedSettingsRef.current[agentType]).length > 0 ? advancedSettingsRef.current[agentType] : undefined}
+              onChange={(value) => {
+                // Store raw string for submit-time validation
+                if (value === null || value === undefined) {
+                  advancedSettingsRawRef.current[agentType] = '';
+                } else if (typeof value === 'string') {
+                  advancedSettingsRawRef.current[agentType] = value;
+                } else {
+                  advancedSettingsRawRef.current[agentType] = JSON.stringify(value, null, 2);
+                }
+              }}
+              height={150}
+              minHeight={100}
+              maxHeight={300}
+              resizable
+              mode="text"
+              placeholder={`{
+    "temperature": 0.5
+}`}
+            />
+          </Form.Item>
+        )}
+      </div>
+    );
+  };
+
+  // Render custom agent item (with delete button)
+  const renderCustomAgentItem = (agentType: string) => (
+    <div key={agentType}>
+      <Form.Item
+        label={<span style={{ color: '#1890ff' }}>{agentType}</span>}
+        tooltip={t('opencode.ohMyOpenCode.customAgentTooltip')}
+        style={{ marginBottom: expandedAgents[agentType] ? 8 : 12 }}
+      >
+        <Form.Item
+          noStyle
+          shouldUpdate={(prevValues, currentValues) =>
+            prevValues[`agent_${agentType}`] !== currentValues[`agent_${agentType}`] ||
+            prevValues[`agent_${agentType}_reasoning`] !== currentValues[`agent_${agentType}_reasoning`]
+          }
+        >
+          {({ getFieldValue }) => {
+            const selectedModel = getFieldValue(`agent_${agentType}`);
+            const currentVariant = getFieldValue(`agent_${agentType}_reasoning`);
+            const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
+            const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
+            const variantOptions = [...mapVariants];
+            if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
+              variantOptions.unshift(currentVariant);
+            }
+
+            return (
+              <Space.Compact style={{ width: '100%' }}>
+                <Form.Item name={`agent_${agentType}`} noStyle>
+                  <Select
+                    placeholder={t('opencode.ohMyOpenCode.selectModel')}
+                    options={modelOptions}
+                    allowClear
+                    showSearch
+                    optionFilterProp="label"
+                    style={{ width: hasVariants ? 'calc(100% - 64px - 120px)' : 'calc(100% - 64px)' }}
+                    onChange={(newModel) => {
+                      const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                      if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
+                        form.setFieldValue(`agent_${agentType}_reasoning`, undefined);
+                      }
+                    }}
+                  />
+                </Form.Item>
+                {hasVariants && (
+                  <Form.Item name={`agent_${agentType}_reasoning`} noStyle>
+                    <Select
+                      placeholder="reasoning"
+                      options={variantOptions.map((v) => ({ label: v, value: v }))}
+                      allowClear
+                      style={{ width: 120 }}
+                    />
+                  </Form.Item>
+                )}
+                <Button
+                  icon={<MoreOutlined />}
+                  onClick={() => toggleAdvancedSettings(agentType)}
+                  type={expandedAgents[agentType] ? 'primary' : 'default'}
+                  title={t('opencode.ohMyOpenCode.advancedSettings')}
+                />
+                <Button
+                  icon={<DeleteOutlined />}
+                  onClick={() => handleRemoveCustomAgent(agentType)}
+                  danger
+                  title={t('common.delete')}
+                />
+              </Space.Compact>
+            );
+          }}
+        </Form.Item>
+      </Form.Item>
+
+      {/* Fallback models & Ultrawork - shown only when model is set */}
+      <Form.Item
+        noStyle
+        shouldUpdate={(prevValues, currentValues) =>
+          prevValues[`agent_${agentType}`] !== currentValues[`agent_${agentType}`]
+        }
+      >
+        {({ getFieldValue }) => {
+          const selectedModel = getFieldValue(`agent_${agentType}`);
+          if (!selectedModel) return null;
+
+          return (
+            <Form.Item
+              wrapperCol={{ offset: labelCol, span: wrapperCol }}
+              style={{ marginBottom: expandedAgents[agentType] ? 0 : 4 }}
+            >
+              <div className={styles.subFieldsPanel}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.fallbackModelsLabel')}</span>
+                  <Form.Item name={`agent_${agentType}_models`} noStyle>
+                    <Select
+                      mode="tags"
+                      variant="filled"
+                      placeholder={t('opencode.ohMyOpenCode.fallbackModelsPlaceholder')}
+                      options={modelOptions}
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      style={{ flex: 1 }}
+                    />
+                  </Form.Item>
+                </div>
+                <Form.Item
+                  noStyle
+                  shouldUpdate={(prev, cur) =>
+                    prev[`agent_${agentType}_ultrawork_model`] !== cur[`agent_${agentType}_ultrawork_model`] ||
+                    prev[`agent_${agentType}_ultrawork_reasoning`] !== cur[`agent_${agentType}_ultrawork_reasoning`]
+                  }
+                >
+                  {({ getFieldValue: getUwFieldValue }) => {
+                    const uwModel = getUwFieldValue(`agent_${agentType}_ultrawork_model`);
+                    const uwVariant = getUwFieldValue(`agent_${agentType}_ultrawork_reasoning`);
+                    const uwMapVariants = uwModel ? modelVariantsMap[uwModel] ?? [] : [];
+                    const uwHasVariants = uwMapVariants.length > 0 || (typeof uwVariant === 'string' && uwVariant);
+                    const uwVariantOptions = [...uwMapVariants];
+                    if (typeof uwVariant === 'string' && uwVariant && !uwVariantOptions.includes(uwVariant)) {
+                      uwVariantOptions.unshift(uwVariant);
+                    }
+
+                    return (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.ultraworkLabel')}</span>
+                        <Space.Compact style={{ flex: 1 }}>
+                          <Form.Item name={`agent_${agentType}_ultrawork_model`} noStyle>
+                            <Select
+                              variant="filled"
+                              placeholder={t('opencode.ohMyOpenCode.ultraworkModelPlaceholder')}
+                              options={modelOptions}
+                              allowClear
+                              showSearch
+                              optionFilterProp="label"
+                              style={{ width: uwHasVariants ? 'calc(100% - 120px)' : '100%' }}
+                              onChange={(newModel) => {
+                                const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                                if (newVariants.length === 0 || (uwVariant && !newVariants.includes(uwVariant))) {
+                                  form.setFieldValue(`agent_${agentType}_ultrawork_reasoning`, undefined);
+                                }
+                              }}
+                            />
+                          </Form.Item>
+                          {uwHasVariants && (
+                            <Form.Item name={`agent_${agentType}_ultrawork_reasoning`} noStyle>
+                              <Select
+                                variant="filled"
+                                placeholder="reasoning"
+                                options={uwVariantOptions.map((v) => ({ label: v, value: v }))}
+                                allowClear
+                                style={{ width: 120 }}
+                              />
+                            </Form.Item>
+                          )}
+                        </Space.Compact>
+                      </div>
+                    );
+                  }}
+                </Form.Item>
+              </div>
+            </Form.Item>
+          );
+        }}
+      </Form.Item>
+
+      {expandedAgents[agentType] && (
+        <Form.Item
+          extra={<Text type="secondary" style={{ fontSize: 11, marginTop: 4, display: 'inline-block' }}>{t('opencode.ohMyOpenCode.advancedSettingsHint')}</Text>}
+          style={{ marginBottom: 20 }}
+          wrapperCol={{ offset: labelCol, span: wrapperCol }}
+        >
+          <JsonEditor
+            value={advancedSettingsRef.current[agentType] && Object.keys(advancedSettingsRef.current[agentType]).length > 0 ? advancedSettingsRef.current[agentType] : undefined}
+            onChange={(value) => {
+              if (value === null || value === undefined) {
+                advancedSettingsRawRef.current[agentType] = '';
+              } else if (typeof value === 'string') {
+                advancedSettingsRawRef.current[agentType] = value;
+              } else {
+                advancedSettingsRawRef.current[agentType] = JSON.stringify(value, null, 2);
+              }
+            }}
+            height={150}
+            minHeight={100}
+            maxHeight={300}
+            resizable
+            mode="text"
+            placeholder={`{
+    "temperature": 0.5
+}`}
+          />
+        </Form.Item>
+      )}
+    </div>
+  );
+
+  // Render category item
+  const renderCategoryItem = (category: OhMyOpenAgentCategoryDefinition) => {
+    const recommendedModel = getOpenAgentCategoryRecommendedModel(category.key, t);
+    const placeholder = buildModelPlaceholder(recommendedModel);
+
+    return (
+      <div key={category.key}>
+        <Form.Item
+          label={getOpenAgentCategoryDisplayName(category.key, t)}
+          tooltip={getOpenAgentCategoryDescription(category.key, t)}
+          style={{ marginBottom: expandedCategories[category.key] ? 8 : 12 }}
+        >
+          <Form.Item
+            noStyle
+            shouldUpdate={(prevValues, currentValues) =>
+              prevValues[`category_${category.key}`] !== currentValues[`category_${category.key}`] ||
+              prevValues[`category_${category.key}_reasoning`] !== currentValues[`category_${category.key}_reasoning`]
+            }
+          >
+            {({ getFieldValue }) => {
+              const selectedModel = getFieldValue(`category_${category.key}`);
+              const currentVariant = getFieldValue(`category_${category.key}_reasoning`);
+              const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
+              const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
+              const variantOptions = [...mapVariants];
+              if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
+                variantOptions.unshift(currentVariant);
+              }
+
+              return (
+                <Space.Compact style={{ width: '100%' }}>
+                  <Form.Item name={`category_${category.key}`} noStyle>
+                    <Select
+                      placeholder={placeholder}
+                      options={modelOptions}
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      style={{ width: hasVariants ? 'calc(100% - 32px - 120px)' : 'calc(100% - 32px)' }}
+                      onChange={(newModel) => {
+                        const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                        if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
+                          form.setFieldValue(`category_${category.key}_reasoning`, undefined);
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                  {hasVariants && (
+                    <Form.Item name={`category_${category.key}_reasoning`} noStyle>
+                      <Select
+                        placeholder="reasoning"
+                        options={variantOptions.map((v) => ({ label: v, value: v }))}
+                        allowClear
+                        style={{ width: 120 }}
+                      />
+                    </Form.Item>
+                  )}
+                  <Button
+                    icon={<MoreOutlined />}
+                    onClick={() => toggleCategorySettings(category.key)}
+                    type={expandedCategories[category.key] ? 'primary' : 'default'}
+                    title={t('opencode.ohMyOpenCode.advancedSettings')}
+                  />
+                </Space.Compact>
+              );
+            }}
+          </Form.Item>
+        </Form.Item>
+
+        {/* Fallback models - shown only when model is set (no ultrawork for categories) */}
+        <Form.Item
+          noStyle
+          shouldUpdate={(prevValues, currentValues) =>
+            prevValues[`category_${category.key}`] !== currentValues[`category_${category.key}`]
+          }
+        >
+          {({ getFieldValue }) => {
+            const selectedModel = getFieldValue(`category_${category.key}`);
+            if (!selectedModel) return null;
+
+            return (
+              <Form.Item
+                wrapperCol={{ offset: labelCol, span: wrapperCol }}
+                style={{ marginBottom: expandedCategories[category.key] ? 0 : 4 }}
+              >
+                <div className={styles.subFieldsPanel} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.fallbackModelsLabel')}</span>
+                  <Form.Item name={`category_${category.key}_models`} noStyle>
+                    <Select
+                      mode="tags"
+                      variant="filled"
+                      placeholder={t('opencode.ohMyOpenCode.fallbackModelsPlaceholder')}
+                      options={modelOptions}
+                      allowClear
+                      showSearch
+                      optionFilterProp="label"
+                      style={{ flex: 1 }}
+                    />
+                  </Form.Item>
+                </div>
+              </Form.Item>
+            );
+          }}
+        </Form.Item>
+
+        {expandedCategories[category.key] && (
+          <Form.Item
+            extra={<Text type="secondary" style={{ fontSize: 11, marginTop: 4, display: 'inline-block' }}>{t('opencode.ohMyOpenCode.advancedSettingsHint')}</Text>}
+            style={{ marginBottom: 20 }}
+            wrapperCol={{ offset: labelCol, span: wrapperCol }}
+          >
+            <JsonEditor
+              value={categoryAdvancedSettingsRef.current[category.key] && Object.keys(categoryAdvancedSettingsRef.current[category.key]).length > 0 ? categoryAdvancedSettingsRef.current[category.key] : undefined}
+              onChange={(value) => {
+                // Store raw string for submit-time validation
+                if (value === null || value === undefined) {
+                  categoryAdvancedSettingsRawRef.current[category.key] = '';
+                } else if (typeof value === 'string') {
+                  categoryAdvancedSettingsRawRef.current[category.key] = value;
+                } else {
+                  categoryAdvancedSettingsRawRef.current[category.key] = JSON.stringify(value, null, 2);
+                }
+              }}
+              height={150}
+              minHeight={100}
+              maxHeight={300}
+              resizable
+              mode="text"
+              placeholder={`{
+    "temperature": 0.5
+}`}
+            />
+          </Form.Item>
+        )}
+      </div>
+    );
+  };
+
+  // Render custom category item (with delete button)
+  const renderCustomCategoryItem = (categoryKey: string) => (
+    <div key={categoryKey}>
+      <Form.Item
+        label={<span style={{ color: '#1890ff' }}>{categoryKey}</span>}
+        tooltip={t('opencode.ohMyOpenCode.customCategoryTooltip')}
+        style={{ marginBottom: expandedCategories[categoryKey] ? 8 : 12 }}
+      >
+        <Form.Item
+          noStyle
+          shouldUpdate={(prevValues, currentValues) =>
+            prevValues[`category_${categoryKey}`] !== currentValues[`category_${categoryKey}`] ||
+            prevValues[`category_${categoryKey}_reasoning`] !== currentValues[`category_${categoryKey}_reasoning`]
+          }
+        >
+          {({ getFieldValue }) => {
+            const selectedModel = getFieldValue(`category_${categoryKey}`);
+            const currentVariant = getFieldValue(`category_${categoryKey}_reasoning`);
+            const mapVariants = selectedModel ? modelVariantsMap[selectedModel] ?? [] : [];
+            const hasVariants = mapVariants.length > 0 || (typeof currentVariant === 'string' && currentVariant);
+            const variantOptions = [...mapVariants];
+            if (typeof currentVariant === 'string' && currentVariant && !variantOptions.includes(currentVariant)) {
+              variantOptions.unshift(currentVariant);
+            }
+
+            return (
+              <Space.Compact style={{ width: '100%' }}>
+                <Form.Item name={`category_${categoryKey}`} noStyle>
+                  <Select
+                    placeholder={t('opencode.ohMyOpenCode.selectModel')}
+                    options={modelOptions}
+                    allowClear
+                    showSearch
+                    optionFilterProp="label"
+                    style={{ width: hasVariants ? 'calc(100% - 64px - 120px)' : 'calc(100% - 64px)' }}
+                    onChange={(newModel) => {
+                      const newVariants = newModel ? modelVariantsMap[newModel] ?? [] : [];
+                      if (newVariants.length === 0 || (currentVariant && !newVariants.includes(currentVariant))) {
+                        form.setFieldValue(`category_${categoryKey}_reasoning`, undefined);
+                      }
+                    }}
+                  />
+                </Form.Item>
+                {hasVariants && (
+                  <Form.Item name={`category_${categoryKey}_reasoning`} noStyle>
+                    <Select
+                      placeholder="reasoning"
+                      options={variantOptions.map((v) => ({ label: v, value: v }))}
+                      allowClear
+                      style={{ width: 120 }}
+                    />
+                  </Form.Item>
+                )}
+                <Button
+                  icon={<MoreOutlined />}
+                  onClick={() => toggleCategorySettings(categoryKey)}
+                  type={expandedCategories[categoryKey] ? 'primary' : 'default'}
+                  title={t('opencode.ohMyOpenCode.advancedSettings')}
+                />
+                <Button
+                  icon={<DeleteOutlined />}
+                  onClick={() => handleRemoveCustomCategory(categoryKey)}
+                  danger
+                  title={t('common.delete')}
+                />
+              </Space.Compact>
+            );
+          }}
+        </Form.Item>
+      </Form.Item>
+
+      {/* Fallback models - shown only when model is set (no ultrawork for categories) */}
+      <Form.Item
+        noStyle
+        shouldUpdate={(prevValues, currentValues) =>
+          prevValues[`category_${categoryKey}`] !== currentValues[`category_${categoryKey}`]
+        }
+      >
+        {({ getFieldValue }) => {
+          const selectedModel = getFieldValue(`category_${categoryKey}`);
+          if (!selectedModel) return null;
+
+          return (
+            <Form.Item
+              wrapperCol={{ offset: labelCol, span: wrapperCol }}
+              style={{ marginBottom: expandedCategories[categoryKey] ? 0 : 4 }}
+            >
+              <div className={styles.subFieldsPanel} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className={styles.subFieldLabel}>{t('opencode.ohMyOpenCode.fallbackModelsLabel')}</span>
+                <Form.Item name={`category_${categoryKey}_models`} noStyle>
+                  <Select
+                    mode="tags"
+                    variant="filled"
+                    placeholder={t('opencode.ohMyOpenCode.fallbackModelsPlaceholder')}
+                    options={modelOptions}
+                    allowClear
+                    showSearch
+                    optionFilterProp="label"
+                    style={{ flex: 1 }}
+                  />
+                </Form.Item>
+              </div>
+            </Form.Item>
+          );
+        }}
+      </Form.Item>
+
+      {expandedCategories[categoryKey] && (
+        <Form.Item
+          extra={<Text type="secondary" style={{ fontSize: 11, marginTop: 4, display: 'inline-block' }}>{t('opencode.ohMyOpenCode.advancedSettingsHint')}</Text>}
+          style={{ marginBottom: 20 }}
+          wrapperCol={{ offset: labelCol, span: wrapperCol }}
+        >
+          <JsonEditor
+            value={categoryAdvancedSettingsRef.current[categoryKey] && Object.keys(categoryAdvancedSettingsRef.current[categoryKey]).length > 0 ? categoryAdvancedSettingsRef.current[categoryKey] : undefined}
+            onChange={(value) => {
+              if (value === null || value === undefined) {
+                categoryAdvancedSettingsRawRef.current[categoryKey] = '';
+              } else if (typeof value === 'string') {
+                categoryAdvancedSettingsRawRef.current[categoryKey] = value;
+              } else {
+                categoryAdvancedSettingsRawRef.current[categoryKey] = JSON.stringify(value, null, 2);
+              }
+            }}
+            height={150}
+            minHeight={100}
+            maxHeight={300}
+            resizable
+            mode="text"
+            placeholder={`{
+    "temperature": 0.5
+}`}
+          />
+        </Form.Item>
+      )}
+    </div>
+  );
+
+  return (
+    <Modal
+      className={styles.modal}
+      title={isEdit
+        ? t('opencode.ohMyOpenCode.editConfig')
+        : t('opencode.ohMyOpenCode.addConfig')}
+      open={open}
+      onCancel={onCancel}
+      footer={[
+        <Button key="cancel" onClick={onCancel}>
+          {t('common.cancel')}
+        </Button>,
+        <Button key="submit" type="primary" loading={loading} onClick={handleSubmit}>
+          {t('common.save')}
+        </Button>,
+      ]}
+      width={800}
+    >
+      <div className={styles.content}>
+      <Form
+        className={styles.form}
+        form={form}
+        layout="horizontal"
+        labelCol={{ span: labelCol }}
+        wrapperCol={{ span: wrapperCol }}
+      >
+        {/* Hidden ID field for editing */}
+        <Form.Item name="id" hidden>
+          <Input />
+        </Form.Item>
+
+        <div className={styles.sectionCard}>
+          <Form.Item
+            className={styles.nameItem}
+            label={t('opencode.ohMyOpenCode.configName')}
+            name="name"
+            rules={[{ required: true, message: t('opencode.ohMyOpenCode.configNamePlaceholder') }]}
+          >
+            <Input
+              placeholder={t('opencode.ohMyOpenCode.configNamePlaceholder')}
+            />
+          </Form.Item>
+        </div>
+
+        <div className={styles.scrollArea}>
+          {/* 操作按钮行 */}
+          <div className={styles.batchLinkRow}>
+            <Button
+              type="link"
+              icon={<ImportOutlined />}
+              onClick={() => setShowImportJson(true)}
+              className={styles.batchLinkButton}
+            >
+              {t('opencode.ohMyOpenCode.importFromJson')}
+            </Button>
+            {isEdit && (
+              <Button
+                type="link"
+                icon={<SwapOutlined />}
+                onClick={() => setShowBatchReplace(!showBatchReplace)}
+                className={styles.batchLinkButton}
+              >
+                {t('opencode.ohMyOpenCode.batchReplaceModel')}
+              </Button>
+            )}
+          </div>
+          {isEdit && (
+            <>
+              {showBatchReplace && (
+                <div className={styles.batchPanel}>
+                  <Text type="secondary" className={styles.helperText}>
+                    {t('opencode.ohMyOpenCode.batchReplaceHint')}
+                  </Text>
+                  <div className={styles.batchFlow}>
+                    <div className={`${styles.batchGroup} ${styles.batchGroupFrom}`}>
+                      <div className={styles.batchGroupHeader}>
+                        <Text className={`${styles.batchGroupTag} ${styles.batchGroupTagFrom}`}>
+                          {t('opencode.ohMyOpenCode.batchReplaceFromTitle')}
+                        </Text>
+                        <Text type="secondary" className={styles.batchGroupHint}>
+                          {t('opencode.ohMyOpenCode.batchReplaceFromHint')}
+                        </Text>
+                      </div>
+                      <div className={styles.batchGroupFields}>
+                        <div className={styles.batchField}>
+                          <Text className={styles.batchLabel}>{t('opencode.ohMyOpenCode.batchReplaceFromPlaceholder')}</Text>
+                          <Select
+                            value={batchReplaceFromModel}
+                            placeholder={t('opencode.ohMyOpenCode.batchReplaceFromPlaceholder')}
+                            options={batchReplaceFromModelOptions}
+                            allowClear
+                            showSearch
+                            optionFilterProp="label"
+                            className={styles.batchSelect}
+                            onChange={(value) => {
+                              setBatchReplaceFromModel(value);
+                              setBatchReplaceFromVariant(undefined);
+                            }}
+                          />
+                        </div>
+                        <div className={styles.batchField}>
+                          <Text className={styles.batchLabel}>{t('opencode.ohMyOpenCode.batchReplaceFromVariantPlaceholder')}</Text>
+                          <Select
+                            value={batchReplaceFromVariant}
+                            placeholder={t('opencode.ohMyOpenCode.batchReplaceFromVariantPlaceholder')}
+                            options={batchReplaceFromVariantOptions.map((v) => ({ label: v, value: v }))}
+                            allowClear
+                            disabled={!batchReplaceFromModel || batchReplaceFromVariantOptions.length === 0}
+                            className={styles.batchSelect}
+                            onChange={(value) => setBatchReplaceFromVariant(value)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className={styles.batchArrow}>
+                      <span className={styles.batchArrowIcon}>
+                        <SwapOutlined />
+                      </span>
+                    </div>
+
+                    <div className={`${styles.batchGroup} ${styles.batchGroupTo}`}>
+                      <div className={styles.batchGroupHeader}>
+                        <Text className={`${styles.batchGroupTag} ${styles.batchGroupTagTo}`}>
+                          {t('opencode.ohMyOpenCode.batchReplaceToTitle')}
+                        </Text>
+                        <Text type="secondary" className={styles.batchGroupHint}>
+                          {t('opencode.ohMyOpenCode.batchReplaceToHint')}
+                        </Text>
+                      </div>
+                      <div className={styles.batchGroupFields}>
+                        <div className={styles.batchField}>
+                          <Text className={styles.batchLabel}>{t('opencode.ohMyOpenCode.batchReplaceToPlaceholder')}</Text>
+                          <Select
+                            value={batchReplaceToModel}
+                            placeholder={t('opencode.ohMyOpenCode.batchReplaceToPlaceholder')}
+                            options={modelOptions}
+                            allowClear
+                            showSearch
+                            optionFilterProp="label"
+                            className={styles.batchSelect}
+                            onChange={(value) => {
+                              setBatchReplaceToModel(value);
+                              setBatchReplaceToVariant(undefined);
+                            }}
+                          />
+                        </div>
+                        <div className={styles.batchField}>
+                          <Text className={styles.batchLabel}>{t('opencode.ohMyOpenCode.batchReplaceToVariantPlaceholder')}</Text>
+                          <Select
+                            value={batchReplaceToVariant}
+                            placeholder={t('opencode.ohMyOpenCode.batchReplaceToVariantPlaceholder')}
+                            options={toModelVariants.map((v) => ({ label: v, value: v }))}
+                            allowClear
+                            disabled={!batchReplaceToModel || toModelVariants.length === 0}
+                            className={styles.batchSelect}
+                            onChange={(value) => setBatchReplaceToVariant(value)}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className={styles.batchActionRow}>
+                    <Text type="secondary" className={styles.batchActionHint}>
+                      {t('opencode.ohMyOpenCode.batchReplaceActionHint')}
+                    </Text>
+                    <Button
+                      type="primary"
+                      icon={<SwapOutlined />}
+                      onClick={handleBatchReplaceModel}
+                      className={styles.batchActionButton}
+                    >
+                      {t('opencode.ohMyOpenCode.batchReplaceAction')}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Agent Models */}
+          <Collapse
+            className={styles.sectionCollapse}
+            bordered={false}
+            defaultActiveKey={['agents']}
+            items={[
+              {
+                key: 'agents',
+                label: (
+                  <div className={styles.sectionLabel}>
+                    <span className={styles.sectionTitle}>{t('opencode.ohMyOpenCode.agentModels')}</span>
+                    <span className={styles.sectionHint}>{t('opencode.ohMyOpenCode.agentModelsHint')}</span>
+                  </div>
+                ),
+                children: (
+                  <>
+                    {allAgentKeys.map((agentType) => {
+                      // Render separator as a Divider instead of a form item
+                      if (agentType.startsWith('__') && agentType.endsWith('_separator__')) {
+                        const desc = getOpenAgentDescription(agentType, t);
+                        return (
+                          <Divider key={agentType} style={{ margin: '16px 0 12px 0', fontSize: 12, color: '#666' }}>
+                            {desc}
+                          </Divider>
+                        );
+                      }
+                      return renderAgentItem(agentType);
+                    })}
+
+                    {/* Custom Agents */}
+                    {customAgents.length > 0 && (
+                      <>
+                        <Divider style={{ margin: '12px 0', fontSize: 12 }}>
+                          {t('opencode.ohMyOpenCode.customAgents')}
+                        </Divider>
+                        {customAgents.map(renderCustomAgentItem)}
+                      </>
+                    )}
+
+                    {/* Add Custom Agent */}
+                    {showAddAgent ? (
+                      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                        <Input
+                          placeholder={t('opencode.ohMyOpenCode.customAgentKeyPlaceholder')}
+                          value={newAgentKey}
+                          onChange={(e) => setNewAgentKey(e.target.value)}
+                          onPressEnter={handleAddCustomAgent}
+                          style={{ flex: 1 }}
+                        />
+                        <Button type="primary" onClick={handleAddCustomAgent}>
+                          {t('common.confirm')}
+                        </Button>
+                        <Button onClick={() => { setShowAddAgent(false); setNewAgentKey(''); }}>
+                          {t('common.cancel')}
+                        </Button>
+                      </div>
+                    ) : (
+                      <Button
+                        type="dashed"
+                        icon={<PlusOutlined />}
+                        onClick={() => setShowAddAgent(true)}
+                        style={{ width: '100%', marginTop: 12 }}
+                      >
+                        {t('opencode.ohMyOpenCode.addCustomAgent')}
+                      </Button>
+                    )}
+                  </>
+                ),
+              },
+            ]}
+          />
+
+          {/* Categories */}
+          <Collapse
+            className={styles.sectionCollapse}
+            bordered={false}
+            defaultActiveKey={categoriesCollapsed ? [] : ['categories']}
+            onChange={(keys) => setCategoriesCollapsed(!keys.includes('categories'))}
+            items={[
+              {
+                key: 'categories',
+                label: (
+                  <div className={styles.sectionLabel}>
+                    <span className={styles.sectionTitle}>{t('opencode.ohMyOpenCode.categories') || 'Categories'}</span>
+                    <span className={styles.sectionHint}>{t('opencode.ohMyOpenCode.categoriesHint')}</span>
+                  </div>
+                ),
+                children: (
+                  <>
+                    {categoryDefinitions.map(renderCategoryItem)}
+
+                    {/* Custom Categories */}
+                    {customCategories.length > 0 && (
+                      <>
+                        <Divider style={{ margin: '12px 0', fontSize: 12 }}>
+                          {t('opencode.ohMyOpenCode.customCategories')}
+                        </Divider>
+                        {customCategories.map(renderCustomCategoryItem)}
+                      </>
+                    )}
+
+                    {/* Add Custom Category */}
+                    {showAddCategory ? (
+                      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                        <Input
+                          placeholder={t('opencode.ohMyOpenCode.customCategoryKeyPlaceholder')}
+                          value={newCategoryKey}
+                          onChange={(e) => setNewCategoryKey(e.target.value)}
+                          onPressEnter={handleAddCustomCategory}
+                          style={{ flex: 1 }}
+                        />
+                        <Button type="primary" onClick={handleAddCustomCategory}>
+                          {t('common.confirm')}
+                        </Button>
+                        <Button onClick={() => { setShowAddCategory(false); setNewCategoryKey(''); }}>
+                          {t('common.cancel')}
+                        </Button>
+                      </div>
+                    ) : (
+                      <Button
+                        type="dashed"
+                        icon={<PlusOutlined />}
+                        onClick={() => setShowAddCategory(true)}
+                        style={{ width: '100%', marginTop: 12 }}
+                      >
+                        {t('opencode.ohMyOpenCode.addCustomCategory')}
+                      </Button>
+                    )}
+                  </>
+                ),
+              },
+            ]}
+          />
+
+          {/* 其他配置 */}
+          <Collapse
+            className={styles.sectionCollapse}
+            bordered={false}
+            defaultActiveKey={[]}
+            items={[
+              {
+                key: 'other',
+                label: (
+                  <div className={styles.sectionLabel}>
+                    <span className={styles.sectionTitle}>{t('opencode.ohMyOpenCode.otherFields')}</span>
+                    <span className={styles.sectionHint}>{t('opencode.ohMyOpenCode.otherFieldsHint')}</span>
+                  </div>
+                ),
+                children: (
+                  <Form.Item
+                    className={styles.editorItem}
+                    labelCol={{ span: 24 }}
+                    wrapperCol={{ span: 24 }}
+                  >
+                    <JsonEditor
+                      value={otherFieldsRef.current && Object.keys(otherFieldsRef.current).length > 0 ? otherFieldsRef.current : undefined}
+                      onChange={(value, isValid) => {
+                        otherFieldsValidRef.current = isValid;
+                        if (value === null || value === undefined) {
+                          otherFieldsRawRef.current = '';
+                          otherFieldsRef.current = {};
+                        } else if (typeof value === 'string') {
+                          otherFieldsRawRef.current = value;
+                          if (value.trim() === '') {
+                            otherFieldsRef.current = {};
+                          }
+                        } else if (typeof value === 'object' && !Array.isArray(value)) {
+                          otherFieldsRef.current = value as Record<string, unknown>;
+                          otherFieldsRawRef.current = JSON.stringify(value, null, 2);
+                        } else {
+                          otherFieldsRawRef.current = JSON.stringify(value, null, 2);
+                        }
+                      }}
+                      height={200}
+                      minHeight={150}
+                      maxHeight={400}
+                      resizable
+                      mode="text"
+                      placeholder={`{
+    "background_task": {
+        "defaultConcurrency": 5
+    }
+}`}
+                    />
+                  </Form.Item>
+                ),
+              },
+            ]}
+          />
+        </div>
+      </Form>
+      </div>
+
+      <ImportJsonConfigModal
+        open={showImportJson}
+        onCancel={() => setShowImportJson(false)}
+        onImport={handleImportJson}
+        variant="omo"
+      />
+    </Modal>
+  );
+};
+
+export default OhMyOpenAgentConfigModal;

@@ -1,17 +1,44 @@
 use serde::{Deserialize, Serialize};
-use surrealdb::sql::Thing;
+use serde_json::Value;
+
+fn default_json_object_string() -> String {
+    "{}".to_string()
+}
+
+/// Controls how a provider's extra settings are applied together with Claude's common config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeSettingsMergeStrategy {
+    /// Preserve AI Toolbox's historical behavior: provider extra fields replace
+    /// same-name common top-level fields.
+    ProviderOverridesCommon,
+    /// Match cc-switch: provider settings are the base and common config overlays them.
+    CommonOverridesProvider,
+    /// Recursively merge both layers and merge array elements with de-duplication.
+    MergeCommonAndProvider,
+}
+
+impl Default for ClaudeSettingsMergeStrategy {
+    fn default() -> Self {
+        Self::ProviderOverridesCommon
+    }
+}
 
 // ============================================================================
 // ClaudeCode Provider Types
 // ============================================================================
 
-/// ClaudeCodeProvider - Database record
+/// ClaudeCodeProvider - database record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCodeProviderRecord {
-    pub id: Thing,
+    pub id: String,
     pub name: String,
     pub category: String,
     pub settings_config: String,
+    #[serde(default = "default_json_object_string")]
+    pub extra_settings_config: String,
+    #[serde(default)]
+    pub extra_settings_merge_strategy: ClaudeSettingsMergeStrategy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,6 +51,8 @@ pub struct ClaudeCodeProviderRecord {
     pub icon_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
     pub is_applied: bool,
     pub is_disabled: bool,
     pub created_at: String,
@@ -38,6 +67,10 @@ pub struct ClaudeCodeProvider {
     pub name: String,
     pub category: String,
     pub settings_config: String,
+    #[serde(default = "default_json_object_string")]
+    pub extra_settings_config: String,
+    #[serde(default)]
+    pub extra_settings_merge_strategy: ClaudeSettingsMergeStrategy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +83,8 @@ pub struct ClaudeCodeProvider {
     pub icon_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
     pub is_applied: bool,
     pub is_disabled: bool,
     pub created_at: String,
@@ -59,16 +94,19 @@ pub struct ClaudeCodeProvider {
 impl From<ClaudeCodeProviderRecord> for ClaudeCodeProvider {
     fn from(record: ClaudeCodeProviderRecord) -> Self {
         ClaudeCodeProvider {
-            id: record.id.id.to_string(),
+            id: record.id,
             name: record.name,
             category: record.category,
             settings_config: record.settings_config,
+            extra_settings_config: record.extra_settings_config,
+            extra_settings_merge_strategy: record.extra_settings_merge_strategy,
             source_provider_id: record.source_provider_id,
             website_url: record.website_url,
             notes: record.notes,
             icon: record.icon,
             icon_color: record.icon_color,
             sort_index: record.sort_index,
+            meta: record.meta,
             is_applied: record.is_applied,
             is_disabled: record.is_disabled,
             created_at: record.created_at,
@@ -83,6 +121,10 @@ pub struct ClaudeCodeProviderContent {
     pub name: String,
     pub category: String,
     pub settings_config: String,
+    #[serde(default = "default_json_object_string")]
+    pub extra_settings_config: String,
+    #[serde(default)]
+    pub extra_settings_merge_strategy: ClaudeSettingsMergeStrategy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,6 +137,8 @@ pub struct ClaudeCodeProviderContent {
     pub icon_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
     pub is_applied: bool,
     pub is_disabled: bool,
     pub created_at: String,
@@ -110,6 +154,10 @@ pub struct ClaudeCodeProviderInput {
     pub name: String,
     pub category: String,
     pub settings_config: String,
+    #[serde(default)]
+    pub extra_settings_config: Option<String>,
+    #[serde(default)]
+    pub extra_settings_merge_strategy: Option<ClaudeSettingsMergeStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,17 +170,21 @@ pub struct ClaudeCodeProviderInput {
     pub icon_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 // ============================================================================
 // ClaudeCode Common Config Types
 // ============================================================================
 
-/// ClaudeCommonConfig - Database record
+/// ClaudeCommonConfig - database record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCommonConfigRecord {
-    pub id: Thing,
+    pub id: String,
     pub config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -142,7 +194,25 @@ pub struct ClaudeCommonConfigRecord {
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeCommonConfig {
     pub config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPathInfo {
+    pub path: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCommonConfigInput {
+    pub config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
+    #[serde(default)]
+    pub clear_root_dir: bool,
 }
 
 /// Input for saving local config (provider and/or common)
@@ -153,6 +223,10 @@ pub struct ClaudeLocalConfigInput {
     pub provider: Option<ClaudeCodeProviderInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub common_config: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
+    #[serde(default)]
+    pub clear_root_dir: bool,
 }
 
 /// Claude settings.json structure (for reading/writing config file)
@@ -176,4 +250,91 @@ pub struct ClaudePluginStatus {
     pub enabled: bool,
     /// Whether ~/.claude/config.json exists
     pub has_config_file: bool,
+}
+
+// ============================================================================
+// Claude Prompt Config Types
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudePromptConfigInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudePromptConfig {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub is_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudePromptConfigContent {
+    pub name: String,
+    pub content: String,
+    pub is_applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_index: Option<i32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ============================================================================
+// Claude All API Hub Import Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAllApiHubProvider {
+    pub provider_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub requires_browser_open: bool,
+    pub is_disabled: bool,
+    pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_cny: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_type: Option<String>,
+    pub account_label: String,
+    pub source_profile_name: String,
+    pub source_extension_id: String,
+    pub provider_config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeAllApiHubProvidersResult {
+    pub found: bool,
+    pub profiles: Vec<crate::coding::all_api_hub::AllApiHubProfileInfo>,
+    pub providers: Vec<ClaudeAllApiHubProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveClaudeAllApiHubProvidersRequest {
+    pub provider_ids: Vec<String>,
 }

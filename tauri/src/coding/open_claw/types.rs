@@ -57,6 +57,8 @@ pub struct OpenClawProviderConfig {
     pub api: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<OpenClawModel>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -157,20 +159,50 @@ pub struct OpenClawConfigPathInfo {
 }
 
 // ============================================================================
+// Health scan & write outcome
+// ============================================================================
+
+/// OpenClaw 配置健康检查警告
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawHealthWarning {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// OpenClaw 配置写入结果(备份路径 + 健康扫描警告)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawWriteOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<OpenClawHealthWarning>,
+}
+
+// ============================================================================
 // Read config result (tagged enum)
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum ReadOpenClawConfigResult {
-    Success { config: OpenClawConfig },
-    NotFound { path: String },
+    Success {
+        config: OpenClawConfig,
+    },
+    NotFound {
+        path: String,
+    },
     ParseError {
         path: String,
         error: String,
         content_preview: Option<String>,
     },
-    Error { error: String },
+    Error {
+        error: String,
+    },
 }
 
 // ============================================================================
@@ -183,4 +215,47 @@ pub struct OpenClawCommonConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawAllApiHubProvider {
+    pub provider_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub api_protocol: String,
+    pub requires_browser_open: bool,
+    pub is_disabled: bool,
+    pub has_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_cny: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_type: Option<String>,
+    pub account_label: String,
+    pub source_profile_name: String,
+    pub source_extension_id: String,
+    pub config: OpenClawProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawAllApiHubProvidersResult {
+    pub found: bool,
+    pub profiles: Vec<crate::coding::all_api_hub::AllApiHubProfileInfo>,
+    pub providers: Vec<OpenClawAllApiHubProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveOpenClawAllApiHubProvidersRequest {
+    pub provider_ids: Vec<String>,
 }

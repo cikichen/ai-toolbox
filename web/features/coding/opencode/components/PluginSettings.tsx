@@ -2,6 +2,7 @@ import React from 'react';
 import { Tag, Input, Space, Empty, Typography, Collapse, message, Tooltip, Popconfirm, Switch } from 'antd';
 import { PlusOutlined, CloseOutlined, DownOutlined, RightOutlined, ApiOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
+import type { OpenCodePluginEntry } from '@/types/opencode';
 import {
   listFavoritePlugins,
   addFavoritePlugin,
@@ -11,24 +12,36 @@ import {
   OpenCodeFavoritePlugin,
 } from '@/services/opencodeApi';
 import { refreshTrayMenu } from '@/services/appApi';
+import {
+  createOpenCodePluginEntry,
+  getOpenCodePluginPackageName,
+  getOpenCodePluginName,
+  isOpenCodePluginEquivalent,
+  normalizeOpenCodePluginName,
+  sanitizeOpenCodePluginList,
+} from '@/features/coding/opencode/utils/pluginNames';
 
 const { Text } = Typography;
 
+const OMO_CANONICAL_PLUGIN = 'oh-my-openagent';
+const OMO_LEGACY_PLUGIN = 'oh-my-opencode';
+const OMO_SLIM_PLUGIN = 'oh-my-opencode-slim';
+
 // Mutually exclusive plugins - if one is selected, the other should be disabled
 const MUTUALLY_EXCLUSIVE_PLUGINS: Record<string, string[]> = {
-  'oh-my-opencode': ['oh-my-opencode-slim'],
-  'oh-my-opencode-slim': ['oh-my-opencode'],
+  [OMO_CANONICAL_PLUGIN]: [OMO_SLIM_PLUGIN],
+  [OMO_LEGACY_PLUGIN]: [OMO_SLIM_PLUGIN],
+  [OMO_SLIM_PLUGIN]: [OMO_CANONICAL_PLUGIN, OMO_LEGACY_PLUGIN],
 };
 
-// Helper function to get plugin base name (strip @version suffix)
-const getPluginBaseName = (pluginName: string): string => {
-  const atIndex = pluginName.indexOf('@');
-  return atIndex === -1 ? pluginName : pluginName.substring(0, atIndex);
+const isOmoPlugin = (pluginName: string): boolean => {
+  const baseName = getOpenCodePluginPackageName(pluginName);
+  return baseName === OMO_CANONICAL_PLUGIN || baseName === OMO_LEGACY_PLUGIN;
 };
 
 interface PluginSettingsProps {
-  plugins: string[];
-  onChange: (plugins: string[]) => void;
+  plugins: OpenCodePluginEntry[];
+  onChange: (plugins: OpenCodePluginEntry[]) => void;
   defaultCollapsed?: boolean;
 }
 
@@ -57,7 +70,10 @@ const PluginSettings: React.FC<PluginSettingsProps> = ({ plugins, onChange, defa
   const loadFavoritePlugins = async () => {
     try {
       const plugins = await listFavoritePlugins();
-      setFavoritePlugins(plugins);
+      const dedupedPlugins = plugins.filter((plugin, index, allPlugins) => (
+        allPlugins.findIndex((candidate) => isOpenCodePluginEquivalent(candidate.pluginName, plugin.pluginName)) === index
+      ));
+      setFavoritePlugins(dedupedPlugins);
     } catch (error) {
       console.error('Failed to load favorite plugins:', error);
     }
@@ -67,7 +83,7 @@ const PluginSettings: React.FC<PluginSettingsProps> = ({ plugins, onChange, defa
   const getDisabledPlugins = React.useCallback((): Set<string> => {
     const disabled = new Set<string>();
     for (const selectedPlugin of plugins) {
-      const baseName = getPluginBaseName(selectedPlugin);
+      const baseName = getOpenCodePluginPackageName(getOpenCodePluginName(selectedPlugin));
       // Use contains matching: check if baseName contains any mutually exclusive plugin key
       for (const [key, exclusiveList] of Object.entries(MUTUALLY_EXCLUSIVE_PLUGINS)) {
         if (baseName.includes(key)) {
@@ -82,20 +98,38 @@ const PluginSettings: React.FC<PluginSettingsProps> = ({ plugins, onChange, defa
   const disabledPlugins = getDisabledPlugins();
 
   const handleClose = (removedPlugin: string) => {
-    const newPlugins = plugins.filter((plugin) => plugin !== removedPlugin);
+    let removed = false;
+    const newPlugins = plugins.filter((plugin) => {
+      if (!removed && getOpenCodePluginName(plugin) === removedPlugin) {
+        removed = true;
+        return false;
+      }
+      return true;
+    });
     onChange(newPlugins);
   };
 
   const handleInputConfirm = async () => {
-    if (inputValue && !plugins.includes(inputValue)) {
+    const normalizedInputValue = normalizeOpenCodePluginName(inputValue);
+    if (normalizedInputValue && !plugins.some((plugin) => isOpenCodePluginEquivalent(getOpenCodePluginName(plugin), normalizedInputValue))) {
       // Add to current plugins
-      onChange([...plugins, inputValue]);
+      const nextPlugins = plugins.filter((plugin) => {
+        const existingPluginName = getOpenCodePluginName(plugin);
+        if (isOmoPlugin(normalizedInputValue) && getOpenCodePluginPackageName(existingPluginName) === OMO_SLIM_PLUGIN) {
+          return false;
+        }
+        if (getOpenCodePluginPackageName(normalizedInputValue) === OMO_SLIM_PLUGIN && isOmoPlugin(existingPluginName)) {
+          return false;
+        }
+        return true;
+      });
+      onChange(sanitizeOpenCodePluginList([...nextPlugins, createOpenCodePluginEntry(normalizedInputValue)]));
 
       // Save to favorites if not already exists
-      const existsInFavorites = favoritePlugins.some((p) => p.pluginName === inputValue);
+      const existsInFavorites = favoritePlugins.some((p) => isOpenCodePluginEquivalent(p.pluginName, normalizedInputValue));
       if (!existsInFavorites) {
         try {
-          await addFavoritePlugin(inputValue);
+          await addFavoritePlugin(normalizedInputValue);
           message.success(t('opencode.plugin.savedToFavorites'));
           await loadFavoritePlugins();
         } catch (error) {
@@ -108,16 +142,27 @@ const PluginSettings: React.FC<PluginSettingsProps> = ({ plugins, onChange, defa
   };
 
   const handleFavoriteClick = (pluginName: string) => {
+    const normalizedPluginName = normalizeOpenCodePluginName(pluginName);
     // Check if disabled due to mutual exclusivity (use contains matching)
-    const baseName = getPluginBaseName(pluginName);
+    const baseName = getOpenCodePluginPackageName(normalizedPluginName);
     const isDisabled = Array.from(disabledPlugins).some((dp) => baseName.includes(dp));
     if (isDisabled) {
       return;
     }
 
     // Add to current plugins if not already added
-    if (!plugins.includes(pluginName)) {
-      onChange([...plugins, pluginName]);
+    if (!plugins.some((plugin) => isOpenCodePluginEquivalent(getOpenCodePluginName(plugin), normalizedPluginName))) {
+      const nextPlugins = plugins.filter((plugin) => {
+        const existingPluginName = getOpenCodePluginName(plugin);
+        if (isOmoPlugin(normalizedPluginName) && getOpenCodePluginPackageName(existingPluginName) === OMO_SLIM_PLUGIN) {
+          return false;
+        }
+        if (getOpenCodePluginPackageName(normalizedPluginName) === OMO_SLIM_PLUGIN && isOmoPlugin(existingPluginName)) {
+          return false;
+        }
+        return true;
+      });
+      onChange(sanitizeOpenCodePluginList([...nextPlugins, createOpenCodePluginEntry(normalizedPluginName)]));
     }
   };
 
@@ -219,13 +264,13 @@ const PluginSettings: React.FC<PluginSettingsProps> = ({ plugins, onChange, defa
         <Space wrap>
           {plugins.map((plugin) => (
             <Tag
-              key={plugin}
+              key={getOpenCodePluginName(plugin)}
               closable
-              onClose={() => handleClose(plugin)}
+              onClose={() => handleClose(getOpenCodePluginName(plugin))}
               style={enabledTagStyle}
               closeIcon={<CloseOutlined style={{ color: '#fff' }} />}
             >
-              {plugin}
+              {getOpenCodePluginName(plugin)}
             </Tag>
           ))}
           {inputVisible ? (
@@ -284,9 +329,9 @@ const PluginSettings: React.FC<PluginSettingsProps> = ({ plugins, onChange, defa
             <Space wrap>
               {/* All favorite plugins from database */}
               {favoritePlugins.map((plugin) => {
-                const baseName = getPluginBaseName(plugin.pluginName);
+                const baseName = getOpenCodePluginPackageName(plugin.pluginName);
                 const isDisabled = Array.from(disabledPlugins).some((dp) => baseName.includes(dp));
-                const isAlreadyAdded = plugins.includes(plugin.pluginName);
+                const isAlreadyAdded = plugins.some((enabledPlugin) => isOpenCodePluginEquivalent(getOpenCodePluginName(enabledPlugin), plugin.pluginName));
 
                 // Determine tag style based on state
                 const tagStyle = isDisabled

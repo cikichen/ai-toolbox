@@ -1,73 +1,65 @@
 //! MCP Server database operations
 //!
-//! Provides CRUD operations for MCP server management.
-//! Uses backtick-escaped record references instead of type::thing() to avoid
-//! UUID parsing issues across SurrealDB versions.
+//! Provides CRUD operations for MCP server management using SQLite JSONB.
 
 use serde_json::Value;
 
-use crate::coding::db_id::{db_record_id, db_new_id};
-use crate::DbState;
 use super::adapter::{
-    from_db_mcp_preferences, from_db_mcp_server, from_db_favorite_mcp, remove_sync_detail, set_sync_detail,
-    to_clean_mcp_server_payload, to_mcp_preferences_payload,
+    from_db_favorite_mcp, from_db_mcp_group, from_db_mcp_preferences, from_db_mcp_server,
+    remove_sync_detail, set_sync_detail, to_clean_mcp_server_payload, to_mcp_preferences_payload,
 };
 use super::command_normalize;
-use super::types::{McpPreferences, McpServer, McpSyncDetail, FavoriteMcp, now_ms};
+use super::types::{now_ms, FavoriteMcp, McpGroup, McpPreferences, McpServer, McpSyncDetail};
+use crate::coding::db_id::db_new_id;
+use crate::db::helpers::{db_delete, db_get, db_list, db_max_i64, db_put, db_query_by_field};
+use crate::db::schema::{DbTable, JsonFieldPath, OrderDirection, OrderField, OrderSpec};
+use crate::SqliteDbState;
 
 // ==================== MCP Server CRUD ====================
 
 /// Get all MCP servers ordered by sort_index
-pub async fn get_mcp_servers(state: &DbState) -> Result<Vec<McpServer>, String> {
-    let db = state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM mcp_server ORDER BY sort_index ASC")
-        .await
-        .map_err(|e| format!("Failed to query MCP servers: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.into_iter().map(from_db_mcp_server).collect())
+pub async fn get_mcp_servers(state: &SqliteDbState) -> Result<Vec<McpServer>, String> {
+    state.with_conn(|conn| {
+        let order = OrderSpec::new(vec![
+            OrderField::json_integer("sort_index", OrderDirection::Asc)?,
+            OrderField::id(OrderDirection::Asc),
+        ]);
+        let records = db_list(conn, DbTable::McpServer, Some(&order))?;
+        Ok(records.into_iter().map(from_db_mcp_server).collect())
+    })
 }
 
 /// Get a single MCP server by ID
-pub async fn get_mcp_server_by_id(state: &DbState, server_id: &str) -> Result<Option<McpServer>, String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("mcp_server", server_id);
-
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| format!("Failed to query MCP server: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.first().map(|r| from_db_mcp_server(r.clone())))
+pub async fn get_mcp_server_by_id(
+    state: &SqliteDbState,
+    server_id: &str,
+) -> Result<Option<McpServer>, String> {
+    state.with_conn(|conn| Ok(db_get(conn, DbTable::McpServer, server_id)?.map(from_db_mcp_server)))
 }
 
 /// Get MCP server by name
-pub async fn get_mcp_server_by_name(state: &DbState, name: &str) -> Result<Option<McpServer>, String> {
-    let db = state.0.lock().await;
-    let name_owned = name.to_string();
-
-    let mut result = db
-        .query(
-            "SELECT *, type::string(id) as id FROM mcp_server WHERE name = $name LIMIT 1",
-        )
-        .bind(("name", name_owned))
-        .await
-        .map_err(|e| format!("Failed to query MCP server by name: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.first().map(|r| from_db_mcp_server(r.clone())))
+pub async fn get_mcp_server_by_name(
+    state: &SqliteDbState,
+    name: &str,
+) -> Result<Option<McpServer>, String> {
+    state.with_conn(|conn| {
+        let records = db_query_by_field(
+            conn,
+            DbTable::McpServer,
+            &JsonFieldPath::new("name")?,
+            &Value::String(name.to_string()),
+            None,
+            Some(1),
+        )?;
+        Ok(records.into_iter().next().map(from_db_mcp_server))
+    })
 }
 
 /// Create or update an MCP server
-pub async fn upsert_mcp_server(state: &DbState, server: &McpServer) -> Result<String, String> {
-    let db = state.0.lock().await;
-
+pub async fn upsert_mcp_server(
+    state: &SqliteDbState,
+    server: &McpServer,
+) -> Result<String, String> {
     // Normalize server_config: remove cmd /c wrapper for database storage (only for stdio type)
     let normalized_config = if server.server_type == "stdio" {
         command_normalize::unwrap_cmd_c(&server.server_config)
@@ -75,290 +67,457 @@ pub async fn upsert_mcp_server(state: &DbState, server: &McpServer) -> Result<St
         server.server_config.clone()
     };
 
-    if server.id.is_empty() {
-        // Get max sort_index for new server
-        let mut max_result = db
-            .query("SELECT sort_index FROM mcp_server ORDER BY sort_index DESC LIMIT 1")
-            .await
-            .map_err(|e| format!("Failed to query max sort_index: {}", e))?;
-        let max_records: Vec<Value> = max_result.take(0).map_err(|e| e.to_string())?;
-        let max_index = max_records
-            .first()
-            .and_then(|v| v.get("sort_index"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1) as i32;
-
-        // Create new server with sort_index = max + 1 and normalized config
-        let mut new_server = server.clone();
-        new_server.sort_index = max_index + 1;
-        new_server.server_config = normalized_config;
-        let payload = to_clean_mcp_server_payload(&new_server);
-
-        let id = db_new_id();
-        let record_id = db_record_id("mcp_server", &id);
-        db.query(&format!("CREATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-            .await
-            .map_err(|e| format!("Failed to create MCP server: {}", e))?;
-        Ok(id)
+    let id = if server.id.is_empty() {
+        db_new_id()
     } else {
-        // Update existing server with normalized config
-        let mut updated_server = server.clone();
-        updated_server.server_config = normalized_config;
-        let payload = to_clean_mcp_server_payload(&updated_server);
-        let record_id = db_record_id("mcp_server", &server.id);
-        db.query(&format!("UPDATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-            .await
-            .map_err(|e| format!("Failed to update MCP server: {}", e))?;
-        Ok(server.id.clone())
-    }
+        server.id.clone()
+    };
+    state.with_conn(|conn| {
+        let mut sqlite_server = server.clone();
+        sqlite_server.id = id.clone();
+        sqlite_server.server_config = normalized_config;
+        if server.id.is_empty() {
+            let max_index =
+                db_max_i64(conn, DbTable::McpServer, &JsonFieldPath::new("sort_index")?)?
+                    .unwrap_or(-1) as i32;
+            sqlite_server.sort_index = max_index + 1;
+        }
+        db_put(
+            conn,
+            DbTable::McpServer,
+            &id,
+            &to_clean_mcp_server_payload(&sqlite_server),
+        )
+    })?;
+    Ok(id)
 }
 
 /// Delete an MCP server
-pub async fn delete_mcp_server(state: &DbState, server_id: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("mcp_server", server_id);
+pub async fn delete_mcp_server(state: &SqliteDbState, server_id: &str) -> Result<(), String> {
+    state.with_conn(|conn| db_delete(conn, DbTable::McpServer, server_id).map(|_| ()))
+}
 
-    db.query(&format!("DELETE {}", record_id))
-        .await
-        .map_err(|e| format!("Failed to delete MCP server: {}", e))?;
-
+/// Update user-managed metadata for an MCP server without touching sync state.
+pub async fn update_mcp_server_metadata(
+    state: &SqliteDbState,
+    server_id: &str,
+    user_group: Option<String>,
+    user_note: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<(), String> {
+    if let Some(mut server) = get_mcp_server_by_id(state, server_id).await? {
+        server.user_group = user_group;
+        server.user_note = user_note;
+        if let Some(tags) = tags {
+            server.tags = tags;
+        }
+        server.updated_at = now_ms();
+        upsert_mcp_server(state, &server).await?;
+    }
     Ok(())
 }
 
 /// Reorder MCP servers by updating sort_index for each server
-pub async fn reorder_mcp_servers(state: &DbState, ids: &[String]) -> Result<(), String> {
-    let db = state.0.lock().await;
-
-    for (index, id) in ids.iter().enumerate() {
-        let record_id = db_record_id("mcp_server", id);
-        db.query(&format!("UPDATE {} SET sort_index = $index", record_id))
-            .bind(("index", index as i32))
-            .await
-            .map_err(|e| format!("Failed to reorder MCP servers: {}", e))?;
-    }
-
-    Ok(())
+pub async fn reorder_mcp_servers(state: &SqliteDbState, ids: &[String]) -> Result<(), String> {
+    state.with_conn(|conn| {
+        for (index, id) in ids.iter().enumerate() {
+            if let Some(mut record) = db_get(conn, DbTable::McpServer, id)? {
+                if let Some(object) = record.as_object_mut() {
+                    object.insert(
+                        "sort_index".to_string(),
+                        Value::Number(serde_json::Number::from(index as i64)),
+                    );
+                }
+                db_put(conn, DbTable::McpServer, id, &record)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 // ==================== Sync Details Operations ====================
 
 /// Update sync detail for a specific tool
 pub async fn update_sync_detail(
-    state: &DbState,
+    state: &SqliteDbState,
     server_id: &str,
     detail: &McpSyncDetail,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("mcp_server", server_id);
-
-    // Get existing server
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    let server = records
-        .first()
-        .map(|r| from_db_mcp_server(r.clone()))
+    let mut server = get_mcp_server_by_id(state, server_id)
+        .await?
         .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
-
-    // Update sync_details
-    let new_sync_details = set_sync_detail(&server.sync_details, &detail.tool, detail);
-
-    // Save updates
-    db.query(&format!("UPDATE {} SET sync_details = $sync_details, updated_at = $updated_at", record_id))
-        .bind(("sync_details", new_sync_details))
-        .bind(("updated_at", now_ms()))
-        .await
-        .map_err(|e| format!("Failed to update sync detail: {}", e))?;
-
+    server.sync_details = Some(set_sync_detail(&server.sync_details, &detail.tool, detail));
+    server.updated_at = now_ms();
+    upsert_mcp_server(state, &server).await?;
     Ok(())
 }
 
 /// Remove sync detail for a specific tool
-pub async fn delete_sync_detail(state: &DbState, server_id: &str, tool: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("mcp_server", server_id);
-    let tool_owned = tool.to_string();
-
-    // Get existing server
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    let Some(server) = records.first().map(|r| from_db_mcp_server(r.clone())) else {
-        return Ok(()); // Server not found, nothing to delete
+pub async fn delete_sync_detail(
+    state: &SqliteDbState,
+    server_id: &str,
+    tool: &str,
+) -> Result<(), String> {
+    let Some(mut server) = get_mcp_server_by_id(state, server_id).await? else {
+        return Ok(());
     };
-
-    // Update sync_details
-    let new_sync_details = remove_sync_detail(&server.sync_details, &tool_owned);
-
-    // Save updates
-    db.query(&format!("UPDATE {} SET sync_details = $sync_details, updated_at = $updated_at", record_id))
-        .bind(("sync_details", new_sync_details))
-        .bind(("updated_at", now_ms()))
-        .await
-        .map_err(|e| format!("Failed to delete sync detail: {}", e))?;
-
+    server.sync_details = Some(remove_sync_detail(&server.sync_details, tool));
+    server.updated_at = now_ms();
+    upsert_mcp_server(state, &server).await?;
     Ok(())
 }
 
 /// Toggle a tool's enabled state for an MCP server
 pub async fn toggle_tool_enabled(
-    state: &DbState,
+    state: &SqliteDbState,
     server_id: &str,
     tool_key: &str,
 ) -> Result<bool, String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("mcp_server", server_id);
-
-    // Get existing server
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    let server = records
-        .first()
-        .map(|r| from_db_mcp_server(r.clone()))
+    let mut server = get_mcp_server_by_id(state, server_id)
+        .await?
         .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
-
-    // Toggle tool in enabled_tools
     let mut enabled_tools = server.enabled_tools.clone();
     let is_now_enabled = if enabled_tools.contains(&tool_key.to_string()) {
-        enabled_tools.retain(|t| t != tool_key);
+        enabled_tools.retain(|tool| tool != tool_key);
         false
     } else {
         enabled_tools.push(tool_key.to_string());
         true
     };
-
-    // Save updates
-    db.query(&format!("UPDATE {} SET enabled_tools = $enabled_tools, updated_at = $updated_at", record_id))
-        .bind(("enabled_tools", enabled_tools))
-        .bind(("updated_at", now_ms()))
-        .await
-        .map_err(|e| format!("Failed to toggle tool: {}", e))?;
-
+    server.enabled_tools = enabled_tools;
+    server.updated_at = now_ms();
+    upsert_mcp_server(state, &server).await?;
     Ok(is_now_enabled)
+}
+
+/// Set the management enabled state for an MCP server.
+///
+/// Disable: records the current `enabled_tools` into `disabled_previous_tools` (keeping any
+/// existing history when there are no current bindings), clears `enabled_tools` /
+/// `sync_details`, and sets `management_enabled = false`. `name`, `server_config`,
+/// `user_group`, `user_note` and `tags` are preserved; the server stays in its group.
+///
+/// Enable: only flips `management_enabled = true` and returns the recorded
+/// `disabled_previous_tools` so the caller can let the user confirm which historical tools
+/// to restore through the normal sync flow.
+pub async fn set_server_management_enabled(
+    state: &SqliteDbState,
+    server_id: &str,
+    enabled: bool,
+) -> Result<Vec<String>, String> {
+    let Some(mut server) = get_mcp_server_by_id(state, server_id).await? else {
+        return Err(format!("MCP server not found: {}", server_id));
+    };
+    if enabled {
+        server.management_enabled = true;
+        server.updated_at = now_ms();
+        upsert_mcp_server(state, &server).await?;
+        return Ok(server.disabled_previous_tools);
+    }
+
+    let previous_tools = if server.enabled_tools.is_empty() {
+        server.disabled_previous_tools.clone()
+    } else {
+        server.enabled_tools.clone()
+    };
+    server.management_enabled = false;
+    server.disabled_previous_tools = previous_tools.clone();
+    server.enabled_tools = Vec::new();
+    server.sync_details = Some(Value::Object(serde_json::Map::new()));
+    server.updated_at = now_ms();
+    upsert_mcp_server(state, &server).await?;
+    Ok(previous_tools)
+}
+
+/// Persist the user-confirmed tool restore set for a re-enabled server.
+///
+/// Re-enable only flips `management_enabled` and leaves `enabled_tools` empty, so the
+/// generic `mcp_sync_to_tool` batch entry would skip the server (`enabled_tools.contains`
+/// check). The restore command writes the confirmed tools back before syncing each one.
+pub async fn set_server_enabled_tools(
+    state: &SqliteDbState,
+    server_id: &str,
+    tools: Vec<String>,
+) -> Result<(), String> {
+    let Some(mut server) = get_mcp_server_by_id(state, server_id).await? else {
+        return Err(format!("MCP server not found: {}", server_id));
+    };
+    let mut seen = std::collections::HashSet::new();
+    server.enabled_tools = tools
+        .into_iter()
+        .filter(|tool| seen.insert(tool.clone()))
+        .collect();
+    server.updated_at = now_ms();
+    upsert_mcp_server(state, &server).await?;
+    Ok(())
 }
 
 // ==================== MCP Preferences ====================
 
 /// Get MCP preferences (singleton record)
-pub async fn get_mcp_preferences(state: &DbState) -> Result<McpPreferences, String> {
-    let db = state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM mcp_preferences:`default` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query MCP preferences: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-
-    if let Some(record) = records.first() {
-        Ok(from_db_mcp_preferences(record.clone()))
-    } else {
-        Ok(McpPreferences::default())
-    }
+pub async fn get_mcp_preferences(state: &SqliteDbState) -> Result<McpPreferences, String> {
+    state.with_conn(|conn| {
+        Ok(db_get(conn, DbTable::McpPreferences, "default")?
+            .map(from_db_mcp_preferences)
+            .unwrap_or_default())
+    })
 }
 
 /// Save MCP preferences (singleton record)
-pub async fn save_mcp_preferences(state: &DbState, prefs: &McpPreferences) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let payload = to_mcp_preferences_payload(prefs);
-
-    db.query("UPSERT mcp_preferences:`default` CONTENT $data")
-        .bind(("data", payload))
-        .await
-        .map_err(|e| format!("Failed to save MCP preferences: {}", e))?;
-
-    Ok(())
+pub async fn save_mcp_preferences(
+    state: &SqliteDbState,
+    prefs: &McpPreferences,
+) -> Result<(), String> {
+    state.with_conn(|conn| {
+        db_put(
+            conn,
+            DbTable::McpPreferences,
+            "default",
+            &to_mcp_preferences_payload(prefs),
+        )
+    })
 }
 
 // ==================== Favorite MCP CRUD ====================
 
 /// Get all favorite MCP servers
-pub async fn get_favorite_mcps(state: &DbState) -> Result<Vec<FavoriteMcp>, String> {
-    let db = state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM favorite_mcp ORDER BY created_at DESC")
-        .await
-        .map_err(|e| format!("Failed to query favorite MCPs: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.into_iter().map(from_db_favorite_mcp).collect())
+pub async fn get_favorite_mcps(state: &SqliteDbState) -> Result<Vec<FavoriteMcp>, String> {
+    state.with_conn(|conn| {
+        let order = OrderSpec::new(vec![
+            OrderField::json_integer("created_at", OrderDirection::Desc)?,
+            OrderField::id(OrderDirection::Asc),
+        ]);
+        let records = db_list(conn, DbTable::FavoriteMcp, Some(&order))?;
+        Ok(records.into_iter().map(from_db_favorite_mcp).collect())
+    })
 }
 
 /// Get a favorite MCP by name
-pub async fn get_favorite_mcp_by_name(state: &DbState, name: &str) -> Result<Option<FavoriteMcp>, String> {
-    let db = state.0.lock().await;
-    let name_owned = name.to_string();
-
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM favorite_mcp WHERE name = $name LIMIT 1")
-        .bind(("name", name_owned))
-        .await
-        .map_err(|e| format!("Failed to query favorite MCP by name: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.first().map(|v| from_db_favorite_mcp(v.clone())))
+pub async fn get_favorite_mcp_by_name(
+    state: &SqliteDbState,
+    name: &str,
+) -> Result<Option<FavoriteMcp>, String> {
+    state.with_conn(|conn| {
+        let records = db_query_by_field(
+            conn,
+            DbTable::FavoriteMcp,
+            &JsonFieldPath::new("name")?,
+            &Value::String(name.to_string()),
+            None,
+            Some(1),
+        )?;
+        Ok(records.into_iter().next().map(from_db_favorite_mcp))
+    })
 }
 
 /// Create or update a favorite MCP
-pub async fn upsert_favorite_mcp(state: &DbState, fav: &FavoriteMcp) -> Result<String, String> {
-    let db = state.0.lock().await;
-
-    // Remove id field for database payload
+pub async fn upsert_favorite_mcp(
+    state: &SqliteDbState,
+    fav: &FavoriteMcp,
+) -> Result<String, String> {
+    let id = if fav.id.is_empty() {
+        db_new_id()
+    } else {
+        fav.id.clone()
+    };
     let mut payload = serde_json::to_value(fav).map_err(|e| e.to_string())?;
     if let Some(obj) = payload.as_object_mut() {
         obj.remove("id");
     }
-
-    if fav.id.is_empty() {
-        // Create new
-        let id = db_new_id();
-        let record_id = db_record_id("favorite_mcp", &id);
-        db.query(&format!("CREATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-            .await
-            .map_err(|e| format!("Failed to create favorite MCP: {}", e))?;
-        Ok(id)
-    } else {
-        // Update existing
-        let record_id = db_record_id("favorite_mcp", &fav.id);
-        db.query(&format!("UPDATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-            .await
-            .map_err(|e| format!("Failed to update favorite MCP: {}", e))?;
-        Ok(fav.id.clone())
-    }
+    state.with_conn(|conn| db_put(conn, DbTable::FavoriteMcp, &id, &payload))?;
+    Ok(id)
 }
 
 /// Delete a favorite MCP
-pub async fn delete_favorite_mcp(state: &DbState, id: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("favorite_mcp", id);
+pub async fn delete_favorite_mcp(state: &SqliteDbState, id: &str) -> Result<(), String> {
+    state.with_conn(|conn| db_delete(conn, DbTable::FavoriteMcp, id).map(|_| ()))
+}
 
-    db.query(&format!("DELETE {}", record_id))
-        .await
-        .map_err(|e| format!("Failed to delete favorite MCP: {}", e))?;
+// ==================== Managed Groups ====================
 
-    Ok(())
+/// List managed MCP groups ordered by sort_index then row id.
+pub async fn get_mcp_groups(state: &SqliteDbState) -> Result<Vec<McpGroup>, String> {
+    state.with_conn(|conn| {
+        let order = OrderSpec::new(vec![
+            OrderField::json_integer("sort_index", OrderDirection::Asc)?,
+            OrderField::id(OrderDirection::Asc),
+        ]);
+        let records = db_list(conn, DbTable::McpGroup, Some(&order))?;
+        Ok(records.into_iter().map(from_db_mcp_group).collect())
+    })
+}
+
+/// Insert or update a managed group; returns the persisted row id.
+pub async fn upsert_mcp_group(state: &SqliteDbState, group: &McpGroup) -> Result<String, String> {
+    let id = if group.id.is_empty() {
+        db_new_id()
+    } else {
+        group.id.clone()
+    };
+    let mut payload = serde_json::to_value(group).map_err(|e| e.to_string())?;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("id");
+    }
+    state.with_conn(|conn| db_put(conn, DbTable::McpGroup, &id, &payload))?;
+    Ok(id)
+}
+
+/// Delete a managed group by id
+pub async fn delete_mcp_group(state: &SqliteDbState, group_id: &str) -> Result<(), String> {
+    state.with_conn(|conn| db_delete(conn, DbTable::McpGroup, group_id).map(|_| ()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn sqlite_mcp_store_round_trips_servers_preferences_and_favorites() {
+        let sqlite_state = SqliteDbState::in_memory_for_test().expect("sqlite");
+
+        let server = McpServer {
+            id: String::new(),
+            name: "Server A".to_string(),
+            server_type: "stdio".to_string(),
+            server_config: json!({"command": "cmd", "args": ["/c", "node"]}),
+            enabled_tools: vec!["claude".to_string()],
+            sync_details: None,
+            description: None,
+            sort_index: 0,
+            created_at: 1,
+            updated_at: 2,
+            user_group: None,
+            user_note: None,
+            tags: Vec::new(),
+            timeout: None,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+        };
+        let server_id = upsert_mcp_server(&sqlite_state, &server)
+            .await
+            .expect("upsert server");
+        let saved_server = get_mcp_server_by_id(&sqlite_state, &server_id)
+            .await
+            .expect("read server")
+            .expect("server exists");
+        assert_eq!(saved_server.name, "Server A");
+        assert_eq!(saved_server.sort_index, 0);
+
+        let prefs = McpPreferences {
+            id: "default".to_string(),
+            show_in_tray: true,
+            preferred_tools: vec!["claude".to_string()],
+            favorites_initialized: true,
+            sync_disabled_to_opencode: true,
+            limit_add_more_to_preferred_tools: true,
+            updated_at: 9,
+        };
+        save_mcp_preferences(&sqlite_state, &prefs)
+            .await
+            .expect("save preferences");
+        let prefs = get_mcp_preferences(&sqlite_state)
+            .await
+            .expect("read preferences");
+        assert!(prefs.show_in_tray);
+        assert!(prefs.limit_add_more_to_preferred_tools);
+
+        let favorite = FavoriteMcp {
+            id: String::new(),
+            name: "Favorite A".to_string(),
+            server_type: "http".to_string(),
+            server_config: json!({"url": "https://example.com/mcp"}),
+            description: None,
+            tags: Vec::new(),
+            is_preset: false,
+            created_at: 5,
+            updated_at: 6,
+        };
+        let favorite_id = upsert_favorite_mcp(&sqlite_state, &favorite)
+            .await
+            .expect("save favorite");
+        assert!(!favorite_id.is_empty());
+        let favorites = get_favorite_mcps(&sqlite_state)
+            .await
+            .expect("read favorites");
+        assert_eq!(favorites.len(), 1);
+        assert_eq!(favorites[0].name, "Favorite A");
+    }
+
+    #[tokio::test]
+    async fn sqlite_mcp_store_management_enabled_round_trips() {
+        let sqlite_state = SqliteDbState::in_memory_for_test().expect("sqlite");
+
+        let server = McpServer {
+            id: String::new(),
+            name: "Managed A".to_string(),
+            server_type: "stdio".to_string(),
+            server_config: json!({"command": "cmd", "args": ["/c", "node"]}),
+            enabled_tools: vec!["claude".to_string(), "codex".to_string()],
+            sync_details: Some(json!({
+                "claude": {"status": "ok"},
+                "codex": {"status": "ok"}
+            })),
+            description: None,
+            sort_index: 0,
+            created_at: 1,
+            updated_at: 2,
+            user_group: Some("Group A".to_string()),
+            user_note: Some("note".to_string()),
+            tags: vec!["tag".to_string()],
+            timeout: None,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+        };
+        let server_id = upsert_mcp_server(&sqlite_state, &server)
+            .await
+            .expect("upsert server");
+
+        // Disable: records current bindings, clears enabled_tools/sync_details.
+        let previous = set_server_management_enabled(&sqlite_state, &server_id, false)
+            .await
+            .expect("disable server");
+        assert_eq!(previous, vec!["claude".to_string(), "codex".to_string()]);
+
+        let disabled = get_mcp_server_by_id(&sqlite_state, &server_id)
+            .await
+            .expect("read server")
+            .expect("server exists");
+        assert!(!disabled.management_enabled);
+        assert!(disabled.enabled_tools.is_empty());
+        assert!(
+            disabled
+                .sync_details
+                .as_ref()
+                .map(|d| d.as_object().map(|o| o.is_empty()).unwrap_or(false))
+                .unwrap_or(false),
+            "sync_details should be an empty object after disable"
+        );
+        assert_eq!(
+            disabled.disabled_previous_tools,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        assert_eq!(disabled.user_group.as_deref(), Some("Group A"));
+        assert_eq!(disabled.user_note.as_deref(), Some("note"));
+        assert_eq!(disabled.tags, vec!["tag".to_string()]);
+        assert_eq!(disabled.name, "Managed A");
+
+        // Re-enable: flips the flag and returns the recorded history.
+        let previous = set_server_management_enabled(&sqlite_state, &server_id, true)
+            .await
+            .expect("enable server");
+        assert_eq!(previous, vec!["claude".to_string(), "codex".to_string()]);
+
+        let reenabled = get_mcp_server_by_id(&sqlite_state, &server_id)
+            .await
+            .expect("read server")
+            .expect("server exists");
+        assert!(reenabled.management_enabled);
+        assert!(reenabled.enabled_tools.is_empty());
+        assert_eq!(
+            reenabled.disabled_previous_tools,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        assert_eq!(reenabled.user_group.as_deref(), Some("Group A"));
+    }
 }

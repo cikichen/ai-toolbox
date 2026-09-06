@@ -4,14 +4,16 @@
  * Modal for configuring SSH sync settings with connection management
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Modal, Switch, Select, Button, List, Space, Typography, Alert, Spin, Tag, Modal as AntdModal, Tabs, Tooltip, Progress, theme } from 'antd';
 import { CheckCircleOutlined, CloseCircleOutlined, ReloadOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ClearOutlined, ApiOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useSSHSync } from '@/features/settings/hooks/useSSHSync';
-import { useSettingsStore } from '@/stores';
-import { SSHConnectionModal } from './SSHConnectionModal';
-import { SSHFileMappingModal } from './SSHFileMappingModal';
+import {
+  isBuiltInDefaultMappingName,
+  translateDefaultMappingName,
+  translateSyncMessage,
+} from '@/features/settings/utils/syncMessageTranslator';
 import {
   sshDeleteFileMapping,
   sshResetFileMappings,
@@ -21,7 +23,12 @@ import {
   sshDeleteConnection,
   sshSetActiveConnection,
 } from '@/services/sshSyncApi';
+import { useSettingsStore } from '@/stores';
+import { DEFAULT_SSH_DIRECTORY_EXCLUDES } from '@/types/sshsync';
 import type { SSHConnection, SSHFileMapping, SSHConnectionResult } from '@/types/sshsync';
+import type { WslDirectModuleStatus } from '@/types/wslsync';
+import { SSHConnectionModal } from './SSHConnectionModal';
+import { SSHFileMappingModal } from './SSHFileMappingModal';
 
 const { Text } = Typography;
 
@@ -29,27 +36,71 @@ const { Text } = Typography;
 const MODULE_NAMES: Record<string, string> = {
   opencode: 'OpenCode',
   claude: 'Claude Code',
+  claude_desktop: 'Claude Desktop',
   codex: 'Codex',
+  grok: 'Grok',
+  kimi: 'Kimi',
   openclaw: 'OpenClaw',
+  geminicli: 'Gemini',
+  pi: 'Pi',
+  oh_my_pi: 'omp',
+  hermes: 'Hermes',
+  dsh: 'dsh',
 };
 
 // Module tag colors
 const MODULE_COLORS: Record<string, string> = {
   opencode: 'blue',
   claude: 'purple',
+  claude_desktop: 'geekblue',
   codex: 'orange',
+  grok: 'gold',
+  kimi: 'lime',
   openclaw: 'green',
+  geminicli: 'cyan',
+  pi: 'magenta',
+  oh_my_pi: 'magenta',
+  hermes: 'volcano',
+  dsh: 'red',
 };
 
-// Map sync module keys to visibleTabs keys
+const AUTH_METHOD_TAG_COLORS: Record<SSHConnection['authMethod'], string> = {
+  key: 'blue',
+  password: 'green',
+  none: 'default',
+};
+
+const CURRENT_FILE_TAIL_MAX_LENGTH = 72;
+
+const truncateTailPath = (path: string, maxLength = CURRENT_FILE_TAIL_MAX_LENGTH) => {
+  if (path.length <= maxLength) {
+    return path;
+  }
+
+  const tailLength = Math.max(1, maxLength - 3);
+  return `...${path.slice(-tailLength)}`;
+};
+
+// Map sync module keys to visibleTabs keys. Every coding module must be mapped,
+// otherwise the visibleModuleKeys filter below hides that module's tab from the
+// modal (and an unmapped tab is force-skipped during sync). Keep in sync with
+// useSSHSync.ts / useWSLSync.ts / WSLSyncModal.tsx.
 const MODULE_TO_TAB: Record<string, string> = {
   opencode: 'opencode',
   claude: 'claudecode',
+  claude_desktop: 'claudedesktop',
   codex: 'codex',
+  grok: 'grok',
+  kimi: 'kimi',
   openclaw: 'openclaw',
+  geminicli: 'geminicli',
+  pi: 'pi',
+  oh_my_pi: 'oh_my_pi',
+  hermes: 'hermes',
+  dsh: 'dsh',
 };
 
-const ALL_MODULE_KEYS = ['opencode', 'claude', 'codex', 'openclaw'];
+const ALL_MODULE_KEYS = ['opencode', 'claude', 'claude_desktop', 'codex', 'grok', 'kimi', 'geminicli', 'openclaw', 'pi', 'oh_my_pi', 'hermes', 'dsh'];
 
 interface SSHSyncModalProps {
   open: boolean;
@@ -74,6 +125,145 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
   const [activeModuleTab, setActiveModuleTab] = useState<string>(visibleModuleKeys[0] || 'all');
   const [testResult, setTestResult] = useState<SSHConnectionResult | null>(null);
   const [testing, setTesting] = useState(false);
+
+  const moduleStatusMap = React.useMemo(() => {
+    return new Map((config?.moduleStatuses || []).map((item) => [item.module, item] as const));
+  }, [config?.moduleStatuses]);
+
+  const getMappingDisplayName = (mapping: SSHFileMapping) => {
+    if (isBuiltInDefaultMappingName(mapping.id, mapping.name)) {
+      return translateDefaultMappingName(mapping.id, t);
+    }
+    return mapping.name;
+  };
+
+  const getProgressDisplayName = (currentItem: string) => {
+    const mapping = config?.fileMappings?.find((item) => item.name === currentItem);
+    return mapping ? getMappingDisplayName(mapping) : currentItem;
+  };
+
+  const getAuthMethodLabel = (authMethod: SSHConnection['authMethod']) => {
+    if (authMethod === 'key') {
+      return t('settings.ssh.authKey');
+    }
+    if (authMethod === 'password') {
+      return t('settings.ssh.authPassword');
+    }
+    return t('settings.ssh.authNone');
+  };
+
+  const getModuleStatus = useCallback((module: string): WslDirectModuleStatus | undefined => {
+    return moduleStatusMap.get(module);
+  }, [moduleStatusMap]);
+
+  const getDirectoryExcludes = (mapping: SSHFileMapping): string[] => {
+    if (!mapping.isDirectory) {
+      return [];
+    }
+    return mapping.directoryExcludes ?? [...DEFAULT_SSH_DIRECTORY_EXCLUDES];
+  };
+
+  const getDisplayLocalPath = useCallback((mapping: SSHFileMapping) => {
+    const status = getModuleStatus(mapping.module);
+    if (!status?.isWslDirect || !status.linuxPath) {
+      return mapping.localPath;
+    }
+
+    const formatWslDisplayPath = (linuxPath: string) => {
+      if (!status.distro) {
+        return linuxPath;
+      }
+
+      const normalizedLinuxPath = linuxPath.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!normalizedLinuxPath) {
+        return `\\\\wsl.localhost\\${status.distro}`;
+      }
+
+      return `\\\\wsl.localhost\\${status.distro}\\${normalizedLinuxPath.replace(/\//g, '\\')}`;
+    };
+
+    const linuxRootPath = status.linuxPath.replace(/\\/g, '/').replace(/\/+$/, '');
+    const linuxUserRoot = status.linuxUserRoot?.replace(/\\/g, '/').replace(/\/+$/, '');
+    const normalizedLocalPath = mapping.localPath.replace(/\\/g, '/');
+    const mappingId = mapping.id;
+
+    if (mappingId === 'opencode-main' || mappingId === 'openclaw-config') {
+      return formatWslDisplayPath(status.linuxPath);
+    }
+
+    if (mappingId === 'opencode-oh-my' || mappingId === 'opencode-oh-my-slim') {
+      const fileName = normalizedLocalPath.split('/').pop();
+      return formatWslDisplayPath(fileName ? `${linuxRootPath}/${fileName}` : status.linuxPath);
+    }
+
+    if (mappingId === 'opencode-prompt') {
+      const parentPath = linuxRootPath.includes('/')
+        ? linuxRootPath.slice(0, linuxRootPath.lastIndexOf('/')) || '/'
+        : '/';
+      return formatWslDisplayPath(`${parentPath.replace(/\/+$/, '') || ''}/AGENTS.md`);
+    }
+
+    if (mappingId === 'opencode-plugins') {
+      const parentPath = linuxRootPath.includes('/')
+        ? linuxRootPath.slice(0, linuxRootPath.lastIndexOf('/')) || '/'
+        : '/';
+      return formatWslDisplayPath(`${parentPath.replace(/\/+$/, '') || ''}/*.mjs`);
+    }
+
+    if (mappingId === 'opencode-auth' && linuxUserRoot) {
+      return formatWslDisplayPath(`${linuxUserRoot}/.local/share/opencode/auth.json`);
+    }
+
+    if (
+      mappingId === 'claude-settings' ||
+      mappingId === 'claude-config' ||
+      mappingId === 'claude-prompt' ||
+      mappingId === 'codex-auth' ||
+      mappingId === 'codex-config' ||
+      mappingId === 'codex-prompt' ||
+      mappingId === 'geminicli-env' ||
+      mappingId === 'geminicli-settings' ||
+      mappingId === 'geminicli-prompt' ||
+      mappingId === 'geminicli-oauth'
+    ) {
+      const fileName = normalizedLocalPath.split('/').pop();
+      return formatWslDisplayPath(fileName ? `${linuxRootPath}/${fileName}` : status.linuxPath);
+    }
+
+    return mapping.localPath;
+  }, [getModuleStatus]);
+
+  const getProgressMessage = () => {
+    if (!syncProgress) {
+      return '';
+    }
+
+    if (syncProgress.phase === 'files') {
+      if (syncProgress.current === 0) {
+        return t('settings.ssh.progress.preparingFiles', { total: syncProgress.total });
+      }
+
+      return t('settings.ssh.progress.filesWithName', {
+        current: syncProgress.current,
+        total: syncProgress.total,
+        name: getProgressDisplayName(syncProgress.currentItem),
+      });
+    }
+
+    if (syncProgress.phase === 'skills') {
+      if (syncProgress.current === 0) {
+        return t('settings.ssh.progress.preparingSkills', { total: syncProgress.total });
+      }
+
+      return t('settings.ssh.progress.skillsWithName', {
+        current: syncProgress.current,
+        total: syncProgress.total,
+        name: syncProgress.currentItem,
+      });
+    }
+
+    return translateSyncMessage(syncProgress.message, 'ssh', t);
+  };
 
   // Initialize state when config loads
   useEffect(() => {
@@ -109,7 +299,7 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
   };
 
   // Test connection
-  const handleTestConnection = async (connId?: string) => {
+  const handleTestConnection = useCallback(async (connId?: string) => {
     const targetId = connId || activeConnectionId;
     const conn = config?.connections.find(c => c.id === targetId);
     if (!conn) return;
@@ -127,14 +317,14 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
     } finally {
       setTesting(false);
     }
-  };
+  }, [activeConnectionId, config?.connections]);
 
   // Auto test connection when modal opens or active connection changes
   useEffect(() => {
     if (open && enabled && activeConnectionId && config?.connections.length) {
       handleTestConnection(activeConnectionId);
     }
-  }, [open, activeConnectionId, enabled]);
+  }, [activeConnectionId, config?.connections.length, enabled, handleTestConnection, open]);
 
   // Connection management
   const handleNewConnection = () => {
@@ -220,6 +410,8 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
       enabled: true,
       isPattern: false,
       isDirectory: false,
+      directoryExcludes: [...DEFAULT_SSH_DIRECTORY_EXCLUDES],
+      cleanupPaths: [],
     };
     setEditingMapping(newMapping);
     setMappingModalOpen(true);
@@ -314,41 +506,86 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
           size="small"
           dataSource={filteredMappings}
           renderItem={(item: SSHFileMapping) => (
-            <List.Item
-              actions={[
-                <Tooltip title={t('common.edit')}>
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<EditOutlined />}
-                    onClick={() => handleEditMapping(item)}
-                    disabled={!enabled}
-                  />
-                </Tooltip>,
-                <Tooltip title={t('common.delete')}>
-                  <Button
-                    type="text"
-                    size="small"
-                    danger
-                    icon={<DeleteOutlined />}
-                    onClick={() => handleDeleteMapping(item)}
-                    disabled={!enabled}
-                  />
-                </Tooltip>,
-              ]}
-            >
+            <List.Item>
               <List.Item.Meta
                 title={
-                  <Space>
-                    <Text>{item.name}</Text>
-                    <Tag color={MODULE_COLORS[item.module] || 'default'}>{MODULE_NAMES[item.module] || item.module}</Tag>
-                    {!item.enabled && <Tag>{t('settings.ssh.disabled')}</Tag>}
-                  </Space>
+                  <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
+                    <Space>
+                       <Text>{getMappingDisplayName(item)}</Text>
+                      <Tag color={MODULE_COLORS[item.module] || 'default'}>{MODULE_NAMES[item.module] || item.module}</Tag>
+                      {!item.enabled && <Tag>{t('settings.ssh.disabled')}</Tag>}
+                    </Space>
+                    <div
+                      style={{
+                        marginInlineStart: 'auto',
+                        flexShrink: 0,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 4,
+                      }}
+                    >
+                      <Tooltip title={t('common.edit')}>
+                        <Button
+                          type="text"
+                          size="small"
+                          icon={<EditOutlined />}
+                          onClick={() => handleEditMapping(item)}
+                          disabled={!enabled}
+                        />
+                      </Tooltip>
+                      <Tooltip title={t('common.delete')}>
+                        <Button
+                          type="text"
+                          size="small"
+                          danger
+                          icon={<DeleteOutlined />}
+                          onClick={() => handleDeleteMapping(item)}
+                          disabled={!enabled}
+                        />
+                      </Tooltip>
+                    </div>
+                  </div>
                 }
                 description={
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {item.localPath} → {item.remotePath}
-                  </Text>
+                  <Space orientation="vertical" size={2}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {getDisplayLocalPath(item)} → {item.remotePath}
+                    </Text>
+                    {item.isDirectory && getDirectoryExcludes(item).length > 0 && (
+                      <Space size={[4, 2]} wrap>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {t('settings.ssh.directoryExcludes')}:
+                        </Text>
+                        {getDirectoryExcludes(item).map((exclude) => (
+                          <Tag
+                            key={exclude}
+                            color="default"
+                            style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: '18px' }}
+                          >
+                            {exclude}
+                          </Tag>
+                        ))}
+                      </Space>
+                    )}
+                    {(item.cleanupPaths?.length ?? 0) > 0 && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>
+                          {t('settings.ssh.cleanupPaths')}:
+                        </Text>
+                        <Space size={[4, 2]} wrap>
+                          {item.cleanupPaths.map((cleanupPath) => (
+                            <Tag
+                              key={cleanupPath}
+                              color="default"
+                              style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: '18px' }}
+                            >
+                              {cleanupPath}
+                            </Tag>
+                          ))}
+                        </Space>
+                      </div>
+                    )}
+                  </Space>
                 }
               />
             </List.Item>
@@ -446,8 +683,8 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
               <Space wrap>
                 <Text type="secondary">{activeConnection.host}:{activeConnection.port}</Text>
                 <Tag>{activeConnection.username}@</Tag>
-                <Tag color={activeConnection.authMethod === 'key' ? 'blue' : 'green'}>
-                  {activeConnection.authMethod === 'key' ? t('settings.ssh.authKey') : t('settings.ssh.authPassword')}
+                <Tag color={AUTH_METHOD_TAG_COLORS[activeConnection.authMethod] || 'default'}>
+                  {getAuthMethodLabel(activeConnection.authMethod)}
                 </Tag>
                 {testing && <Spin size="small" />}
                 {!testing && testResult && (
@@ -463,7 +700,7 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
               )}
               {testResult?.error && (
                 <div style={{ marginTop: 4 }}>
-                  <Text type="danger" style={{ fontSize: 12 }}>{testResult.error}</Text>
+                  <Text type="danger" style={{ fontSize: 12 }}>{translateSyncMessage(testResult.error, 'ssh', t)}</Text>
                 </div>
               )}
             </div>
@@ -537,19 +774,38 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
             {syncing && syncProgress && (
               <div style={{ marginTop: 12 }}>
                 <div style={{ marginBottom: 4 }}>
-                  <Text type="secondary">{syncProgress.message}</Text>
+                  <Text type="secondary">{getProgressMessage()}</Text>
                 </div>
                 <Progress
                   percent={syncProgress.total > 0 ? Math.round((syncProgress.current / syncProgress.total) * 100) : 0}
                   size="small"
                   status="active"
                 />
+                {syncProgress.currentFile && (
+                  <div style={{ marginTop: 4, minWidth: 0, maxWidth: '100%' }}>
+                    <Text
+                      type="secondary"
+                      style={{
+                        display: 'block',
+                        maxWidth: '100%',
+                        fontSize: 12,
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'clip',
+                      }}
+                    >
+                      {t('settings.ssh.progress.currentFile', {
+                        file: truncateTailPath(syncProgress.currentFile),
+                      })}
+                    </Text>
+                  </div>
+                )}
               </div>
             )}
             {status?.lastSyncError && (
               <Alert
                 type="error"
-                message={status.lastSyncError}
+                title={translateSyncMessage(status.lastSyncError, 'ssh', t)}
                 showIcon
                 style={{ marginTop: 12 }}
               />
@@ -557,10 +813,9 @@ export const SSHSyncModal: React.FC<SSHSyncModalProps> = ({ open, onClose }) => 
             {syncWarning && (
               <Alert
                 type="warning"
-                message={syncWarning}
+                title={translateSyncMessage(syncWarning, 'ssh', t)}
                 showIcon
-                closable
-                onClose={dismissSyncWarning}
+                closable={{ onClose: dismissSyncWarning }}
                 style={{ marginTop: 12 }}
               />
             )}

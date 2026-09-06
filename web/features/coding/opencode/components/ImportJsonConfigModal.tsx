@@ -1,22 +1,19 @@
 import React from 'react';
 import { Modal, Button, Typography, message } from 'antd';
 import { useTranslation } from 'react-i18next';
-import JSON5 from 'json5';
 import JsonEditor from '@/components/common/JsonEditor';
+import {
+  parseImportedConfigText,
+  type ImportedConfigData,
+} from './importJsonConfigUtils';
 
 const { Text } = Typography;
-
-export interface ImportedConfigData {
-  agents?: Record<string, Record<string, unknown>>;
-  categories?: Record<string, Record<string, unknown>>;
-  otherFields?: Record<string, unknown>;
-}
 
 interface ImportJsonConfigModalProps {
   open: boolean;
   onCancel: () => void;
   onImport: (data: ImportedConfigData, mode: 'core' | 'full') => void;
-  /** 'omo' for Oh My OpenCode, 'omos' for Oh My OpenCode Slim */
+  /** 'omo' for Oh My OpenAgent, 'omos' for Oh My OpenCode Slim */
   variant: 'omo' | 'omos';
 }
 
@@ -49,47 +46,17 @@ const ImportJsonConfigModal: React.FC<ImportJsonConfigModalProps> = ({
       return;
     }
 
-    let obj: unknown;
     try {
-      obj = JSON5.parse(raw);
+      const nextParsed = parseImportedConfigText(raw, variant);
+      if (!nextParsed) {
+        message.warning(t('opencode.ohMyOpenCode.importFromJsonEmpty'));
+        return;
+      }
+
+      setParsed(nextParsed);
     } catch {
       message.error(t('opencode.ohMyOpenCode.importFromJsonInvalidFormat'));
-      return;
     }
-
-    if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
-      message.error(t('opencode.ohMyOpenCode.importFromJsonInvalidFormat'));
-      return;
-    }
-
-    const config = obj as Record<string, unknown>;
-
-    const agents = (typeof config.agents === 'object' && config.agents !== null && !Array.isArray(config.agents))
-      ? config.agents as Record<string, Record<string, unknown>>
-      : undefined;
-
-    const categories = (typeof config.categories === 'object' && config.categories !== null && !Array.isArray(config.categories))
-      ? config.categories as Record<string, Record<string, unknown>>
-      : undefined;
-
-    // Collect other fields (everything except agents, categories, $schema)
-    const otherFields: Record<string, unknown> = {};
-    Object.entries(config).forEach(([key, value]) => {
-      if (key !== 'agents' && key !== 'categories' && key !== '$schema') {
-        otherFields[key] = value;
-      }
-    });
-
-    if (!agents && !categories) {
-      message.warning(t('opencode.ohMyOpenCode.importFromJsonEmpty'));
-      return;
-    }
-
-    setParsed({
-      agents,
-      categories,
-      otherFields: Object.keys(otherFields).length > 0 ? otherFields : undefined,
-    });
   };
 
   const handleImport = (mode: 'core' | 'full') => {
@@ -107,6 +74,25 @@ const ImportJsonConfigModal: React.FC<ImportJsonConfigModalProps> = ({
   const agentCount = parsed?.agents ? Object.keys(parsed.agents).length : 0;
   const categoryCount = parsed?.categories ? Object.keys(parsed.categories).length : 0;
   const otherFieldCount = parsed?.otherFields ? Object.keys(parsed.otherFields).length : 0;
+  const jsonPlaceholder = variant === 'omo'
+    ? `{
+  "agents": {
+    "Coder": { "model": "..." },
+    "Architect": { "model": "..." }
+  },
+  "categories": {
+    "coding": { "model": "..." }
+  }
+}`
+    : `{
+  "preset": "openai",
+  "presets": {
+    "openai": {
+      "orchestrator": { "model": "..." },
+      "oracle": { "model": "..." }
+    }
+  }
+}`;
 
   return (
     <Modal
@@ -170,15 +156,7 @@ const ImportJsonConfigModal: React.FC<ImportJsonConfigModalProps> = ({
         maxHeight={500}
         resizable
         mode="text"
-        placeholder={`{
-  "agents": {
-    "Coder": { "model": "..." },
-    "Architect": { "model": "..." }
-  }${variant === 'omo' ? `,
-  "categories": {
-    "coding": { "model": "..." }
-  }` : ''}
-}`}
+        placeholder={jsonPlaceholder}
       />
 
       {parsed && (

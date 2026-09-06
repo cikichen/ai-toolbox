@@ -4,17 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+      - '!v*-beta*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release tag (default: <branch>_beta, e.g. v1.2.3)'
-        required: false
+        description: 'Beta release tag, e.g. v1.2.3-beta1'
+        required: true
         type: string
 
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: short
-  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.version || format('{0}_beta', github.ref_name) }}
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 
 jobs:
   create-release:
@@ -27,6 +28,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate manual beta tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta[0-9]+$ ]]; then
+            echo "::error::Manual release only accepts beta tags like v1.2.3-beta1"
+            exit 1
+          fi
+          echo "Manual beta release tag validated: $RELEASE_TAG"
 
       - name: Validate version consistency
         if: github.event_name == 'push' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, 'beta')
@@ -56,7 +68,49 @@ jobs:
 
             ⚠️ Mac安装提示：`"应用程序"已损坏` 解决方法：`xattr -cr /Applications/AI\ Toolbox.app`
           draft: true
-          prerelease: false
+          # Manual beta builds should be Pre-release; formal tag pushes stay as normal releases.
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+
+  test:
+    name: Run Full Test Suite
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path tauri/Cargo.toml
+
+      - name: Run TypeScript type check
+        run: pnpm exec tsc --noEmit
+
+      - name: Run frontend tests
+        run: pnpm test
 
   build:
     needs: create-release
@@ -77,7 +131,7 @@ jobs:
             bundle: dmg,app
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            bundle: deb,appimage
+            bundle: deb,appimage,rpm
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -94,12 +148,6 @@ jobs:
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './tauri -> target'
-          shared-key: ${{ matrix.target }}
-
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
@@ -107,12 +155,11 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'pnpm'
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Update models.json from models.dev
+      - name: Update models.dev.json from models.dev
         run: node scripts/update-models.mjs
         continue-on-error: true
 
@@ -125,6 +172,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             librsvg2-dev \
             patchelf \
+            rpm \
             libssl-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev
@@ -175,6 +223,15 @@ jobs:
           fi
           echo "✅ Tauri signing key prepared"
 
+      - name: Verify Rust and Tauri toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cargo
+          cargo --version
+          cargo metadata --manifest-path tauri/Cargo.toml --no-deps --format-version 1 >/dev/null
+          pnpm tauri --version
+
       - name: Build Tauri App
         uses: tauri-apps/tauri-action@v0
         env:
@@ -193,13 +250,13 @@ jobs:
         shell: bash
         run: |
           echo "Listing bundles in tauri/target..."
-          find tauri/target -maxdepth 4 -type f \( -name "*.msi" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.tar.gz" -o -name "*.sig" \) 2>/dev/null || true
+          find tauri/target -maxdepth 4 -type f \( -name "*.msi" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" -o -name "*.sig" \) 2>/dev/null || true
 
   update-homebrew-cask:
     name: Update Homebrew Cask
     runs-on: ubuntu-latest
-    needs: [create-release, build]
-    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.version, 'v')
+    needs: [create-release, build, test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, 'beta')
     permissions:
       contents: write
     steps:
@@ -301,23 +358,137 @@ jobs:
         run: |
           set -euo pipefail
 
-          if git diff --quiet -- Casks/ai-toolbox.rb; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Casks/ai-toolbox.rb
+
+          if git diff --cached --quiet -- Casks/ai-toolbox.rb; then
             echo "No cask changes detected, skip commit."
             exit 0
           fi
 
+          git commit -m "chore(cask): update ai-toolbox for ${RELEASE_TAG}"
+          git pull --rebase origin "${DEFAULT_BRANCH}"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+
+  update-scoop-bucket:
+    name: Update Scoop Bucket
+    # Runs after update-homebrew-cask so both manifest-update jobs never push
+    # to the default branch concurrently.
+    runs-on: ubuntu-latest
+    needs: [create-release, build, test, update-homebrew-cask]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, 'beta')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          mkdir -p dl
+          gh release download "$TAG" --dir dl --pattern '*-setup.exe' --repo "$GITHUB_REPOSITORY"
+          ls -la dl
+
+      - name: Generate Scoop manifest
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+
+          shopt -s nullglob
+          setup_exe=""
+          for file in dl/*-setup.exe; do
+            setup_exe="$file"
+          done
+          if [ -z "$setup_exe" ]; then
+            echo "❌ Failed to detect Windows NSIS setup exe asset" >&2
+            ls -la dl
+            exit 1
+          fi
+
+          EXE_NAME="$(basename "$setup_exe")"
+          EXE_SHA="$(sha256sum "$setup_exe" | awk '{print $1}')"
+          export VERSION REPO EXE_NAME EXE_SHA
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          repo = os.environ["REPO"]
+          exe_name = os.environ["EXE_NAME"]
+          exe_sha = os.environ["EXE_SHA"]
+
+          manifest = {
+              "version": version,
+              "description": "Desktop toolbox for managing AI coding assistant configurations",
+              "homepage": f"https://github.com/{repo}",
+              "license": "MIT",
+              "architecture": {
+                  "64bit": {
+                      "url": f"https://github.com/{repo}/releases/download/v{version}/{exe_name}#/dl.exe",
+                      "hash": f"sha256:{exe_sha}",
+                  }
+              },
+              "installer": {
+                  "script": [
+                      "# Tauri NSIS installer (currentUser). /S = silent, /D = install dir.",
+                      "# /D must be the LAST switch and unquoted (NSIS requirement).",
+                      'Start-Process -Wait -FilePath "$dir\\dl.exe" -ArgumentList \'/S\', "/D=$dir"',
+                      "# Scoop only auto-removes the installer for installer.file/args, not for script hooks.",
+                      'Remove-Item "$dir\\dl.exe" -Force -ErrorAction SilentlyContinue',
+                  ]
+              },
+              "uninstaller": {
+                  "script": [
+                      'if (Test-Path "$dir\\uninstall.exe") { Start-Process -Wait -FilePath "$dir\\uninstall.exe" -ArgumentList \'/S\' }'
+                  ]
+              },
+              "shortcuts": [["ai-toolbox.exe", "AI Toolbox"]],
+          }
+
+          Path("bucket/ai-toolbox.json").write_text(
+              json.dumps(manifest, indent=4) + "\n", encoding="utf-8"
+          )
+          PY
+
+          echo "Generated bucket/ai-toolbox.json:" && cat bucket/ai-toolbox.json
+
+      - name: Commit and push bucket update
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          git add bucket/ai-toolbox.json
+
+          if git diff --cached --quiet -- bucket/ai-toolbox.json; then
+            echo "No bucket changes detected, skip commit."
+            exit 0
+          fi
+
+          git commit -m "chore(scoop): update ai-toolbox for ${RELEASE_TAG}"
           git pull --rebase origin "${DEFAULT_BRANCH}"
-          git add Casks/ai-toolbox.rb
-          git commit -m "chore(cask): update ai-toolbox for ${RELEASE_TAG}"
           git push origin "HEAD:${DEFAULT_BRANCH}"
 
   assemble-latest-json:
     name: Assemble latest.json
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, test]
     permissions:
       contents: write
     steps:

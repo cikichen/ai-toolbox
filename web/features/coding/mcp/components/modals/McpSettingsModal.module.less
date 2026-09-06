@@ -25,6 +25,23 @@
   flex: 1;
 }
 
+.selectControl {
+  width: min(220px, 100%);
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+
+  &:focus {
+    border-color: var(--color-border-secondary);
+  }
+}
+
 .hint {
   font-size: 12px;
   color: var(--color-text-tertiary);
@@ -41,6 +58,24 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+.toolItemLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inlineOption {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.optionLabel {
+  color: var(--color-text-primary);
+  font-size: 13px;
 }
 
 .footer {

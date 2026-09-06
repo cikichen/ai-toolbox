@@ -5,12 +5,16 @@
  */
 
 import React, { useEffect } from 'react';
-import { Modal, Form, Input, Select, Switch, Space, Typography, Divider, Button, Modal as AntdModal } from 'antd';
+import { Modal, Form, Input, Select, Switch, Divider, Button, Modal as AntdModal } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { wslAddFileMapping, wslUpdateFileMapping } from '@/services/wslSyncApi';
+import {
+  invalidCleanupPaths,
+  normalizeCleanupPaths,
+  supportsCleanupPaths,
+} from '@/features/settings/utils/fileMappingCleanup';
+import { DEFAULT_SSH_DIRECTORY_EXCLUDES } from '@/types/sshsync';
 import type { FileMapping } from '@/types/wslsync';
-
-const { Text } = Typography;
 
 interface FileMappingModalProps {
   open: boolean;
@@ -57,16 +61,51 @@ const detectPathIssues = (windowsPath: string, wslPath: string): PathIssue => {
   };
 };
 
+const normalizeDirectoryExcludes = (values: unknown): string[] => {
+  const items = Array.isArray(values) ? values : [];
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+
+  for (const item of items) {
+    if (typeof item !== 'string') {
+      continue;
+    }
+    const name = item.trim().replace(/^[\\/]+|[\\/]+$/g, '').trim();
+    if (!name || name.includes('/') || name.includes('\\') || seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    normalized.push(name);
+  }
+
+  return normalized;
+};
+
 export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClose, mapping }) => {
   const { t } = useTranslation();
   const [form] = Form.useForm();
 
   const isEdit = mapping !== null;
 
+  const handleDirectoryModeChange = (checked: boolean) => {
+    if (!checked) {
+      return;
+    }
+
+    const currentExcludes = form.getFieldValue('directoryExcludes');
+    if (!Array.isArray(currentExcludes) || currentExcludes.length === 0) {
+      form.setFieldValue('directoryExcludes', [...DEFAULT_SSH_DIRECTORY_EXCLUDES]);
+    }
+  };
+
   useEffect(() => {
     if (open) {
       if (mapping && mapping.id) {
-        form.setFieldsValue(mapping);
+        form.setFieldsValue({
+          ...mapping,
+          directoryExcludes: mapping.directoryExcludes ?? [...DEFAULT_SSH_DIRECTORY_EXCLUDES],
+          cleanupPaths: mapping.cleanupPaths ?? [],
+        });
       } else {
         form.resetFields();
         form.setFieldsValue({
@@ -74,6 +113,8 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
           enabled: true,
           isPattern: false,
           isDirectory: false,
+          directoryExcludes: [...DEFAULT_SSH_DIRECTORY_EXCLUDES],
+          cleanupPaths: [],
         });
       }
     }
@@ -147,6 +188,17 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
       const newMapping: FileMapping = {
         ...values,
         id,
+        directoryExcludes: values.isDirectory
+          ? normalizeDirectoryExcludes(values.directoryExcludes)
+          : [],
+        cleanupPaths: supportsCleanupPaths({
+          isDirectory: values.isDirectory,
+          isPattern: values.isPattern,
+          targetPath: values.wslPath,
+          sourcePath: values.windowsPath,
+        })
+          ? normalizeCleanupPaths(values.cleanupPaths)
+          : [],
       };
 
       // Save to database (will trigger wsl-config-changed event to refresh UI)
@@ -190,7 +242,14 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
             <Select.Option value="opencode">OpenCode</Select.Option>
             <Select.Option value="claude">Claude Code</Select.Option>
             <Select.Option value="codex">Codex</Select.Option>
+            <Select.Option value="grok">Grok</Select.Option>
+            <Select.Option value="kimi">Kimi</Select.Option>
             <Select.Option value="openclaw">OpenClaw</Select.Option>
+            <Select.Option value="geminicli">Gemini</Select.Option>
+            <Select.Option value="pi">Pi</Select.Option>
+            <Select.Option value="oh_my_pi">omp</Select.Option>
+            <Select.Option value="hermes">Hermes</Select.Option>
+            <Select.Option value="dsh">dsh</Select.Option>
           </Select>
         </Form.Item>
 
@@ -198,12 +257,7 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
 
         <Form.Item
           name="windowsPath"
-          label={
-            <Space>
-              <Text>Windows</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>路径</Text>
-            </Space>
-          }
+          label={t('settings.wsl.windowsPath')}
           rules={[{ required: true, message: t('settings.wsl.windowsPathRequired') }]}
           extra={t('settings.wsl.windowsPathHint')}
         >
@@ -212,12 +266,7 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
 
         <Form.Item
           name="wslPath"
-          label={
-            <Space>
-              <Text>WSL</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>路径</Text>
-            </Space>
-          }
+          label={t('settings.wsl.wslPath')}
           rules={[{ required: true, message: t('settings.wsl.wslPathRequired') }]}
           extra={t('settings.wsl.wslPathHint')}
         >
@@ -228,12 +277,7 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
 
         <Form.Item
           name="enabled"
-          label={
-            <Space>
-              <Text>启用</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>同步</Text>
-            </Space>
-          }
+          label={t('settings.wsl.enableMapping')}
           valuePropName="checked"
         >
           <Switch />
@@ -241,12 +285,7 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
 
         <Form.Item
           name="isPattern"
-          label={
-            <Space>
-              <Text>模式</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>通配符</Text>
-            </Space>
-          }
+          label={t('settings.wsl.patternMode')}
           valuePropName="checked"
           extra={t('settings.wsl.patternModeHint')}
         >
@@ -255,16 +294,86 @@ export const FileMappingModal: React.FC<FileMappingModalProps> = ({ open, onClos
 
         <Form.Item
           name="isDirectory"
-          label={
-            <Space>
-              <Text>模式</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>目录</Text>
-            </Space>
-          }
+          label={t('settings.wsl.directoryMode')}
           valuePropName="checked"
-          extra="同步整个目录及其内容"
+          extra={t('settings.wsl.directoryModeHint')}
         >
-          <Switch />
+          <Switch onChange={handleDirectoryModeChange} />
+        </Form.Item>
+
+        <Form.Item
+          noStyle
+          shouldUpdate={(previousValues, currentValues) =>
+            previousValues.isDirectory !== currentValues.isDirectory
+          }
+        >
+          {({ getFieldValue }) => {
+            if (!getFieldValue('isDirectory')) {
+              return null;
+            }
+
+            return (
+              <Form.Item
+                name="directoryExcludes"
+                label={t('settings.wsl.directoryExcludes')}
+                extra={t('settings.wsl.directoryExcludesHint')}
+              >
+                <Select
+                  mode="tags"
+                  tokenSeparators={[',', '\n']}
+                  placeholder={t('settings.wsl.directoryExcludesPlaceholder')}
+                />
+              </Form.Item>
+            );
+          }}
+        </Form.Item>
+
+        <Form.Item
+          noStyle
+          shouldUpdate={(previousValues, currentValues) =>
+            previousValues.isDirectory !== currentValues.isDirectory ||
+            previousValues.isPattern !== currentValues.isPattern ||
+            previousValues.windowsPath !== currentValues.windowsPath ||
+            previousValues.wslPath !== currentValues.wslPath
+          }
+        >
+          {({ getFieldValue }) => {
+            if (!supportsCleanupPaths({
+              isDirectory: getFieldValue('isDirectory'),
+              isPattern: getFieldValue('isPattern'),
+              targetPath: getFieldValue('wslPath'),
+              sourcePath: getFieldValue('windowsPath'),
+            })) {
+              return null;
+            }
+
+            return (
+              <Form.Item
+                name="cleanupPaths"
+                label={t('settings.wsl.cleanupPaths')}
+                extra={t('settings.wsl.cleanupPathsHint')}
+                rules={[
+                  {
+                    validator: (_, value) => {
+                      const invalidPaths = invalidCleanupPaths(value);
+                      if (invalidPaths.length > 0) {
+                        return Promise.reject(
+                          new Error(t('settings.wsl.cleanupPathsInvalid', { path: invalidPaths[0] })),
+                        );
+                      }
+                      return Promise.resolve();
+                    },
+                  },
+                ]}
+              >
+                <Select
+                  mode="tags"
+                  tokenSeparators={[',', '\n']}
+                  placeholder={t('settings.wsl.cleanupPathsPlaceholder')}
+                />
+              </Form.Item>
+            );
+          }}
         </Form.Item>
       </Form>
     </Modal>

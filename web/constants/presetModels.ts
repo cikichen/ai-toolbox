@@ -1,5 +1,12 @@
+import type { OpenCodeModelVariant } from '@/types/opencode';
+
 /**
- * Preset models configuration for different AI SDK types
+ * Preset models configuration for different AI SDK types.
+ *
+ * The canonical data lives in tauri/resources/preset_models.json.
+ * On app startup the Rust backend loads the bundled defaults (or local
+ * cache) and populates PRESET_MODELS, then the frontend background-
+ * fetches the latest version from the remote repository.
  */
 
 export interface PresetModel {
@@ -8,988 +15,116 @@ export interface PresetModel {
   contextLimit?: number;
   outputLimit?: number;
   modalities?: { input: string[]; output: string[] };
+  cost?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    cache_read?: number;
+    cache_write?: number;
+  };
   attachment?: boolean;
   reasoning?: boolean;
   tool_call?: boolean;
   temperature?: boolean;
-  variants?: Record<string, unknown>;
+  variants?: Record<string, OpenCodeModelVariant>;
   options?: Record<string, unknown>;
 }
 
 /**
- * Preset models grouped by npm SDK type
+ * Remote URL for fetching the latest preset models JSON.
+ * Points to the raw file in the main branch of the repository.
  */
-export const PRESET_MODELS: Record<string, PresetModel[]> = {
-  '@ai-sdk/openai-compatible': [
-    {
-      id: 'MiniMax-M2.5',
-      name: 'Minimax M2.5',
-      contextLimit: 204800,
-      outputLimit: 131072,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'glm-5',
-      name: 'GLM 5',
-      contextLimit: 204800,
-      outputLimit: 131072,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'qwen3.5-plus',
-      name: 'Qwen3.5 Plus',
-      contextLimit: 1000000,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'kimi-k2.5',
-      name: 'Kimi K2.5',
-      contextLimit: 262144,
-      outputLimit: 262144,
-      modalities: { input: ['text', 'image', 'video'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      attachment: true,
-    },
-    {
-      id: 'MiniMax-M2.1',
-      name: 'Minimax M2.1',
-      contextLimit: 204800,
-      outputLimit: 131072,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'glm-4.7',
-      name: 'GLM 4.7',
-      contextLimit: 204800,
-      outputLimit: 131072,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'deepseek-chat',
-      name: 'DeepSeek Chat',
-      contextLimit: 128000,
-      outputLimit: 8192,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'deepseek-reasoner',
-      name: 'DeepSeek Reasoner',
-      contextLimit: 128000,
-      outputLimit: 128000,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      options: {
-        include: ['reasoning_content'],
-      },
-    },
-    {
-      id: 'gpt-5',
-      name: 'GPT-5',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-    },
-    {
-      id: 'gpt-5-mini',
-      name: 'GPT-5 Mini',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-    },
-    {
-      id: 'gpt-5-nano',
-      name: 'GPT-5 Nano',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-    },
-    {
-      id: 'openai/gpt-oss-120b',
-      name: 'GPT OSS 120B',
-      contextLimit: 128000,
-      outputLimit: 8192,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'openai/gpt-oss-20b',
-      name: 'GPT OSS 20B',
-      contextLimit: 131072,
-      outputLimit: 32768,
-      modalities: { input: ['text'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: false,
-    },
-    {
-      id: 'gemini-2.5-flash',
-      name: 'Gemini 2.5 Flash',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'audio', 'video', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'gemini-2.5-pro',
-      name: 'Gemini 2.5 Pro',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-  ],
-  '@ai-sdk/google': [
-    {
-      id: 'gemini-2.5-flash-lite',
-      name: 'Gemini 2.5 Flash Lite',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'pdf', 'video', 'audio'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        auto: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingBudget: -1,
-          },
-        },
-        'no-thinking': {
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-        },
-      },
-    },
-    {
-      id: 'gemini-3-flash-preview',
-      name: 'Gemini 3 Flash Preview',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'pdf', 'video', 'audio'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      attachment: false,
-      variants: {
-        high: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'high',
-          },
-        },
-        low: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'low',
-          },
-        },
-        medium: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'medium',
-          },
-        },
-      },
-    },
-    {
-      id: 'gemini-3-pro-preview',
-      name: 'Gemini 3 Pro Preview',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'pdf', 'video', 'audio'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      attachment: true,
-      variants: {
-        high: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'high',
-          },
-        },
-        low: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'low',
-          },
-        },
-      },
-    },
-    {
-      id: 'gemini-2.5-flash',
-      name: 'Gemini 2.5 Flash',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'audio', 'video', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        auto: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingBudget: -1,
-          },
-        },
-        'no-thinking': {
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-        },
-      },
-    },
-    {
-      id: 'gemini-2.5-pro',
-      name: 'Gemini 2.5 Pro',
-      contextLimit: 1048576,
-      outputLimit: 65536,
-      modalities: { input: ['text', 'image', 'audio', 'video', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'high',
-          },
-        },
-        low: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'low',
-          },
-        },
-        medium: {
-          thinkingConfig: {
-            includeThoughts: true,
-            thinkingLevel: 'medium',
-          },
-        },
-      },
-    },
-    {
-      id: 'gemini-2.5-flash-image',
-      name: 'Gemini 2.5 Flash Image',
-      contextLimit: 32768,
-      outputLimit: 32768,
-      modalities: { input: ['text', 'image'], output: ['text', 'image'] },
-      reasoning: true,
-      tool_call: false,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'gemini-2.0-flash',
-      name: 'Gemini 2.0 Flash',
-      contextLimit: 1048576,
-      outputLimit: 8192,
-      modalities: { input: ['text', 'image', 'audio', 'video', 'pdf'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'gemini-2.0-flash-lite',
-      name: 'Gemini 2.0 Flash Lite',
-      contextLimit: 1048576,
-      outputLimit: 8192,
-      modalities: { input: ['text', 'image', 'audio', 'video', 'pdf'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-  ],
-  '@ai-sdk/openai': [
-    {
-      id: 'gpt-5',
-      name: 'GPT-5',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'high',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'low',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.1',
-      name: 'GPT-5.1',
-      contextLimit: 400000,
-      outputLimit: 272000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'high',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'low',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.1-codex',
-      name: 'GPT-5.1 Codex',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      options: {
-        include: ['reasoning.encrypted_content'],
-        store: false,
-      },
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.1-codex-max',
-      name: 'GPT-5.1 Codex Max',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      options: {
-        include: ['reasoning.encrypted_content'],
-        store: false,
-      },
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        xhigh: {
-          reasoningEffort: 'xhigh',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.2',
-      name: 'GPT-5.2',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        xhigh: {
-          reasoningEffort: 'xhigh',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.2-codex',
-      name: 'GPT-5.2 Codex',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      options: {
-        include: ['reasoning.encrypted_content'],
-        store: false,
-      },
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        xhigh: {
-          reasoningEffort: 'xhigh',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.3-codex',
-      name: 'GPT-5.3 Codex',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      options: {
-        include: ['reasoning.encrypted_content'],
-        store: false,
-      },
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        xhigh: {
-          reasoningEffort: 'xhigh',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.4',
-      name: 'GPT-5.4',
-      contextLimit: 1000000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        xhigh: {
-          reasoningEffort: 'xhigh',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5-mini',
-      name: 'GPT-5 Mini',
-      contextLimit: 272000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'high',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'low',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5-nano',
-      name: 'GPT-5 Nano',
-      contextLimit: 400000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'high',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'low',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-5.3-codex-spark',
-      name: 'GPT-5.3 Codex Spark',
-      contextLimit: 128000,
-      outputLimit: 32000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: false,
-      attachment: true,
-      options: {
-        include: ['reasoning.encrypted_content'],
-        store: false,
-      },
-      variants: {
-        high: {
-          reasoningEffort: 'high',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        low: {
-          reasoningEffort: 'low',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-        medium: {
-          reasoningEffort: 'medium',
-          reasoningSummary: 'auto',
-          textVerbosity: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gpt-4.1',
-      name: 'GPT-4.1',
-      contextLimit: 1047576,
-      outputLimit: 32768,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'gpt-4.1-mini',
-      name: 'GPT-4.1 mini',
-      contextLimit: 1047576,
-      outputLimit: 32768,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'gpt-4.1-nano',
-      name: 'GPT-4.1 nano',
-      contextLimit: 1047576,
-      outputLimit: 32768,
-      modalities: { input: ['text', 'image'], output: ['text'] },
-      reasoning: false,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-  ],
-  '@ai-sdk/anthropic': [
-    {
-      id: 'claude-sonnet-4-5-20250929',
-      name: 'Claude Sonnet 4.5',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          effort: 'high',
-        },
-        low: {
-          effort: 'low',
-        },
-        medium: {
-          effort: 'medium',
-        },
-      },
-    },
-    {
-      id: 'claude-opus-4-5-20251101',
-      name: 'Claude Opus 4.5',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          thinking: {
-            budgetTokens: 18000,
-            type: 'enabled',
-          },
-        },
-        low: {
-          thinking: {
-            budgetTokens: 5000,
-            type: 'enabled',
-          },
-        },
-        medium: {
-          thinking: {
-            budgetTokens: 13000,
-            type: 'enabled',
-          },
-        },
-      },
-    },
-    {
-      id: 'claude-sonnet-4-6',
-      name: 'Claude Sonnet 4.6',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          effort: 'high',
-        },
-        low: {
-          effort: 'low',
-        },
-        medium: {
-          effort: 'medium',
-        },
-      },
-    },
-    {
-      id: 'claude-opus-4-6',
-      name: 'Claude Opus 4.6',
-      contextLimit: 200000,
-      outputLimit: 128000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          thinking: {
-            budgetTokens: 18000,
-            type: 'enabled',
-          },
-        },
-        low: {
-          thinking: {
-            budgetTokens: 5000,
-            type: 'enabled',
-          },
-        },
-        medium: {
-          thinking: {
-            budgetTokens: 13000,
-            type: 'enabled',
-          },
-        },
-      },
-    },
-    {
-      id: 'claude-haiku-4-5-20251001',
-      name: 'Claude Haiku 4.5',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-    },
-    {
-      id: 'gemini-claude-opus-4-5-thinking',
-      name: 'Antigravity - Claude Opus 4.5',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          effort: 'high',
-        },
-        low: {
-          effort: 'low',
-        },
-        medium: {
-          effort: 'medium',
-        },
-      },
-    },
-    {
-      id: 'gemini-claude-sonnet-4-5-thinking',
-      name: 'Antigravity - Claude Sonnet 4.5',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          thinking: {
-            budgetTokens: 18000,
-            type: 'enabled',
-          },
-        },
-        low: {
-          thinking: {
-            budgetTokens: 5000,
-            type: 'enabled',
-          },
-        },
-        medium: {
-          thinking: {
-            budgetTokens: 13000,
-            type: 'enabled',
-          },
-        },
-      },
-    },
-    {
-      id: 'claude-sonnet-4-0',
-      name: 'Claude Sonnet 4 (latest)',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          effort: 'high',
-        },
-        low: {
-          effort: 'low',
-        },
-        medium: {
-          effort: 'medium',
-        },
-      },
-    },
-    {
-      id: 'claude-opus-4-1',
-      name: 'Claude Opus 4.1 (latest)',
-      contextLimit: 200000,
-      outputLimit: 32000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          thinking: {
-            budgetTokens: 18000,
-            type: 'enabled',
-          },
-        },
-        low: {
-          thinking: {
-            budgetTokens: 5000,
-            type: 'enabled',
-          },
-        },
-        medium: {
-          thinking: {
-            budgetTokens: 13000,
-            type: 'enabled',
-          },
-        },
-      },
-    },
-    {
-      id: 'claude-3-7-sonnet-latest',
-      name: 'Claude Sonnet 3.7 (latest)',
-      contextLimit: 200000,
-      outputLimit: 64000,
-      modalities: { input: ['text', 'image', 'pdf'], output: ['text'] },
-      reasoning: true,
-      tool_call: true,
-      temperature: true,
-      attachment: true,
-      variants: {
-        high: {
-          effort: 'high',
-        },
-        low: {
-          effort: 'low',
-        },
-        medium: {
-          effort: 'medium',
-        },
-      },
-    },
-  ],
+export const PRESET_MODELS_REMOTE_URL =
+  'https://raw.githubusercontent.com/coulsontl/ai-toolbox/main/tauri/resources/preset_models.json';
+
+type PresetModelsListener = () => void;
+
+/**
+ * Preset models grouped by npm SDK type.
+ *
+ * Starts empty and is populated at startup from the Rust backend
+ * (bundled defaults or local cache), then updated from remote.
+ * Components that need reactive updates should subscribe to the
+ * version change exposed below.
+ */
+export const PRESET_MODELS: Record<string, PresetModel[]> = {};
+
+let presetModelsVersion = 0;
+const presetModelsListeners = new Set<PresetModelsListener>();
+
+export const getPresetModelsVersion = (): number => presetModelsVersion;
+
+export const subscribePresetModels = (listener: PresetModelsListener): (() => void) => {
+  presetModelsListeners.add(listener);
+  return () => {
+    presetModelsListeners.delete(listener);
+  };
+};
+
+const notifyPresetModelsUpdated = () => {
+  presetModelsVersion += 1;
+  presetModelsListeners.forEach((listener) => listener());
+};
+
+const normalizePresetModelId = (modelId: string): string => modelId.trim().toLowerCase();
+
+/**
+ * Find a preset model by exact model ID.
+ *
+ * Matching is provider-aware but not provider-limited:
+ * 1. Prefer the current provider's npm group first.
+ * 2. Fall back to every preset group if the preferred group has no match.
+ */
+export const findPresetModelById = (
+  modelId: string,
+  preferredNpm?: string,
+): PresetModel | undefined => {
+  const normalizedModelId = normalizePresetModelId(modelId);
+  if (!normalizedModelId) {
+    return undefined;
+  }
+
+  const findInModels = (models: PresetModel[] = []) =>
+    models.find((presetModel) => normalizePresetModelId(presetModel.id) === normalizedModelId);
+
+  if (preferredNpm) {
+    const preferredMatch = findInModels(PRESET_MODELS[preferredNpm] || []);
+    if (preferredMatch) {
+      return preferredMatch;
+    }
+  }
+
+  for (const [npmKey, models] of Object.entries(PRESET_MODELS)) {
+    if (preferredNpm && npmKey === preferredNpm) {
+      continue;
+    }
+    const matchedPresetModel = findInModels(models);
+    if (matchedPresetModel) {
+      return matchedPresetModel;
+    }
+  }
+
+  return undefined;
+};
+
+/**
+ * Replace the contents of PRESET_MODELS with `models`.
+ * The object reference stays the same so existing imports remain valid.
+ *
+ * If `models` is empty or invalid the call is a no-op so that
+ * existing data is never accidentally wiped out.
+ */
+export const updatePresetModels = (models: Record<string, PresetModel[]>) => {
+  // Guard: never replace with empty / invalid data
+  if (!models || typeof models !== 'object' || Object.keys(models).length === 0) {
+    return;
+  }
+  // Remove old keys
+  for (const key of Object.keys(PRESET_MODELS)) {
+    delete PRESET_MODELS[key];
+  }
+  // Copy new keys
+  Object.assign(PRESET_MODELS, models);
+  notifyPresetModelsUpdated();
 };

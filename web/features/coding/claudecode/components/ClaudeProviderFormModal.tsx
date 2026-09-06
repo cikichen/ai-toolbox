@@ -1,13 +1,124 @@
 import React from 'react';
-import { Modal, Tabs, Form, Input, Select, Space, Button, Alert, message, AutoComplete, Radio } from 'antd';
-import { EyeInvisibleOutlined, EyeOutlined, CloudDownloadOutlined } from '@ant-design/icons';
+import { Modal, Form, Input, Select, Space, Button, Alert, message, AutoComplete, Checkbox, Dropdown, Tooltip } from 'antd';
+import { EyeInvisibleOutlined, EyeOutlined, CloudDownloadOutlined, DownOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { Settings2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
+import JsonEditor from '@/components/common/JsonEditor';
 import { useAppStore } from '@/stores';
-import type { ClaudeCodeProvider, ClaudeProviderFormValues, ClaudeSettingsConfig } from '@/types/claudecode';
-import { listFavoriteProviders } from '@/services/opencodeApi';
+import type {
+  ClaudeApiFormat,
+  ClaudeCodeProvider,
+  ClaudeProviderFormValues,
+  ClaudeSettingsMergeStrategy,
+  ClaudeSettingsConfig,
+  GatewayProviderMeta,
+} from '@/types/claudecode';
+import { DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY } from '@/types/claudecode';
+import { isJsonObject } from '@/utils/json';
+import { readCurrentOpenCodeProviders } from '@/services/opencodeApi';
+import BillingConfigCollapse from '@/features/coding/shared/providerBilling/BillingConfigCollapse';
+import ProviderConfigCollapse from '@/features/coding/shared/providerConfig/ProviderConfigCollapse';
+import ProviderNotesCollapse from '@/features/coding/shared/providerConfig/ProviderNotesCollapse';
+import {
+  getBillingConfigFromMeta,
+  mergeBillingConfigIntoMeta,
+} from '@/features/coding/shared/providerBilling/billingConfigUtils';
+import {
+  getCustomHeadersFromMeta,
+  mergeCustomHeadersIntoMeta,
+} from '@/features/coding/shared/providerHeaders/customHeadersUtils';
+import CustomHeadersCollapse from '@/features/coding/shared/providerHeaders/CustomHeadersCollapse';
+import {
+  getModelRewritesFromMeta,
+  mergeModelRewritesIntoMeta,
+  type ModelRewritesState,
+} from '@/features/coding/shared/providerModelRewrites/modelRewritesUtils';
+import ModelRewritesCollapse from '@/features/coding/shared/providerModelRewrites/ModelRewritesCollapse';
+import {
+  CUSTOM_PROVIDER_ENDPOINT_KEY,
+  CUSTOM_PROVIDER_PROFILE_ID,
+  findGatewayProviderEndpoint,
+  getGatewayProviderProfilesForTool,
+  getGatewayProviderProfilesVersion,
+  inferGatewayProviderEndpointSelection,
+  mergeGatewayProfileReferenceIntoMeta,
+  parseGatewayProviderEndpointKey,
+  subscribeGatewayProviderProfiles,
+  toGatewayProviderEndpointKey,
+  toGatewayProviderProfileReference,
+  type GatewayProviderProfileReference,
+} from '@/features/coding/shared/gateway/providerProfiles';
+import {
+  getClaudeProviderModelConfig,
+  hasClaudeOneMMarker,
+  setClaudeOneMMarker,
+  stripClaudeOneMMarker,
+  type ClaudeModelRole,
+} from '../utils/claudeModelConfig';
+import styles from './ClaudeProviderFormModal.module.less';
 
-const { TextArea } = Input;
+function toExtraSettingsEditorValue(rawConfig?: string): unknown {
+  if (!rawConfig?.trim()) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawConfig) as unknown;
+    if (!isJsonObject(parsed)) {
+      return rawConfig;
+    }
+    return parsed;
+  } catch {
+    return rawConfig;
+  }
+}
+
+function parseExtraSettingsConfig(rawConfig?: string): string | undefined {
+  const trimmedConfig = rawConfig?.trim();
+  if (!trimmedConfig) {
+    return undefined;
+  }
+
+  const parsed = JSON.parse(trimmedConfig) as unknown;
+  if (!isJsonObject(parsed)) {
+    throw new Error('Expected JSON object');
+  }
+
+  return JSON.stringify(parsed);
+}
+
+function hasNonEmptyExtraSettingsObject(rawConfig?: string): boolean {
+  const trimmedConfig = rawConfig?.trim();
+  if (!trimmedConfig) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmedConfig) as unknown;
+    return isJsonObject(parsed) && Object.keys(parsed).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+const DEFAULT_CLAUDE_API_FORMAT: ClaudeApiFormat = 'anthropic';
+const OFFICIAL_PROVIDER_ENDPOINT_KEY = '__official__:';
+
+function normalizeClaudeApiFormat(value?: string): ClaudeApiFormat {
+  if (value === 'openai_chat' || value === 'openai_responses' || value === 'gemini_native') {
+    return value;
+  }
+  return DEFAULT_CLAUDE_API_FORMAT;
+}
+
+function mergeGatewayMetaIntoProviderMeta(
+  meta: GatewayProviderMeta | undefined,
+  gatewayProfile: GatewayProviderProfileReference | undefined,
+  apiFormat: ClaudeApiFormat | undefined,
+): GatewayProviderMeta | undefined {
+  return mergeGatewayProfileReferenceIntoMeta(meta, gatewayProfile, apiFormat);
+}
 
 // OpenCode 供应商展示类型
 interface OpenCodeProviderDisplay {
@@ -22,7 +133,7 @@ interface ClaudeProviderFormModalProps {
   open: boolean;
   provider?: ClaudeCodeProvider | null;
   isCopy?: boolean;
-  defaultTab?: 'manual' | 'import';
+  mode?: 'manual' | 'import';
   onCancel: () => void;
   onSubmit: (values: ClaudeProviderFormValues) => Promise<void>;
 }
@@ -39,11 +150,21 @@ interface FetchModelsResponse {
   total: number;
 }
 
+interface ModelRoleRow {
+  role: ClaudeModelRole;
+  label: string;
+  model: string;
+  displayName: string;
+  modelField: 'sonnetModel' | 'opusModel' | 'fableModel' | 'haikuModel';
+  displayNameField: 'sonnetModelName' | 'opusModelName' | 'fableModelName' | 'haikuModelName';
+  supportsOneM: boolean;
+}
+
 const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
   open,
   provider,
   isCopy = false,
-  defaultTab = 'manual',
+  mode = 'manual',
   onCancel,
   onSubmit,
 }) => {
@@ -52,10 +173,11 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
   const [form] = Form.useForm();
   const [loading, setLoading] = React.useState(false);
   const [showApiKey, setShowApiKey] = React.useState(false);
-  const [activeTab, setActiveTab] = React.useState<'manual' | 'import'>(defaultTab);
 
   const labelCol = { span: language === 'zh-CN' ? 4 : 6 };
   const wrapperCol = { span: 20 };
+  const sectionWrapperCol = { span: 24 };
+  const notesCollapseResetKey = `${open ? 'open' : 'closed'}:${mode}:${provider?.id ?? 'new'}:${isCopy ? 'copy' : 'normal'}`;
 
   // 从 OpenCode 导入相关状态
   const [openCodeProviders, setOpenCodeProviders] = React.useState<OpenCodeProviderDisplay[]>([]);
@@ -67,22 +189,209 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
   const [fetchedModels, setFetchedModels] = React.useState<FetchedModel[]>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [fetchApiType, setFetchApiType] = React.useState<'openai_compat' | 'native'>('native');
-  // 当前表单的 baseUrl（用于匹配供应商）
+  // 当前表单的 baseUrl（仅用于辅助匹配 OpenCode 导入候选）
   const [currentBaseUrl, setCurrentBaseUrl] = React.useState<string>('');
+  const [providerCategory, setProviderCategory] = React.useState<'official' | 'custom'>('custom');
+  const [extraSettingsValue, setExtraSettingsValue] = React.useState<unknown>(null);
+  const [extraSettingsError, setExtraSettingsError] = React.useState<string>();
+  const [advancedSettingsExpanded, setAdvancedSettingsExpanded] = React.useState(false);
+  const [billingConfig, setBillingConfig] = React.useState(() => getBillingConfigFromMeta(provider?.meta));
+  const [customHeaders, setCustomHeaders] = React.useState(() => getCustomHeadersFromMeta(provider?.meta));
+  const [modelRewrites, setModelRewrites] = React.useState<ModelRewritesState>(() => getModelRewritesFromMeta(provider?.meta));
+  const gatewayProviderProfilesVersion = React.useSyncExternalStore(
+    subscribeGatewayProviderProfiles,
+    getGatewayProviderProfilesVersion,
+    getGatewayProviderProfilesVersion,
+  );
+  const extraSettingsRawRef = React.useRef('');
+  const apiFormatOptions = React.useMemo(() => [
+    {
+      value: 'anthropic',
+      label: t('claudecode.provider.apiFormatAnthropic'),
+    },
+    {
+      value: 'openai_chat',
+      label: t('claudecode.provider.apiFormatOpenAIChat'),
+    },
+    {
+      value: 'openai_responses',
+      label: t('claudecode.provider.apiFormatOpenAIResponses'),
+    },
+    {
+      value: 'gemini_native',
+      label: t('claudecode.provider.apiFormatGeminiNative'),
+    },
+  ], [t]);
+  const settingsMergeStrategyOptions = React.useMemo(() => [
+    {
+      value: 'provider_overrides_common',
+      label: t('claudecode.provider.mergeStrategyProviderOverridesCommon'),
+    },
+    {
+      value: 'common_overrides_provider',
+      label: t('claudecode.provider.mergeStrategyCommonOverridesProvider'),
+    },
+    {
+      value: 'merge_common_and_provider',
+      label: t('claudecode.provider.mergeStrategyMergeCommonAndProvider'),
+    },
+  ], [t]);
 
   const isEdit = !!provider && !isCopy;
+  const canSelectProviderCategory = !provider && mode === 'manual';
+  const isOfficialMode = providerCategory === 'official';
+  const watchOptions = React.useMemo(() => ({ form, preserve: true }), [form]);
+  const selectedProviderProfileId = Form.useWatch('providerProfileId', watchOptions) as string | undefined;
+  const selectedSettingsMergeStrategy = (Form.useWatch(
+    'extraSettingsMergeStrategy',
+    watchOptions,
+  ) as ClaudeSettingsMergeStrategy | undefined) || DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY;
+  const selectedIsCustomProviderProfile = (selectedProviderProfileId || CUSTOM_PROVIDER_PROFILE_ID) === CUSTOM_PROVIDER_PROFILE_ID;
+  const fallbackModel = Form.useWatch('model', watchOptions) || '';
+  const sonnetModel = Form.useWatch('sonnetModel', watchOptions) || '';
+  const sonnetModelName = Form.useWatch('sonnetModelName', watchOptions) || '';
+  const opusModel = Form.useWatch('opusModel', watchOptions) || '';
+  const opusModelName = Form.useWatch('opusModelName', watchOptions) || '';
+  const fableModel = Form.useWatch('fableModel', watchOptions) || '';
+  const fableModelName = Form.useWatch('fableModelName', watchOptions) || '';
+  const haikuModel = Form.useWatch('haikuModel', watchOptions) || '';
+  const haikuModelName = Form.useWatch('haikuModelName', watchOptions) || '';
 
-  // 当 Modal 打开时，根据 defaultTab 设置 activeTab
-  React.useEffect(() => {
-    setActiveTab(defaultTab);
-  }, [defaultTab]);
+  const modelRoleRows: ModelRoleRow[] = React.useMemo(() => [
+    {
+      role: 'sonnet',
+      label: t('claudecode.model.roleSonnet'),
+      model: sonnetModel,
+      displayName: sonnetModelName,
+      modelField: 'sonnetModel',
+      displayNameField: 'sonnetModelName',
+      supportsOneM: true,
+    },
+    {
+      role: 'opus',
+      label: t('claudecode.model.roleOpus'),
+      model: opusModel,
+      displayName: opusModelName,
+      modelField: 'opusModel',
+      displayNameField: 'opusModelName',
+      supportsOneM: true,
+    },
+    {
+      role: 'fable',
+      label: t('claudecode.model.roleFable'),
+      model: fableModel,
+      displayName: fableModelName,
+      modelField: 'fableModel',
+      displayNameField: 'fableModelName',
+      supportsOneM: true,
+    },
+    {
+      role: 'haiku',
+      label: t('claudecode.model.roleHaiku'),
+      model: haikuModel,
+      displayName: haikuModelName,
+      modelField: 'haikuModel',
+      displayNameField: 'haikuModelName',
+      supportsOneM: true,
+    },
+  ], [fableModel, fableModelName, haikuModel, haikuModelName, opusModel, opusModelName, sonnetModel, sonnetModelName, t]);
+
+  const extraSettingsHintKey = React.useMemo(() => {
+    switch (selectedSettingsMergeStrategy) {
+      case 'common_overrides_provider':
+        return 'claudecode.provider.extraSettingsHintCommonOverridesProvider';
+      case 'merge_common_and_provider':
+        return 'claudecode.provider.extraSettingsHintMergeCommonAndProvider';
+      case 'provider_overrides_common':
+      default:
+        return 'claudecode.provider.extraSettingsHintProviderOverridesCommon';
+    }
+  }, [selectedSettingsMergeStrategy]);
+
+  const providerEndpointOptions = React.useMemo(() => {
+    if (isOfficialMode && !canSelectProviderCategory) {
+      return [{
+        value: OFFICIAL_PROVIDER_ENDPOINT_KEY,
+        label: t('claudecode.provider.providerProfileOfficial'),
+      }];
+    }
+
+    return [
+      {
+      value: CUSTOM_PROVIDER_ENDPOINT_KEY,
+      label: t('claudecode.provider.providerProfileCustom'),
+      },
+      ...(canSelectProviderCategory ? [{
+        value: OFFICIAL_PROVIDER_ENDPOINT_KEY,
+        label: t('claudecode.provider.providerProfileOfficial'),
+      }] : []),
+      ...getGatewayProviderProfilesForTool('claude').flatMap((profile) => {
+        const endpoints = profile.tools.claude?.endpoints || [];
+        return endpoints.map((endpoint) => ({
+          value: toGatewayProviderEndpointKey(profile.id, endpoint.id),
+          label: `${profile.label} / ${endpoint.label}`,
+        }));
+      }),
+    ];
+  }, [canSelectProviderCategory, gatewayProviderProfilesVersion, isOfficialMode, t]);
+
+  const getExtraSettingsErrorMessage = React.useCallback((error: unknown) => {
+    if (error instanceof SyntaxError) {
+      return t('claudecode.provider.extraSettingsInvalidJsonDetailed', { message: error.message });
+    }
+    if (error instanceof Error && error.message === 'Expected JSON object') {
+      return t('claudecode.provider.extraSettingsInvalidObject');
+    }
+    const messageText = error instanceof Error ? error.message : String(error);
+    return t('claudecode.provider.extraSettingsInvalidJsonDetailed', { message: messageText });
+  }, [t]);
+
+  const validateExtraSettingsEditorValue = React.useCallback((): string | undefined => {
+    try {
+      setExtraSettingsError(undefined);
+      return parseExtraSettingsConfig(extraSettingsRawRef.current);
+    } catch (error) {
+      setExtraSettingsError(getExtraSettingsErrorMessage(error));
+      return undefined;
+    }
+  }, [getExtraSettingsErrorMessage]);
+
+  const handleExtraSettingsChange = React.useCallback((_value: unknown, isValid: boolean) => {
+    if (!isValid) {
+      setExtraSettingsError(t('claudecode.provider.extraSettingsInvalidJson'));
+      return;
+    }
+    validateExtraSettingsEditorValue();
+  }, [t, validateExtraSettingsEditorValue]);
+
+  const handleExtraSettingsBlur = React.useCallback((_value: unknown, isValid: boolean) => {
+    if (!isValid) {
+      try {
+        parseExtraSettingsConfig(extraSettingsRawRef.current);
+      } catch (error) {
+        setExtraSettingsError(getExtraSettingsErrorMessage(error));
+      }
+      return;
+    }
+    const parsedExtraSettingsConfig = validateExtraSettingsEditorValue();
+    if (parsedExtraSettingsConfig === undefined) {
+      setExtraSettingsValue(null);
+      return;
+    }
+    setExtraSettingsValue(JSON.parse(parsedExtraSettingsConfig) as unknown);
+  }, [getExtraSettingsErrorMessage, validateExtraSettingsEditorValue]);
+
+  const handleExtraSettingsRawChange = React.useCallback((value: string) => {
+    extraSettingsRawRef.current = value;
+    setExtraSettingsValue(value);
+  }, []);
 
   // 加载 OpenCode 中的供应商列表
   React.useEffect(() => {
-    if (activeTab === 'import' || isEdit) {
+    if (mode === 'import' || isEdit) {
       loadOpenCodeProviders();
     }
-  }, [activeTab, isEdit]);
+  }, [mode, isEdit]);
 
   // 初始化表单（组件挂载时执行一次）
   React.useEffect(() => {
@@ -95,47 +404,150 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
       }
 
       const baseUrl = settingsConfig.env?.ANTHROPIC_BASE_URL || '';
-      setCurrentBaseUrl(baseUrl);
+      const modelConfig = getClaudeProviderModelConfig(settingsConfig);
+      const nextProviderCategory = provider.category === 'official' ? 'official' : 'custom';
+      const providerEndpointSelection = nextProviderCategory === 'official'
+        ? {
+            providerProfileId: CUSTOM_PROVIDER_PROFILE_ID,
+            providerEndpointId: undefined,
+          }
+        : inferGatewayProviderEndpointSelection({
+            tool: 'claude',
+            meta: provider.meta,
+            providerType: provider.meta?.providerType,
+            apiFormat: provider.meta?.apiFormat,
+          });
+      const providerEndpoint = providerEndpointSelection.providerProfileId === CUSTOM_PROVIDER_PROFILE_ID
+        ? undefined
+        : findGatewayProviderEndpoint(
+            providerEndpointSelection.providerProfileId,
+            'claude',
+            providerEndpointSelection.providerEndpointId,
+          );
+      const selectedBaseUrl = baseUrl || providerEndpoint?.baseUrl || '';
+      const selectedApiFormat = providerEndpoint
+        ? normalizeClaudeApiFormat(providerEndpoint.apiFormat)
+        : normalizeClaudeApiFormat(provider.meta?.apiFormat);
+      setProviderCategory(nextProviderCategory);
+      setCurrentBaseUrl(selectedBaseUrl);
+      setBillingConfig(getBillingConfigFromMeta(provider.meta));
+      setCustomHeaders(getCustomHeadersFromMeta(provider.meta));
+      setModelRewrites(getModelRewritesFromMeta(provider.meta));
+      const nextExtraSettingsRaw = nextProviderCategory === 'official'
+        ? ''
+        : provider.extraSettingsConfig || '';
+      setExtraSettingsValue(toExtraSettingsEditorValue(nextExtraSettingsRaw));
+      setExtraSettingsError(undefined);
+      setAdvancedSettingsExpanded(
+        nextProviderCategory !== 'official' &&
+        (
+          hasNonEmptyExtraSettingsObject(nextExtraSettingsRaw) ||
+          provider.extraSettingsMergeStrategy !== DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY
+        ),
+      );
+      extraSettingsRawRef.current = nextExtraSettingsRaw;
 
       form.setFieldsValue({
+        category: nextProviderCategory,
         name: provider.name,
-        baseUrl,
+        providerEndpointKey: nextProviderCategory === 'official'
+          ? OFFICIAL_PROVIDER_ENDPOINT_KEY
+          : toGatewayProviderEndpointKey(
+              providerEndpointSelection.providerProfileId,
+              providerEndpointSelection.providerEndpointId,
+            ),
+        providerProfileId: providerEndpointSelection.providerProfileId,
+        providerEndpointId: providerEndpointSelection.providerEndpointId,
+        baseUrl: selectedBaseUrl,
         apiKey: settingsConfig.env?.ANTHROPIC_AUTH_TOKEN || settingsConfig.env?.ANTHROPIC_API_KEY,
-        model: settingsConfig.model,
-        haikuModel: settingsConfig.haikuModel,
-        sonnetModel: settingsConfig.sonnetModel,
-        opusModel: settingsConfig.opusModel,
+        apiFormat: selectedApiFormat,
+        model: modelConfig.fallbackModel,
+        haikuModel: modelConfig.roles.haiku.model,
+        haikuModelName: modelConfig.roles.haiku.displayName,
+        sonnetModel: modelConfig.roles.sonnet.model,
+        sonnetModelName: modelConfig.roles.sonnet.displayName,
+        opusModel: modelConfig.roles.opus.model,
+        opusModelName: modelConfig.roles.opus.displayName,
+        fableModel: modelConfig.roles.fable.model,
+        fableModelName: modelConfig.roles.fable.displayName,
+        extraSettingsMergeStrategy:
+          provider.extraSettingsMergeStrategy || DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY,
         notes: provider.notes,
+      });
+    } else {
+      form.resetFields();
+      setProviderCategory('custom');
+      setCurrentBaseUrl('');
+      setBillingConfig(getBillingConfigFromMeta(undefined));
+      setCustomHeaders(getCustomHeadersFromMeta(undefined));
+      setModelRewrites(getModelRewritesFromMeta(undefined));
+      setExtraSettingsValue(null);
+      setExtraSettingsError(undefined);
+      setAdvancedSettingsExpanded(false);
+      extraSettingsRawRef.current = '';
+      form.setFieldsValue({
+        category: 'custom',
+        providerEndpointKey: CUSTOM_PROVIDER_ENDPOINT_KEY,
+        providerProfileId: CUSTOM_PROVIDER_PROFILE_ID,
+        providerEndpointId: undefined,
+        apiFormat: DEFAULT_CLAUDE_API_FORMAT,
+        extraSettingsMergeStrategy: DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY,
       });
     }
   }, [provider, form]);
 
+  React.useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    if (!provider && mode === 'manual') {
+      setProviderCategory('custom');
+      setCurrentBaseUrl('');
+      setBillingConfig(getBillingConfigFromMeta(undefined));
+      setCustomHeaders(getCustomHeadersFromMeta(undefined));
+      setModelRewrites(getModelRewritesFromMeta(undefined));
+      setExtraSettingsValue(null);
+      setExtraSettingsError(undefined);
+      setAdvancedSettingsExpanded(false);
+      extraSettingsRawRef.current = '';
+      form.setFieldsValue({
+        category: 'custom',
+        providerEndpointKey: CUSTOM_PROVIDER_ENDPOINT_KEY,
+        providerProfileId: CUSTOM_PROVIDER_PROFILE_ID,
+        providerEndpointId: undefined,
+        apiFormat: DEFAULT_CLAUDE_API_FORMAT,
+        extraSettingsMergeStrategy: DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY,
+      });
+    }
+  }, [form, mode, open, provider]);
+
   const loadOpenCodeProviders = async () => {
     setLoadingProviders(true);
     try {
-      const favoriteProviders = await listFavoriteProviders();
+      const providers = await readCurrentOpenCodeProviders();
 
-      // 筛选 npm === '@ai-sdk/anthropic' 的供应商
-      const anthropicProviders: OpenCodeProviderDisplay[] = favoriteProviders
-        .filter((fp) => fp.providerConfig.npm === '@ai-sdk/anthropic')
-        .map((fp) => {
-          const models = Object.entries(fp.providerConfig.models || {}).map(([modelId, model]) => ({
+      // 直接读取 OpenCode 当前配置，避免把“我使用过的供应商”历史库当作当前导入源。
+      const anthropicProviders: OpenCodeProviderDisplay[] = Object.entries(providers)
+        .filter(([, providerConfig]) => providerConfig.npm === '@ai-sdk/anthropic')
+        .map(([providerId, providerConfig]) => {
+          const models = Object.entries(providerConfig.models || {}).map(([modelId, model]) => ({
             id: modelId,
             name: model.name || modelId,
           }));
 
           return {
-            id: fp.providerId,
-            name: fp.providerConfig.name || fp.providerId,
-            baseUrl: fp.providerConfig.options?.baseURL,
-            apiKey: fp.providerConfig.options?.apiKey,
+            id: providerId,
+            name: providerConfig.name || providerId,
+            baseUrl: providerConfig.options?.baseURL,
+            apiKey: providerConfig.options?.apiKey,
             models,
           };
         });
 
       setOpenCodeProviders(anthropicProviders);
     } catch (error) {
-      console.error('Failed to load favorite providers:', error);
+      console.error('Failed to load OpenCode providers:', error);
       message.error(t('common.error'));
     } finally {
       setLoadingProviders(false);
@@ -152,15 +564,18 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
       return;
     }
 
-    // 构建 customUrl：在 baseUrl 后追加 /v1/models
-    const base = baseUrl.replace(/\/$/, '');
-    const customUrl = `${base}/v1/models`;
+    // Normalize the gateway root before appending the Anthropic API version.
+    // The model endpoint is always <gateway>/v1/models, so accepting a base URL
+    // that already ends in /v1 must not produce /v1/v1/models.
+    const base = String(baseUrl).trim().replace(/\/+$/, '');
+    const normalizedBase = base.replace(/\/v1$/i, '');
+    const customUrl = `${normalizedBase}/v1/models`;
 
     setLoadingModels(true);
     try {
       const response = await invoke<FetchModelsResponse>('fetch_provider_models', {
         request: {
-          baseUrl: `${base}/v1`,
+          baseUrl: `${normalizedBase}/v1`,
           apiKey,
           apiType: fetchApiType,
           sdkType: '@ai-sdk/anthropic',
@@ -200,41 +615,184 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
       processedUrl = processedUrl.slice(0, -1);
     }
     setProcessedBaseUrl(processedUrl);
+    setCurrentBaseUrl(processedUrl);
 
     // 自动填充表单
     form.setFieldsValue({
       name: providerData.name,
+      providerEndpointKey: CUSTOM_PROVIDER_ENDPOINT_KEY,
+      providerProfileId: CUSTOM_PROVIDER_PROFILE_ID,
+      providerEndpointId: undefined,
       baseUrl: processedUrl,
       apiKey: providerData.apiKey || '',
+      apiFormat: DEFAULT_CLAUDE_API_FORMAT,
     });
+  };
+
+  const handleProviderEndpointChange = (selectionKey: string) => {
+    if (selectionKey === OFFICIAL_PROVIDER_ENDPOINT_KEY) {
+      if (!canSelectProviderCategory) {
+        return;
+      }
+      handleCategoryChange('official');
+      return;
+    }
+
+    const { providerProfileId, providerEndpointId } = parseGatewayProviderEndpointKey(selectionKey);
+    if (canSelectProviderCategory && providerCategory !== 'custom') {
+      setProviderCategory('custom');
+      form.setFieldsValue({ category: 'custom' });
+    }
+
+    if (providerProfileId === CUSTOM_PROVIDER_PROFILE_ID) {
+      form.setFieldsValue({
+        providerEndpointKey: CUSTOM_PROVIDER_ENDPOINT_KEY,
+        providerProfileId,
+        providerEndpointId: undefined,
+        apiFormat: form.getFieldValue('apiFormat') || DEFAULT_CLAUDE_API_FORMAT,
+      });
+      return;
+    }
+
+    const endpoint = findGatewayProviderEndpoint(providerProfileId, 'claude', providerEndpointId);
+    if (!endpoint) {
+      return;
+    }
+
+    const endpointModel = endpoint.model?.trim();
+    const nextModel = endpoint.models?.primary ?? endpointModel ?? form.getFieldValue('model');
+    const nextHaikuModel = endpoint.models?.haiku ?? endpointModel ?? form.getFieldValue('haikuModel');
+    const nextSonnetModel = endpoint.models?.sonnet ?? endpointModel ?? form.getFieldValue('sonnetModel');
+    const nextOpusModel = endpoint.models?.opus ?? endpointModel ?? form.getFieldValue('opusModel');
+    const nextFableModel = endpoint.models?.fable ?? '';
+
+    form.setFieldsValue({
+      providerEndpointKey: toGatewayProviderEndpointKey(providerProfileId, endpoint.id),
+      providerProfileId,
+      providerEndpointId: endpoint.id,
+      apiFormat: normalizeClaudeApiFormat(endpoint.apiFormat),
+      baseUrl: endpoint.baseUrl,
+      model: nextModel,
+      haikuModel: nextHaikuModel,
+      haikuModelName: nextHaikuModel,
+      sonnetModel: nextSonnetModel,
+      sonnetModelName: nextSonnetModel,
+      opusModel: nextOpusModel,
+      opusModelName: nextOpusModel,
+      fableModel: nextFableModel,
+      fableModelName: nextFableModel,
+    });
+    setCurrentBaseUrl(endpoint.baseUrl);
   };
 
   const handleSubmit = async () => {
     try {
       // 只验证当前模式需要的字段
-      const fieldsToValidate = activeTab === 'import'
-        ? ['sourceProvider', 'name', 'baseUrl', 'apiKey', 'model', 'haikuModel', 'sonnetModel', 'opusModel', 'notes']
-        : ['name', 'baseUrl', 'apiKey', 'model', 'haikuModel', 'sonnetModel', 'opusModel', 'notes'];
+      const fieldsToValidate = mode === 'import'
+        ? ['sourceProvider', 'name', 'baseUrl', 'apiKey', 'apiFormat', 'model', 'haikuModel', 'haikuModelName', 'sonnetModel', 'sonnetModelName', 'opusModel', 'opusModelName', 'fableModel', 'fableModelName', 'notes']
+        : [...(canSelectProviderCategory ? ['category'] : []), 'name', ...(!isOfficialMode ? ['providerEndpointKey', 'baseUrl', 'apiKey', 'apiFormat'] : []), 'model', 'haikuModel', 'haikuModelName', 'sonnetModel', 'sonnetModelName', 'opusModel', 'opusModelName', 'fableModel', 'fableModelName', 'notes'];
       
       const values = await form.validateFields(fieldsToValidate);
+      const submittedValues = {
+        ...(form.getFieldsValue(true) as ClaudeProviderFormValues),
+        ...values,
+      };
       
       setLoading(true);
       
+      const normalizedBaseUrl = submittedValues.baseUrl?.trim() || undefined;
+      const normalizedApiKey = submittedValues.apiKey?.trim() || undefined;
+      const selectedCategory = mode === 'import'
+        ? 'custom'
+        : (providerCategory === 'official' ? 'official' : 'custom');
+      const selectedEndpoint = selectedCategory === 'official' || submittedValues.providerProfileId === CUSTOM_PROVIDER_PROFILE_ID
+        ? undefined
+        : findGatewayProviderEndpoint(
+            submittedValues.providerProfileId,
+            'claude',
+            submittedValues.providerEndpointId,
+          );
+      const selectedApiFormat = selectedCategory === 'official'
+        ? undefined
+        : selectedEndpoint
+          ? normalizeClaudeApiFormat(selectedEndpoint.apiFormat)
+          : normalizeClaudeApiFormat(submittedValues.apiFormat);
+      const selectedBaseUrl = selectedCategory === 'official'
+        ? undefined
+        : normalizedBaseUrl ?? selectedEndpoint?.baseUrl;
+      const gatewayProfile = selectedEndpoint
+        ? toGatewayProviderProfileReference('claude', submittedValues.providerProfileId || '', selectedEndpoint.id)
+        : undefined;
+      let extraSettingsConfig: string | undefined;
+      try {
+        extraSettingsConfig = selectedCategory === 'official'
+          ? undefined
+          : parseExtraSettingsConfig(extraSettingsRawRef.current);
+      } catch (error) {
+        setExtraSettingsError(getExtraSettingsErrorMessage(error));
+        setAdvancedSettingsExpanded(true);
+        return;
+      }
       const formValues: ClaudeProviderFormValues = {
-        name: values.name,
-        category: 'custom',
-        baseUrl: values.baseUrl,
-        apiKey: values.apiKey,
-        model: values.model,
-        haikuModel: values.haikuModel,
-        sonnetModel: values.sonnetModel,
-        opusModel: values.opusModel,
-        notes: values.notes,
-        sourceProviderId: activeTab === 'import' ? selectedProvider?.id : undefined,
+        name: submittedValues.name,
+        category: selectedCategory,
+        providerEndpointKey: selectedEndpoint
+          ? toGatewayProviderEndpointKey(submittedValues.providerProfileId || '', selectedEndpoint.id)
+          : CUSTOM_PROVIDER_ENDPOINT_KEY,
+        providerProfileId: selectedEndpoint
+          ? submittedValues.providerProfileId
+          : CUSTOM_PROVIDER_PROFILE_ID,
+        providerEndpointId: selectedEndpoint?.id,
+        baseUrl: mode === 'import'
+          ? normalizedBaseUrl
+          : selectedBaseUrl,
+        apiKey: mode === 'import'
+          ? normalizedApiKey
+          : (selectedCategory === 'official' ? undefined : normalizedApiKey),
+        model: submittedValues.model,
+        haikuModel: submittedValues.haikuModel,
+        haikuModelName: submittedValues.haikuModelName,
+        sonnetModel: submittedValues.sonnetModel,
+        sonnetModelName: submittedValues.sonnetModelName,
+        opusModel: submittedValues.opusModel,
+        opusModelName: submittedValues.opusModelName,
+        fableModel: submittedValues.fableModel,
+        fableModelName: submittedValues.fableModelName,
+        extraSettingsConfig,
+        extraSettingsMergeStrategy: selectedCategory === 'official'
+          ? undefined
+          : (submittedValues.extraSettingsMergeStrategy || DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY),
+        apiFormat: selectedApiFormat,
+        meta: mergeModelRewritesIntoMeta(
+          mergeCustomHeadersIntoMeta(
+            mergeBillingConfigIntoMeta(
+              mergeGatewayMetaIntoProviderMeta(
+                provider?.meta,
+                gatewayProfile,
+                gatewayProfile ? undefined : selectedApiFormat,
+              ),
+              selectedCategory === 'official'
+                ? { enabled: false, pricingModelSource: 'inherit' }
+                : billingConfig,
+            ),
+            selectedCategory === 'official'
+              ? { enabled: false, headers: [] }
+              : customHeaders,
+          ),
+          selectedCategory === 'official'
+            ? { enabled: false, rewrites: [] }
+            : modelRewrites,
+        ),
+        notes: submittedValues.notes,
+        sourceProviderId: mode === 'import' ? selectedProvider?.id : undefined,
       };
 
       await onSubmit(formValues);
       form.resetFields();
+      setExtraSettingsValue(null);
+      setExtraSettingsError(undefined);
+      setAdvancedSettingsExpanded(false);
+      extraSettingsRawRef.current = '';
       setSelectedProvider(null);
       setAvailableModels([]);
       onCancel();
@@ -245,12 +803,7 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
     }
   };
 
-  const modelSelectOptions = availableModels.map((model) => ({
-    label: model.name && model.name !== model.id ? `${model.name} (${model.id})` : model.id,
-    value: model.id,
-  }));
-
-  // 根据 baseUrl 匹配供应商的模型列表
+  // 根据 baseUrl 辅助匹配 OpenCode 导入候选的模型列表
   // OpenCode 的 URL 可能包含 /v1，所以用包含匹配
   const matchedProviderModels = React.useMemo(() => {
     if (!currentBaseUrl || openCodeProviders.length === 0) {
@@ -311,6 +864,273 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
     return options;
   }, [fetchedModels, matchedProviderModels]);
 
+  const filterModelOption = React.useCallback((inputValue: string, option?: { label: unknown; value: unknown }) => {
+    const normalizedInput = inputValue.toLowerCase();
+    return [option?.label, option?.value]
+      .filter((item): item is string | number => item !== undefined && item !== null)
+      .some((item) => String(item).toLowerCase().includes(normalizedInput));
+  }, []);
+
+  const handleRoleOneMChange = React.useCallback((row: ModelRoleRow, enabled: boolean) => {
+    if (!row.supportsOneM) {
+      return;
+    }
+
+    const previousModelBase = stripClaudeOneMMarker(row.model).trim();
+    const nextModel = setClaudeOneMMarker(row.model, enabled);
+    const nextModelBase = stripClaudeOneMMarker(nextModel).trim();
+    const shouldSyncDisplayName =
+      !row.displayName.trim() || row.displayName.trim() === previousModelBase;
+
+    form.setFieldsValue({
+      [row.modelField]: nextModel,
+      ...(shouldSyncDisplayName ? { [row.displayNameField]: nextModelBase } : {}),
+    });
+  }, [form]);
+
+  const handleFallbackOneMChange = React.useCallback((enabled: boolean) => {
+    const baseModel = stripClaudeOneMMarker(fallbackModel).trim();
+    if (!baseModel) {
+      return;
+    }
+    form.setFieldsValue({ model: setClaudeOneMMarker(baseModel, enabled) });
+  }, [fallbackModel, form]);
+
+  const handleQuickSetModels = React.useCallback(() => {
+    const sourceModel = fallbackModel || sonnetModel || opusModel || fableModel || haikuModel;
+    const sourceModelBase = stripClaudeOneMMarker(sourceModel).trim();
+    if (!sourceModelBase) {
+      return;
+    }
+
+    const nextValues: Record<string, string> = {};
+    modelRoleRows.forEach((row) => {
+      const nextModel = row.supportsOneM
+        ? setClaudeOneMMarker(sourceModel, hasClaudeOneMMarker(sourceModel))
+        : sourceModelBase;
+      nextValues[row.modelField] = nextModel;
+      nextValues[row.displayNameField] = stripClaudeOneMMarker(nextModel).trim();
+    });
+    form.setFieldsValue(nextValues);
+    message.success(t('claudecode.model.quickSetSuccess'));
+  }, [fableModel, fallbackModel, form, haikuModel, modelRoleRows, opusModel, sonnetModel, t]);
+
+  const fetchApiTypeMenu = React.useMemo(() => ({
+    selectedKeys: [fetchApiType],
+    onClick: ({ key }: { key: string }) => {
+      setFetchApiType(key === 'openai_compat' ? 'openai_compat' : 'native');
+    },
+    items: [
+      {
+        key: 'native',
+        label: t('claudecode.fetchModels.native'),
+      },
+      {
+        key: 'openai_compat',
+        label: t('claudecode.fetchModels.openaiCompat'),
+      },
+    ],
+  }), [fetchApiType, t]);
+
+  const renderModelMappingSection = () => (
+    <Form.Item wrapperCol={sectionWrapperCol}>
+      <section className={styles.modelMappingSection}>
+        <div className={styles.modelMappingHeader}>
+          <div className={styles.modelMappingTitleBlock}>
+            <div className={styles.modelMappingTitle}>{t('claudecode.model.mappingTitle')}</div>
+            <div className={styles.modelMappingHint}>{t('claudecode.model.mappingHint')}</div>
+          </div>
+          <div className={styles.modelMappingActions}>
+            <Tooltip title={t('claudecode.model.quickSetTooltip')}>
+              <Button
+                size="small"
+                icon={<ThunderboltOutlined />}
+                disabled={!fallbackModel && !sonnetModel && !opusModel && !fableModel && !haikuModel}
+                onClick={handleQuickSetModels}
+              >
+                {t('claudecode.model.quickSetModels')}
+              </Button>
+            </Tooltip>
+            {!isOfficialMode && mode !== 'import' && (
+              <Space.Compact>
+                <Button
+                  size="small"
+                  icon={<CloudDownloadOutlined />}
+                  loading={loadingModels}
+                  onClick={handleFetchModels}
+                >
+                  {t('claudecode.fetchModels.button')}
+                </Button>
+                <Dropdown menu={fetchApiTypeMenu} trigger={['click']}>
+                  <Button
+                    size="small"
+                    icon={<DownOutlined />}
+                    aria-label={fetchApiType === 'native'
+                      ? t('claudecode.fetchModels.native')
+                      : t('claudecode.fetchModels.openaiCompat')}
+                  />
+                </Dropdown>
+              </Space.Compact>
+            )}
+            {fetchedModels.length > 0 && mode !== 'import' && (
+              <span className={styles.modelLoadedText}>
+                {t('claudecode.fetchModels.loaded', { count: fetchedModels.length })}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className={styles.modelGridHeader}>
+          <span>{t('claudecode.model.roleHeader')}</span>
+          <span>{t('claudecode.model.displayNameHeader')}</span>
+          <span>{t('claudecode.model.requestModelHeader')}</span>
+          <span>{t('claudecode.model.oneMHeader')}</span>
+        </div>
+
+        <div className={styles.modelRows}>
+          {modelRoleRows.map((row) => {
+            const modelBase = stripClaudeOneMMarker(row.model);
+            const usesOneM = row.supportsOneM && hasClaudeOneMMarker(row.model);
+            return (
+              <div key={row.role} className={styles.modelRow}>
+                <div className={styles.modelRoleLabel}>{row.label}</div>
+                <Form.Item name={row.displayNameField} noStyle>
+                  <Input
+                    placeholder={modelBase || t('claudecode.model.displayNamePlaceholder')}
+                  />
+                </Form.Item>
+                <Form.Item
+                  name={row.modelField}
+                  noStyle
+                  // 与兜底模型一致：输入框只显示剥离 [1M] 后的 base，1M 状态由开关表达。
+                  getValueProps={(value) => ({
+                    value: stripClaudeOneMMarker(typeof value === 'string' ? value : ''),
+                  })}
+                  getValueFromEvent={(value: string) => {
+                    const previousModelBase = stripClaudeOneMMarker(row.model).trim();
+                    const nextModelBase = stripClaudeOneMMarker(value).trim();
+                    const nextModel = row.supportsOneM
+                      ? setClaudeOneMMarker(nextModelBase, hasClaudeOneMMarker(row.model))
+                      : nextModelBase;
+                    const shouldSyncDisplayName =
+                      !row.displayName.trim() || row.displayName.trim() === previousModelBase;
+
+                    if (shouldSyncDisplayName) {
+                      // 使用 setTimeout 确保在下一个事件循环中更新，避免干扰当前输入
+                      setTimeout(() => {
+                        form.setFieldsValue({
+                          [row.displayNameField]: nextModelBase,
+                        });
+                      }, 0);
+                    }
+
+                    return nextModel;
+                  }}
+                >
+                  <AutoComplete
+                    allowClear
+                    options={modelOptions}
+                    placeholder={t('claudecode.model.defaultModelPlaceholder')}
+                    style={{ width: '100%' }}
+                    filterOption={filterModelOption}
+                    onClear={() => form.setFieldsValue({ [row.modelField]: '' })}
+                  />
+                </Form.Item>
+                <div className={styles.oneMCell}>
+                  {row.supportsOneM && (
+                    <Checkbox
+                      checked={usesOneM}
+                      onChange={(event) => handleRoleOneMChange(row, event.target.checked)}
+                    >
+                      {t('claudecode.model.oneMLabel')}
+                    </Checkbox>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className={styles.fallbackModel}>
+          <div className={styles.fallbackModelLabel}>{t('claudecode.model.fallbackModel')}</div>
+          <div className={styles.fallbackModelInput}>
+            <div className={styles.fallbackModelRow}>
+              <Form.Item
+                name="model"
+                noStyle
+                // 输入框只显示剥离 [1M] 后的 base，1M 状态由右侧开关表达；
+                // 否则用户在输入框末尾退格/补字会与 getValueFromEvent 重组逻辑
+                // 相互作用，堆积出 `xxx[1M][1M]` 这类垃圾后缀。
+                getValueProps={(value) => ({
+                  value: stripClaudeOneMMarker(typeof value === 'string' ? value : ''),
+                })}
+                getValueFromEvent={(value: string) =>
+                  setClaudeOneMMarker(value, hasClaudeOneMMarker(fallbackModel))
+                }
+              >
+                <AutoComplete
+                  allowClear
+                  options={modelOptions}
+                  placeholder={t('claudecode.model.defaultModelPlaceholder')}
+                  style={{ width: '100%' }}
+                  filterOption={filterModelOption}
+                />
+              </Form.Item>
+              <div className={styles.oneMCell}>
+                <Checkbox
+                  checked={hasClaudeOneMMarker(fallbackModel)}
+                  onChange={(event) => handleFallbackOneMChange(event.target.checked)}
+                >
+                  {t('claudecode.model.oneMLabel')}
+                </Checkbox>
+              </div>
+            </div>
+            <div className={styles.modelMappingHint}>
+              {t('claudecode.model.fallbackModelHint')}
+            </div>
+          </div>
+        </div>
+      </section>
+    </Form.Item>
+  );
+
+  const handleCategoryChange = (category: string) => {
+    const nextCategory = category === 'official' ? 'official' : 'custom';
+    setProviderCategory(nextCategory);
+
+    if (nextCategory === 'official') {
+      setCurrentBaseUrl('');
+      setFetchedModels([]);
+      setBillingConfig(getBillingConfigFromMeta(undefined));
+      setCustomHeaders(getCustomHeadersFromMeta(undefined));
+      setModelRewrites(getModelRewritesFromMeta(undefined));
+      setExtraSettingsValue(null);
+      setExtraSettingsError(undefined);
+      setAdvancedSettingsExpanded(false);
+      extraSettingsRawRef.current = '';
+      form.setFieldsValue({
+        category: 'official',
+        baseUrl: undefined,
+        apiKey: undefined,
+        providerEndpointKey: OFFICIAL_PROVIDER_ENDPOINT_KEY,
+        providerProfileId: CUSTOM_PROVIDER_PROFILE_ID,
+        providerEndpointId: undefined,
+        apiFormat: DEFAULT_CLAUDE_API_FORMAT,
+        extraSettingsMergeStrategy: DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY,
+      });
+    } else {
+      form.setFieldsValue({
+        category: 'custom',
+        providerEndpointKey: CUSTOM_PROVIDER_ENDPOINT_KEY,
+        providerProfileId: CUSTOM_PROVIDER_PROFILE_ID,
+        providerEndpointId: undefined,
+        apiFormat: form.getFieldValue('apiFormat') || DEFAULT_CLAUDE_API_FORMAT,
+        extraSettingsMergeStrategy:
+          form.getFieldValue('extraSettingsMergeStrategy') || DEFAULT_CLAUDE_SETTINGS_MERGE_STRATEGY,
+      });
+    }
+  };
+
   const renderManualTab = () => (
     <Form
       form={form}
@@ -319,124 +1139,199 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
       wrapperCol={wrapperCol}
     >
       <Form.Item
+        label={t('claudecode.provider.providerProfile')}
+        required
+        help={<span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{t('claudecode.provider.providerProfileHelp')}</span>}
+      >
+        <div className={isOfficialMode ? undefined : styles.providerProfileRow}>
+          <Form.Item
+            name="providerEndpointKey"
+            noStyle
+            initialValue={CUSTOM_PROVIDER_ENDPOINT_KEY}
+            rules={[{ required: true, message: t('common.error') }]}
+          >
+            <Select
+              options={providerEndpointOptions}
+              disabled={isOfficialMode && !canSelectProviderCategory}
+              onChange={handleProviderEndpointChange}
+            />
+          </Form.Item>
+          {!isOfficialMode && (
+            <Form.Item
+              name="apiFormat"
+              noStyle
+              initialValue={DEFAULT_CLAUDE_API_FORMAT}
+            >
+              <Select
+                options={apiFormatOptions}
+                disabled={!selectedIsCustomProviderProfile}
+              />
+            </Form.Item>
+          )}
+        </div>
+      </Form.Item>
+      <Form.Item name="providerProfileId" hidden initialValue={CUSTOM_PROVIDER_PROFILE_ID}>
+        <Input />
+      </Form.Item>
+      <Form.Item name="providerEndpointId" hidden>
+        <Input />
+      </Form.Item>
+
+      {isOfficialMode && (
+        <Form.Item wrapperCol={{ offset: labelCol.span, span: wrapperCol.span }}>
+          <div className={styles.officialModeNotice}>
+            <div className={styles.officialModeAccent} aria-hidden="true" />
+            <div className={styles.officialModeContent}>
+              <div className={styles.officialModeTitle}>
+                {t('claudecode.provider.officialModeTitle')}
+              </div>
+              <div className={styles.officialModeDescription}>
+                {t('claudecode.provider.officialModeDescription')}
+              </div>
+            </div>
+          </div>
+        </Form.Item>
+      )}
+
+      <Form.Item
         name="name"
-        label={t('claudecode.provider.name')}
+        label={t('claudecode.provider.formName')}
         rules={[{ required: true, message: t('common.error') }]}
       >
         <Input placeholder={t('claudecode.provider.namePlaceholder')} />
       </Form.Item>
 
-      <Form.Item
-        name="baseUrl"
-        label={t('claudecode.provider.baseUrl')}
-        rules={[{ required: true, message: t('common.error') }]}
-      >
-        <Input
-          placeholder={t('claudecode.provider.baseUrlPlaceholder')}
-          onChange={(e) => setCurrentBaseUrl(e.target.value)}
-        />
-      </Form.Item>
-
-      <Form.Item
-        name="apiKey"
-        label={t('claudecode.provider.apiKey')}
-        rules={[{ required: true, message: t('common.error') }]}
-      >
-        <Input
-          type={showApiKey ? 'text' : 'password'}
-          placeholder={t('claudecode.provider.apiKeyPlaceholder')}
-          addonAfter={
-            <Button
-              type="text"
-              size="small"
-              icon={showApiKey ? <EyeInvisibleOutlined /> : <EyeOutlined />}
-              onClick={() => setShowApiKey(!showApiKey)}
-            >
-              {showApiKey ? t('claudecode.provider.hideApiKey') : t('claudecode.provider.showApiKey')}
-            </Button>
-          }
-        />
-      </Form.Item>
-
-      {/* 获取模型列表 */}
-      <Form.Item wrapperCol={{ offset: labelCol.span, span: wrapperCol.span }}>
-        <Space size="middle" style={{ width: '100%' }}>
-          <Radio.Group
-            value={fetchApiType}
-            onChange={(e) => setFetchApiType(e.target.value)}
-            size="small"
+      {!isOfficialMode && (
+        <>
+          <Form.Item
+            name="baseUrl"
+            label={t('claudecode.provider.baseUrl')}
+            rules={[{ required: true, message: t('common.error') }]}
           >
-            <Radio value="openai_compat">{t('claudecode.fetchModels.openaiCompat')}</Radio>
-            <Radio value="native">{t('claudecode.fetchModels.native')}</Radio>
-          </Radio.Group>
-          <Button
-            type="default"
-            icon={<CloudDownloadOutlined />}
-            loading={loadingModels}
-            onClick={handleFetchModels}
+            <Input
+              placeholder={t('claudecode.provider.baseUrlPlaceholder')}
+              onChange={(e) => setCurrentBaseUrl(e.target.value)}
+            />
+          </Form.Item>
+
+          <Form.Item
+            name="apiKey"
+            label={t('claudecode.provider.apiKey')}
+            rules={[{ required: true, message: t('common.error') }]}
           >
-            {t('claudecode.fetchModels.button')}
-          </Button>
-          {fetchedModels.length > 0 && (
-            <span style={{ color: '#52c41a' }}>
-              {t('claudecode.fetchModels.loaded', { count: fetchedModels.length })}
-            </span>
-          )}
-        </Space>
-      </Form.Item>
+            <Input
+              type={showApiKey ? 'text' : 'password'}
+              placeholder={t('claudecode.provider.apiKeyPlaceholder')}
+              addonAfter={
+                <Button
+                  type="text"
+                  size="small"
+                  icon={showApiKey ? <EyeInvisibleOutlined /> : <EyeOutlined />}
+                  onClick={() => setShowApiKey(!showApiKey)}
+                >
+                  {showApiKey ? t('claudecode.provider.hideApiKey') : t('claudecode.provider.showApiKey')}
+                </Button>
+              }
+            />
+          </Form.Item>
 
-      <Form.Item name="model" label={t('claudecode.model.defaultModel')}>
-        <AutoComplete
-          options={modelOptions}
-          placeholder={t('claudecode.model.defaultModelPlaceholder')}
-          style={{ width: '100%' }}
-          filterOption={(inputValue, option) =>
-            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
-            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
-          }
-        />
-      </Form.Item>
+        </>
+      )}
 
-      <Form.Item name="haikuModel" label={t('claudecode.model.haikuModel')}>
-        <AutoComplete
-          options={modelOptions}
-          placeholder={t('claudecode.model.haikuModelPlaceholder')}
-          style={{ width: '100%' }}
-          filterOption={(inputValue, option) =>
-            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
-            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
-          }
-        />
-      </Form.Item>
+      {renderModelMappingSection()}
 
-      <Form.Item name="sonnetModel" label={t('claudecode.model.sonnetModel')}>
-        <AutoComplete
-          options={modelOptions}
-          placeholder={t('claudecode.model.sonnetModelPlaceholder')}
-          style={{ width: '100%' }}
-          filterOption={(inputValue, option) =>
-            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
-            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
-          }
-        />
-      </Form.Item>
+      {!isOfficialMode && (
+        <Form.Item wrapperCol={sectionWrapperCol}>
+          <ProviderConfigCollapse
+            title={t('claudecode.provider.advancedSettings')}
+            expanded={advancedSettingsExpanded}
+            onExpandedChange={setAdvancedSettingsExpanded}
+            icon={<Settings2 />}
+          >
+            <div className={styles.extraSettingsContent}>
+              <JsonEditor
+                value={extraSettingsValue}
+                onChange={handleExtraSettingsChange}
+                onBlur={handleExtraSettingsBlur}
+                onRawChange={handleExtraSettingsRawChange}
+                onRawBlur={handleExtraSettingsRawChange}
+                mode="text"
+                height={180}
+                minHeight={140}
+                maxHeight={360}
+                resizable
+                className={styles.extraSettingsEditor}
+                placeholder={t('claudecode.provider.extraSettingsPlaceholder')}
+              />
+              <div className={styles.settingsMergeStrategyRow}>
+                <label
+                  className={styles.settingsMergeStrategyLabel}
+                  htmlFor="claude-settings-merge-strategy"
+                >
+                  {t('claudecode.provider.mergeStrategyLabel')}
+                </label>
+                <div className={styles.settingsMergeStrategyControl}>
+                  <Form.Item name="extraSettingsMergeStrategy" noStyle>
+                    <Select
+                      id="claude-settings-merge-strategy"
+                      size="small"
+                      className={styles.settingsMergeStrategySelect}
+                      options={settingsMergeStrategyOptions}
+                    />
+                  </Form.Item>
+                </div>
+              </div>
+              <div className={styles.extraSettingsHelp}>
+                {extraSettingsError && (
+                  <div className={styles.extraSettingsError}>
+                    {extraSettingsError}
+                  </div>
+                )}
+                <div className={styles.extraSettingsHint}>
+                  {t('claudecode.provider.mergeStrategyOverviewHint')}
+                </div>
+                <div className={styles.extraSettingsHint}>
+                  {t(extraSettingsHintKey)}
+                </div>
+              </div>
+            </div>
+          </ProviderConfigCollapse>
+        </Form.Item>
+      )}
 
-      <Form.Item name="opusModel" label={t('claudecode.model.opusModel')}>
-        <AutoComplete
-          options={modelOptions}
-          placeholder={t('claudecode.model.opusModelPlaceholder')}
-          style={{ width: '100%' }}
-          filterOption={(inputValue, option) =>
-            (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
-            option?.value.toLowerCase().includes(inputValue.toLowerCase())) ?? false
-          }
-        />
-      </Form.Item>
+      {!isOfficialMode && (
+        <Form.Item wrapperCol={sectionWrapperCol}>
+          <BillingConfigCollapse
+            value={billingConfig}
+            onChange={setBillingConfig}
+          />
+        </Form.Item>
+      )}
 
-      <Form.Item name="notes" label={t('claudecode.provider.notes')}>
-        <TextArea
-          rows={3}
+      {!isOfficialMode && (
+        <Form.Item wrapperCol={sectionWrapperCol}>
+          <CustomHeadersCollapse
+            value={customHeaders}
+            onChange={setCustomHeaders}
+          />
+        </Form.Item>
+      )}
+
+      {!isOfficialMode && (
+        <Form.Item wrapperCol={sectionWrapperCol}>
+          <ModelRewritesCollapse
+            value={modelRewrites}
+            onChange={setModelRewrites}
+          />
+        </Form.Item>
+      )}
+
+      <Form.Item name="notes" wrapperCol={sectionWrapperCol}>
+        <ProviderNotesCollapse
+          title={t('claudecode.provider.notes')}
           placeholder={t('claudecode.provider.notesPlaceholder')}
+          rows={3}
+          resetKey={notesCollapseResetKey}
         />
       </Form.Item>
     </Form>
@@ -482,7 +1377,7 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
           />
         )}
 
-        <Form.Item name="name" label={t('claudecode.provider.name')}>
+        <Form.Item name="name" label={t('claudecode.provider.formName')}>
           <Input placeholder={t('claudecode.provider.namePlaceholder')} disabled />
         </Form.Item>
 
@@ -494,57 +1389,27 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
           <Input type="password" disabled />
         </Form.Item>
 
+        <Form.Item name="apiFormat" label={t('claudecode.provider.apiFormat')} initialValue={DEFAULT_CLAUDE_API_FORMAT}>
+          <Select options={apiFormatOptions} disabled />
+        </Form.Item>
+
         {availableModels.length > 0 && (
-          <>
-            <Alert
-              message={t('claudecode.model.selectFromProvider')}
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-            />
-
-            <Form.Item name="model" label={t('claudecode.import.selectDefaultModel')}>
-              <Select
-                placeholder={t('claudecode.model.defaultModelPlaceholder')}
-                options={modelSelectOptions}
-                allowClear
-                showSearch
-              />
-            </Form.Item>
-
-            <Form.Item name="haikuModel" label={t('claudecode.import.selectHaikuModel')}>
-              <Select
-                placeholder={t('claudecode.model.haikuModelPlaceholder')}
-                options={modelSelectOptions}
-                allowClear
-                showSearch
-              />
-            </Form.Item>
-
-            <Form.Item name="sonnetModel" label={t('claudecode.import.selectSonnetModel')}>
-              <Select
-                placeholder={t('claudecode.model.sonnetModelPlaceholder')}
-                options={modelSelectOptions}
-                allowClear
-                showSearch
-              />
-            </Form.Item>
-
-            <Form.Item name="opusModel" label={t('claudecode.import.selectOpusModel')}>
-              <Select
-                placeholder={t('claudecode.model.opusModelPlaceholder')}
-                options={modelSelectOptions}
-                allowClear
-                showSearch
-              />
-            </Form.Item>
-          </>
+          <Alert
+            message={t('claudecode.model.selectFromProvider')}
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+          />
         )}
 
-        <Form.Item name="notes" label={t('claudecode.provider.notes')}>
-          <TextArea
-            rows={3}
+        {renderModelMappingSection()}
+
+        <Form.Item name="notes" wrapperCol={sectionWrapperCol}>
+          <ProviderNotesCollapse
+            title={t('claudecode.provider.notes')}
             placeholder={t('claudecode.provider.notesPlaceholder')}
+            rows={3}
+            resetKey={notesCollapseResetKey}
           />
         </Form.Item>
       </Form>
@@ -553,7 +1418,13 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
 
   return (
     <Modal
-      title={isEdit ? t('claudecode.provider.editProvider') : t('claudecode.provider.addProvider')}
+      title={
+        isEdit
+          ? t('claudecode.provider.editProvider')
+          : mode === 'import'
+            ? t('claudecode.import.title')
+            : t('claudecode.provider.addProvider')
+      }
       open={open}
       onCancel={onCancel}
       onOk={handleSubmit}
@@ -562,25 +1433,7 @@ const ClaudeProviderFormModal: React.FC<ClaudeProviderFormModalProps> = ({
       okText={t('common.save')}
       cancelText={t('common.cancel')}
     >
-      {!isEdit && (
-        <Tabs
-          activeKey={activeTab}
-          onChange={(key) => setActiveTab(key as 'manual' | 'import')}
-          items={[
-            {
-              key: 'manual',
-              label: t('claudecode.form.tabManual'),
-              children: renderManualTab(),
-            },
-            {
-              key: 'import',
-              label: t('claudecode.form.tabImport'),
-              children: renderImportTab(),
-            },
-          ]}
-        />
-      )}
-      {isEdit && renderManualTab()}
+      {isEdit || mode === 'manual' ? renderManualTab() : renderImportTab()}
     </Modal>
   );
 };

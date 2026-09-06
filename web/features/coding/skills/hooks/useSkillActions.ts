@@ -7,6 +7,7 @@ import * as api from '../services/skillsApi';
 import { useSkills } from './useSkills';
 import type { ManagedSkill, ToolOption } from '../types';
 import { showGitError, confirmTargetOverwrite } from '../utils/errorHandlers';
+import { shouldOverwriteExistingTarget, type BatchToolOptions } from '../utils/batchToolOptions';
 import { refreshTrayMenu } from '@/services/appApi';
 
 export interface UseSkillActionsOptions {
@@ -15,14 +16,37 @@ export interface UseSkillActionsOptions {
 
 export interface UseSkillActionsResult {
   actionLoading: boolean;
+  updatingSkillIds: string[];
   deleteSkillId: string | null;
   setDeleteSkillId: (id: string | null) => void;
   skillToDelete: ManagedSkill | undefined;
+  batchDeleteIds: string[];
+  setBatchDeleteIds: (ids: string[]) => void;
   handleToggleTool: (skill: ManagedSkill, toolId: string) => Promise<void>;
   handleUpdate: (skill: ManagedSkill) => Promise<void>;
   handleDelete: (skillId: string) => void;
   confirmDelete: () => Promise<void>;
   handleDragEnd: (event: DragEndEvent) => Promise<void>;
+  handleBatchRefresh: (skillIds: string[]) => Promise<void>;
+  handleBatchDelete: (skillIds: string[]) => void;
+  confirmBatchDelete: () => Promise<void>;
+  handleBatchAddTool: (
+    skillIds: string[],
+    toolId: string,
+    options?: BatchToolOptions,
+  ) => Promise<boolean>;
+  handleBatchRemoveTool: (
+    skillIds: string[],
+    toolId: string,
+    options?: BatchToolOptions,
+  ) => Promise<boolean>;
+  handleBatchSetGroup: (skillIds: string[], userGroup: string | null) => Promise<boolean>;
+  handleBatchSetManagementEnabled: (
+    skillIds: string[],
+    enabled: boolean,
+    restoreToolsBySkillId?: Record<string, string[]>,
+  ) => Promise<boolean>;
+  handleSetManagementEnabled: (skill: ManagedSkill, enabled: boolean, restoreTools?: string[]) => Promise<boolean>;
 }
 
 export function useSkillActions({ allTools }: UseSkillActionsOptions): UseSkillActionsResult {
@@ -30,13 +54,20 @@ export function useSkillActions({ allTools }: UseSkillActionsOptions): UseSkillA
   const { skills, refresh, updateSkill, deleteSkill, setSkills } = useSkills();
 
   const [deleteSkillId, setDeleteSkillId] = React.useState<string | null>(null);
+  const [batchDeleteIds, setBatchDeleteIds] = React.useState<string[]>([]);
   const [actionLoading, setActionLoading] = React.useState(false);
+  const [updatingSkillIds, setUpdatingSkillIds] = React.useState<string[]>([]);
 
   const skillToDelete = deleteSkillId
     ? skills.find((s) => s.id === deleteSkillId)
     : undefined;
 
   const handleToggleTool = React.useCallback(async (skill: ManagedSkill, toolId: string) => {
+    if (!skill.management_enabled) {
+      message.info(t('skills.disabledSyncBlocked'));
+      return;
+    }
+
     const target = skill.targets.find((t) => t.tool === toolId);
     const synced = Boolean(target);
 
@@ -74,15 +105,19 @@ export function useSkillActions({ allTools }: UseSkillActionsOptions): UseSkillA
   }, [allTools, t, refresh]);
 
   const handleUpdate = React.useCallback(async (skill: ManagedSkill) => {
-    setActionLoading(true);
+    if (updatingSkillIds.includes(skill.id)) {
+      return;
+    }
+
+    setUpdatingSkillIds((prev) => [...prev, skill.id]);
     try {
       await updateSkill(skill);
     } catch (error) {
       showGitError(String(error), t, allTools);
     } finally {
-      setActionLoading(false);
+      setUpdatingSkillIds((prev) => prev.filter((id) => id !== skill.id));
     }
-  }, [updateSkill, t, allTools]);
+  }, [allTools, t, updateSkill, updatingSkillIds]);
 
   const handleDelete = React.useCallback((skillId: string) => {
     setDeleteSkillId(skillId);
@@ -132,15 +167,234 @@ export function useSkillActions({ allTools }: UseSkillActionsOptions): UseSkillA
     }
   }, [skills, setSkills, t]);
 
+  // Batch refresh
+  const handleBatchRefresh = React.useCallback(async (skillIds: string[]) => {
+    setActionLoading(true);
+    try {
+      for (const id of skillIds) {
+        await api.updateManagedSkill(id);
+      }
+      await refresh();
+      message.success(t('skills.batch.refreshSuccess', { count: skillIds.length }));
+    } catch (error) {
+      showGitError(String(error), t, allTools);
+    } finally {
+      setActionLoading(false);
+    }
+  }, [refresh, t, allTools]);
+
+  // Batch delete - trigger confirmation
+  const handleBatchDelete = React.useCallback((skillIds: string[]) => {
+    setBatchDeleteIds(skillIds);
+  }, []);
+
+  // Batch delete - confirm
+  const confirmBatchDelete = React.useCallback(async () => {
+    if (batchDeleteIds.length === 0) return;
+    setActionLoading(true);
+    try {
+      for (const id of batchDeleteIds) {
+        await api.deleteManagedSkill(id);
+      }
+      await refresh();
+      await refreshTrayMenu();
+      message.success(t('skills.batch.deleteSuccess', { count: batchDeleteIds.length }));
+      setBatchDeleteIds([]);
+    } catch (error) {
+      showGitError(String(error), t, allTools);
+    } finally {
+      setActionLoading(false);
+    }
+  }, [batchDeleteIds, refresh, t, allTools]);
+
+  // Batch add tool sync
+  const handleBatchAddTool = React.useCallback(async (
+    skillIds: string[],
+    toolId: string,
+    options?: BatchToolOptions,
+  ) => {
+    setActionLoading(true);
+    let successCount = 0;
+    try {
+      for (const id of skillIds) {
+        const skill = skills.find((s) => s.id === id);
+        if (!skill) continue;
+        if (!skill.management_enabled) continue;
+        const alreadySynced = skill.targets.some((t) => t.tool === toolId);
+        if (alreadySynced) continue;
+        await api.syncSkillToTool(
+          skill.central_path,
+          skill.id,
+          toolId,
+          skill.name,
+          shouldOverwriteExistingTarget(options),
+        );
+        successCount++;
+      }
+      await refresh();
+      await refreshTrayMenu();
+      const toolLabel = allTools.find((t) => t.id === toolId)?.label || toolId;
+      if (successCount > 0 && !options?.quiet) {
+        message.success(t('skills.batch.addToolSuccess', { count: successCount, tool: toolLabel }));
+      }
+      return true;
+    } catch (error) {
+      showGitError(String(error), t, allTools);
+      return false;
+    } finally {
+      setActionLoading(false);
+    }
+  }, [skills, refresh, t, allTools]);
+
+  // Batch remove tool sync
+  const handleBatchRemoveTool = React.useCallback(async (
+    skillIds: string[],
+    toolId: string,
+    options?: BatchToolOptions,
+  ) => {
+    setActionLoading(true);
+    let successCount = 0;
+    try {
+      for (const id of skillIds) {
+        const skill = skills.find((s) => s.id === id);
+        if (!skill) continue;
+        const isSynced = skill.targets.some((t) => t.tool === toolId);
+        if (!isSynced) continue;
+        await api.unsyncSkillFromTool(id, toolId);
+        successCount++;
+      }
+      await refresh();
+      await refreshTrayMenu();
+      const toolLabel = allTools.find((t) => t.id === toolId)?.label || toolId;
+      if (successCount > 0 && !options?.quiet) {
+        message.success(t('skills.batch.removeToolSuccess', { count: successCount, tool: toolLabel }));
+      }
+      return true;
+    } catch (error) {
+      showGitError(String(error), t, allTools);
+      return false;
+    } finally {
+      setActionLoading(false);
+    }
+  }, [skills, refresh, t, allTools]);
+
+  const handleBatchSetGroup = React.useCallback(async (
+    skillIds: string[],
+    groupId: string | null,
+  ) => {
+    if (skillIds.length === 0) {
+      return false;
+    }
+
+    setActionLoading(true);
+    try {
+      await api.batchUpdateSkillGroup(skillIds, groupId);
+      await refresh();
+      message.success(t('skills.batch.setGroupSuccess', { count: skillIds.length }));
+      return true;
+    } catch (error) {
+      message.error(String(error));
+      return false;
+    } finally {
+      setActionLoading(false);
+    }
+  }, [refresh, t]);
+
+  const handleBatchSetManagementEnabled = React.useCallback(async (
+    skillIds: string[],
+    enabled: boolean,
+    restoreToolsBySkillId: Record<string, string[]> = {},
+  ) => {
+    const targetSkills = skillIds
+      .map((id) => skills.find((skill) => skill.id === id))
+      .filter((skill): skill is ManagedSkill => Boolean(skill))
+      .filter((skill) => skill.management_enabled !== enabled);
+
+    if (targetSkills.length === 0) {
+      return false;
+    }
+
+    setActionLoading(true);
+    let restoredToolCount = 0;
+    try {
+      for (const skill of targetSkills) {
+        await api.setSkillManagementEnabled(skill.id, enabled);
+        if (!enabled) {
+          continue;
+        }
+
+        for (const toolId of restoreToolsBySkillId[skill.id] ?? []) {
+          await api.syncSkillToTool(skill.central_path, skill.id, toolId, skill.name, true);
+          restoredToolCount++;
+        }
+      }
+
+      await refresh();
+      await refreshTrayMenu();
+      if (enabled) {
+        message.success(restoredToolCount > 0
+          ? t('skills.batch.enableRestoreSuccess', {
+            count: targetSkills.length,
+            tools: restoredToolCount,
+          })
+          : t('skills.batch.enableSuccess', { count: targetSkills.length }));
+      } else {
+        message.success(t('skills.batch.disableSuccess', { count: targetSkills.length }));
+      }
+      return true;
+    } catch (error) {
+      showGitError(String(error), t, allTools);
+      return false;
+    } finally {
+      setActionLoading(false);
+    }
+  }, [allTools, refresh, skills, t]);
+
+  const handleSetManagementEnabled = React.useCallback(async (
+    skill: ManagedSkill,
+    enabled: boolean,
+    restoreTools?: string[],
+  ) => {
+    setActionLoading(true);
+    try {
+      await api.setSkillManagementEnabled(skill.id, enabled);
+      if (enabled) {
+        for (const toolId of restoreTools ?? []) {
+          await api.syncSkillToTool(skill.central_path, skill.id, toolId, skill.name, true);
+        }
+      }
+      await refresh();
+      await refreshTrayMenu();
+      message.success(enabled ? t('skills.enabledSuccess') : t('skills.disabledSuccess'));
+      return true;
+    } catch (error) {
+      showGitError(String(error), t, allTools);
+      return false;
+    } finally {
+      setActionLoading(false);
+    }
+  }, [allTools, refresh, t]);
+
   return {
     actionLoading,
+    updatingSkillIds,
     deleteSkillId,
     setDeleteSkillId,
     skillToDelete,
+    batchDeleteIds,
+    setBatchDeleteIds,
     handleToggleTool,
     handleUpdate,
     handleDelete,
     confirmDelete,
     handleDragEnd,
+    handleBatchRefresh,
+    handleBatchDelete,
+    confirmBatchDelete,
+    handleBatchAddTool,
+    handleBatchRemoveTool,
+    handleBatchSetGroup,
+    handleBatchSetManagementEnabled,
+    handleSetManagementEnabled,
   };
 }

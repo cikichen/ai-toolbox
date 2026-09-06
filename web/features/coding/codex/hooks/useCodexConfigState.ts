@@ -1,13 +1,29 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   extractCodexBaseUrl,
+  ensureCodexCustomProviderConfig,
   setCodexBaseUrl,
   extractCodexModel,
   setCodexModel,
   normalizeQuotes,
+  normalizeCodexConfigForOfficialMode,
   removeCodexBaseUrl,
   removeCodexModel,
 } from '@/utils/codexConfigUtils';
+import type {
+  CodexCatalogModel,
+  CodexProviderCategory,
+  CodexSettingsConfig,
+} from '@/types/codex';
+import {
+  normalizeCodexCatalogModalities,
+  normalizeCodexCatalogModels,
+  normalizeCodexCatalogReasoningLevels,
+} from '../utils/codexCatalogModels';
+import {
+  buildCodexSettingsConfig,
+  resolveCodexAutoReviewModelOverride,
+} from '../utils/codexSettingsConfig';
 
 interface UseCodexConfigStateProps {
   initialData?: {
@@ -15,46 +31,130 @@ interface UseCodexConfigStateProps {
   };
 }
 
-interface CodexSettingsConfig {
-  auth?: {
-    OPENAI_API_KEY?: string;
-  };
+export interface CodexSettingsConfigSnapshot {
+  category?: CodexProviderCategory;
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
   config?: string;
+  catalogModels?: CodexCatalogModel[];
+  autoReviewModelOverride?: string;
 }
 
 // 新建配置的默认 config.toml 模板
 const DEFAULT_CONFIG_TOML = `model_provider = "custom"
+model_reasoning_effort = "high"
 
 [model_providers.custom]
-name = "custom"
+name = "OpenAI"
 wire_api = "responses"
 requires_openai_auth = true`;
 
+function parseCodexCatalogModels(config: CodexSettingsConfig): CodexCatalogModel[] {
+  const rawModels = Array.isArray(config.modelCatalog?.models)
+    ? config.modelCatalog.models
+    : [];
+
+  return normalizeCodexCatalogModels(
+    rawModels.map((item) => {
+      const compatibleItem = item as CodexCatalogModel & {
+        display_name?: unknown;
+        context_window?: unknown;
+        reasoning_levels?: unknown;
+        default_reasoning_level?: unknown;
+      };
+
+      return {
+        model: typeof compatibleItem.model === 'string' ? compatibleItem.model : '',
+        displayName:
+          typeof compatibleItem.displayName === 'string'
+            ? compatibleItem.displayName
+            : typeof compatibleItem.display_name === 'string'
+              ? compatibleItem.display_name
+              : '',
+        contextWindow:
+          typeof compatibleItem.contextWindow === 'string' || typeof compatibleItem.contextWindow === 'number'
+            ? compatibleItem.contextWindow
+            : typeof compatibleItem.context_window === 'string' || typeof compatibleItem.context_window === 'number'
+              ? compatibleItem.context_window
+              : '',
+        supportsImage:
+          typeof compatibleItem.supportsImage === 'boolean' ? compatibleItem.supportsImage : undefined,
+        vision: typeof compatibleItem.vision === 'boolean' ? compatibleItem.vision : undefined,
+        attachment: typeof compatibleItem.attachment === 'boolean' ? compatibleItem.attachment : undefined,
+        modalities: normalizeCodexCatalogModalities(compatibleItem.modalities),
+        reasoningLevels: normalizeCodexCatalogReasoningLevels(
+          Array.isArray(compatibleItem.reasoningLevels)
+            ? compatibleItem.reasoningLevels
+            : compatibleItem.reasoning_levels,
+        ),
+        defaultReasoningLevel:
+          typeof compatibleItem.defaultReasoningLevel === 'string' && compatibleItem.defaultReasoningLevel.trim()
+            ? compatibleItem.defaultReasoningLevel.trim()
+            : typeof compatibleItem.default_reasoning_level === 'string' && compatibleItem.default_reasoning_level.trim()
+              ? compatibleItem.default_reasoning_level.trim()
+              : undefined,
+      };
+    }),
+  );
+}
+
+function parseInitialCodexState(initialData?: { settingsConfig?: string }) {
+  if (!initialData?.settingsConfig) {
+    const defaultBaseUrl = extractCodexBaseUrl(DEFAULT_CONFIG_TOML) || '';
+    const defaultModel = extractCodexModel(DEFAULT_CONFIG_TOML) || '';
+
+    return {
+      category: 'custom' as CodexProviderCategory,
+      apiKey: '',
+      auth: {} as Record<string, unknown>,
+      baseUrl: defaultBaseUrl,
+      model: defaultModel,
+      config: DEFAULT_CONFIG_TOML,
+      catalogModels: [] as CodexCatalogModel[],
+      autoReviewModelOverride: '',
+    };
+  }
+
+  try {
+    const config: CodexSettingsConfig = JSON.parse(initialData.settingsConfig);
+    const authObj = config.auth || {};
+    const apiKey = typeof authObj.OPENAI_API_KEY === 'string' ? authObj.OPENAI_API_KEY : '';
+    const configStr = config.config || '';
+    const baseUrl = extractCodexBaseUrl(configStr) || '';
+    const model = extractCodexModel(configStr) || '';
+    const category: CodexProviderCategory = apiKey.trim() || baseUrl.trim() ? 'custom' : 'official';
+
+    return {
+      category,
+      apiKey,
+      auth: authObj as Record<string, unknown>,
+      baseUrl,
+      model,
+      config: configStr,
+      catalogModels: category === 'custom' ? parseCodexCatalogModels(config) : [],
+      autoReviewModelOverride:
+        category === 'custom' ? (resolveCodexAutoReviewModelOverride(config) || '') : '',
+    };
+  } catch {
+    return {
+      category: 'custom' as CodexProviderCategory,
+      apiKey: '',
+      auth: {} as Record<string, unknown>,
+      baseUrl: '',
+      model: '',
+      config: '',
+      catalogModels: [] as CodexCatalogModel[],
+      autoReviewModelOverride: '',
+    };
+  }
+}
+
 /**
  * Codex 配置状态管理 Hook
- * 参考 cc-switch 项目实现，提供字段与 TOML 配置的双向同步
  */
 export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = {}) {
-  // 解析初始数据
-  const parsedInitial = (() => {
-    if (!initialData?.settingsConfig) {
-      // 新建配置时使用默认模板
-      const defaultBaseUrl = extractCodexBaseUrl(DEFAULT_CONFIG_TOML) || '';
-      const defaultModel = extractCodexModel(DEFAULT_CONFIG_TOML) || '';
-      return { apiKey: '', auth: {}, baseUrl: defaultBaseUrl, model: defaultModel, config: DEFAULT_CONFIG_TOML };
-    }
-    try {
-      const config: CodexSettingsConfig = JSON.parse(initialData.settingsConfig);
-      const authObj = config.auth || {};
-      const apiKey = typeof authObj.OPENAI_API_KEY === 'string' ? authObj.OPENAI_API_KEY : '';
-      const configStr = config.config || '';
-      const baseUrl = extractCodexBaseUrl(configStr) || '';
-      const model = extractCodexModel(configStr) || '';
-      return { apiKey, auth: authObj, baseUrl, model, config: configStr };
-    } catch {
-      return { apiKey: '', auth: {}, baseUrl: '', model: '', config: '' };
-    }
-  })();
+  const parsedInitial = parseInitialCodexState(initialData);
 
   // 基础状态（使用解析后的初始值）
   const [codexApiKey, setCodexApiKey] = useState(parsedInitial.apiKey);
@@ -62,6 +162,11 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
   const [codexModel, setCodexModelState] = useState(parsedInitial.model);
   const [codexConfig, setCodexConfigState] = useState(parsedInitial.config);
   const [codexAuth, setCodexAuthState] = useState<Record<string, unknown>>(parsedInitial.auth);
+  const [codexCatalogModels, setCodexCatalogModels] = useState<CodexCatalogModel[]>(parsedInitial.catalogModels);
+  const [codexAutoReviewModelOverride, setCodexAutoReviewModelOverride] = useState(
+    parsedInitial.autoReviewModelOverride,
+  );
+  const [providerCategory, setProviderCategoryState] = useState<CodexProviderCategory>(parsedInitial.category);
 
   // 防止循环更新的标志位
   const isUpdatingBaseUrlRef = useRef(false);
@@ -104,13 +209,21 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
   const handleApiKeyChange = useCallback((key: string) => {
     const trimmedKey = key.trim();
     setCodexApiKey(trimmedKey);
+    if (trimmedKey) {
+      setProviderCategoryState('custom');
+    }
     // 标记正在从 API Key 输入框更新，需要同步到 auth.json 编辑器
     isUpdatingApiKeyRef.current = true;
     // 同步更新 auth.json，保留其他字段
-    setCodexAuthState((prev) => ({
-      ...prev,
-      OPENAI_API_KEY: trimmedKey,
-    }));
+    setCodexAuthState((prev) => {
+      const nextAuth = { ...prev };
+      if (trimmedKey) {
+        nextAuth.OPENAI_API_KEY = trimmedKey;
+      } else {
+        delete nextAuth.OPENAI_API_KEY;
+      }
+      return nextAuth;
+    });
     // 使用 requestAnimationFrame 确保在下一帧重置
     requestAnimationFrame(() => {
       setTimeout(() => {
@@ -133,6 +246,9 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
   const handleBaseUrlChange = useCallback((url: string) => {
     const sanitized = normalizeQuotes(url).replace(/['"`]/g, '').trim();
     setCodexBaseUrlState(sanitized);
+    if (sanitized) {
+      setProviderCategoryState('custom');
+    }
 
     // 标记用户已在输入框中设置值，后续不再从 TOML 编辑器覆盖
     userSetBaseUrlRef.current = true;
@@ -236,6 +352,11 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
 
     setCodexBaseUrlState(baseUrl);
     setCodexModelState(model);
+    setCodexCatalogModels([]);
+    setCodexAutoReviewModelOverride('');
+    setProviderCategoryState(
+      apiKey.trim() || baseUrl.trim() ? 'custom' : 'official',
+    );
 
     // 从 config 中移除已提取的字段
     let cleanedConfig = config;
@@ -249,35 +370,79 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
     setCodexConfigState(cleanedConfig);
   }, []);
 
+  const resetFromSettingsConfig = useCallback((settingsConfig?: string) => {
+    const nextState = parseInitialCodexState(
+      settingsConfig ? { settingsConfig } : undefined,
+    );
+
+    userSetBaseUrlRef.current = false;
+    userSetModelRef.current = false;
+    isUpdatingBaseUrlRef.current = false;
+    isUpdatingModelRef.current = false;
+    isUpdatingApiKeyRef.current = false;
+
+    setCodexApiKey(nextState.apiKey);
+    setCodexAuthState(nextState.auth);
+    setCodexBaseUrlState(nextState.baseUrl);
+    setCodexModelState(nextState.model);
+    setCodexConfigState(nextState.config);
+    setCodexCatalogModels(nextState.catalogModels);
+    setCodexAutoReviewModelOverride(nextState.autoReviewModelOverride);
+    setProviderCategoryState(nextState.category);
+  }, []);
+
+  const handleProviderCategoryChange = useCallback((nextCategory: CodexProviderCategory) => {
+    setProviderCategoryState(nextCategory);
+
+    if (nextCategory === 'official') {
+      setCodexApiKey('');
+      setCodexBaseUrlState('');
+      setCodexAuthState((prev) => {
+        const nextAuth = { ...prev };
+        delete nextAuth.OPENAI_API_KEY;
+        return nextAuth;
+      });
+      userSetBaseUrlRef.current = false;
+      setCodexCatalogModels([]);
+      setCodexAutoReviewModelOverride('');
+      setCodexConfigState((prev) => normalizeCodexConfigForOfficialMode(prev));
+    } else {
+      setCodexConfigState((prev) => ensureCodexCustomProviderConfig(prev));
+    }
+  }, []);
+
+  const handleAutoReviewModelOverrideChange = useCallback((value: string) => {
+    setCodexAutoReviewModelOverride(value);
+  }, []);
+
   // 获取最终的 settingsConfig（用于保存）
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const getFinalSettingsConfig = useCallback((externalConfig?: string): string => {
-    // 如果传入了外部配置，优先使用它；否则使用内部状态
-    let finalConfig = externalConfig !== undefined ? externalConfig : codexConfig;
-
-    // 写入 base_url
-    if (codexBaseUrl) {
-      finalConfig = setCodexBaseUrl(finalConfig, codexBaseUrl);
-    }
-
-    // 写入 model
-    if (codexModel) {
-      finalConfig = setCodexModel(finalConfig, codexModel);
-    }
-
-    // 使用完整的 auth.json 内容，但确保 OPENAI_API_KEY 使用输入框的值
-    const finalAuth = {
-      ...codexAuth,
-      OPENAI_API_KEY: codexApiKey,
-    };
-
-    const settingsConfig: CodexSettingsConfig = {
-      auth: finalAuth,
-      config: finalConfig.trim(),
-    };
-
-    return JSON.stringify(settingsConfig);
-  }, [codexApiKey, codexAuth, codexBaseUrl, codexModel, codexConfig]);
+  const getFinalSettingsConfig = useCallback((snapshot: CodexSettingsConfigSnapshot = {}): string => {
+    const finalCategory = snapshot.category ?? providerCategory;
+    const finalApiKey = snapshot.apiKey ?? codexApiKey;
+    const finalBaseUrl = snapshot.baseUrl ?? codexBaseUrl;
+    const finalModel = snapshot.model ?? codexModel;
+    return buildCodexSettingsConfig({
+      category: finalCategory,
+      apiKey: finalApiKey,
+      baseUrl: finalBaseUrl,
+      model: finalModel,
+      config: snapshot.config ?? codexConfig,
+      catalogModels: snapshot.catalogModels ?? codexCatalogModels,
+      autoReviewModelOverride:
+        snapshot.autoReviewModelOverride ?? codexAutoReviewModelOverride,
+      auth: codexAuth,
+    });
+  }, [
+    codexApiKey,
+    codexAuth,
+    codexAutoReviewModelOverride,
+    codexBaseUrl,
+    codexCatalogModels,
+    codexModel,
+    codexConfig,
+    providerCategory,
+  ]);
 
   return {
     // 状态
@@ -286,6 +451,9 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
     codexBaseUrl,
     codexModel,
     codexConfig,
+    codexCatalogModels,
+    codexAutoReviewModelOverride,
+    providerCategory,
 
     // 标志位（用于同步控制）
     isUpdatingApiKeyRef,
@@ -296,10 +464,15 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps = 
     handleBaseUrlChange,
     handleModelChange,
     handleConfigChange,
+    handleAutoReviewModelOverrideChange,
+    handleProviderCategoryChange,
 
     // 工具方法
     setCodexConfig,
+    setCodexCatalogModels,
+    setCodexAutoReviewModelOverride,
     resetCodexConfig,
+    resetFromSettingsConfig,
     getFinalSettingsConfig,
   };
 }

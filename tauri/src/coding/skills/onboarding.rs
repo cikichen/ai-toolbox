@@ -8,7 +8,8 @@ use super::content_hash::hash_dir;
 use super::skill_store;
 use super::tool_adapters::{get_all_tool_adapters, RuntimeToolAdapter};
 use super::types::{OnboardingGroup, OnboardingPlan, OnboardingVariant};
-use crate::DbState;
+use crate::coding::tools::claude_plugins::PluginInfo;
+use crate::SqliteDbState;
 
 /// Extra skill source directories to scan during onboarding discovery.
 /// These are third-party skill stores outside the built-in tool adapters.
@@ -20,21 +21,25 @@ struct ExtraSkillSource {
     skills_dir: &'static str,
 }
 
-const EXTRA_SKILL_SOURCES: &[ExtraSkillSource] = &[
-    ExtraSkillSource {
-        key: "cc_switch",
-        display_name: "CC Switch",
-        skills_dir: "~/.cc-switch/skills",
-    },
-];
+const EXTRA_SKILL_SOURCES: &[ExtraSkillSource] = &[ExtraSkillSource {
+    key: "cc_switch",
+    display_name: "CC Switch",
+    skills_dir: "~/.cc-switch/skills",
+}];
 
 /// Build an onboarding plan by scanning installed tools for existing skills
-pub async fn build_onboarding_plan(app: &tauri::AppHandle, state: &DbState) -> Result<OnboardingPlan> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?;
+pub async fn build_onboarding_plan(
+    app: &tauri::AppHandle,
+    state: &SqliteDbState,
+) -> Result<OnboardingPlan> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?;
     let central = resolve_central_repo_path(app, state).await?;
 
     // Get custom tools
-    let custom_tools = skill_store::get_custom_tools(state).await.unwrap_or_default();
+    let custom_tools = skill_store::get_custom_tools(state)
+        .await
+        .unwrap_or_default();
 
     // Get already managed target paths to exclude them
     let managed_targets = skill_store::list_all_skill_target_paths(state)
@@ -52,16 +57,29 @@ pub async fn build_onboarding_plan(app: &tauri::AppHandle, state: &DbState) -> R
         .into_iter()
         .map(|s| s.name)
         .collect::<std::collections::HashSet<_>>();
+    let claude_plugins =
+        crate::coding::tools::claude_plugins::get_installed_plugins(&state.db()).await;
 
     // Run the blocking file system operations in a dedicated thread pool
     // to avoid blocking the tokio async runtime
     tokio::task::spawn_blocking(move || {
+        // CC Switch per-skill enable markers (directory name -> tool keys).
+        // Missing/legacy DB just yields an empty map; disk directories stay the
+        // discovery source, the DB only annotates them.
+        let cc_switch_enabled =
+            crate::coding::cc_switch::list_cc_switch_skill_enabled_map(None).unwrap_or_default();
         let filter_ctx = FilterContext {
             exclude_root: Some(&central),
             managed_targets: Some(&managed_targets),
             managed_names: Some(&managed_names),
         };
-        build_onboarding_plan_in_home(&home, &filter_ctx, &custom_tools)
+        build_onboarding_plan_in_home(
+            &home,
+            &filter_ctx,
+            &custom_tools,
+            &claude_plugins,
+            &cc_switch_enabled,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))?
@@ -71,6 +89,8 @@ fn build_onboarding_plan_in_home(
     _home: &Path,
     filter_ctx: &FilterContext<'_>,
     custom_tools: &[super::types::CustomTool],
+    claude_plugins: &[PluginInfo],
+    cc_switch_enabled: &HashMap<String, Vec<String>>,
 ) -> Result<OnboardingPlan> {
     // Get all adapters (built-in + custom)
     let adapters = get_all_tool_adapters(custom_tools);
@@ -79,19 +99,18 @@ fn build_onboarding_plan_in_home(
 
     for adapter in &adapters {
         // Check if tool is installed using path_utils
-        let detect_path = crate::coding::tools::path_utils::resolve_storage_path(&adapter.relative_detect_dir);
+        let detect_path =
+            crate::coding::tools::path_utils::resolve_storage_path(&adapter.relative_detect_dir);
         if detect_path.is_none() || !detect_path.as_ref().unwrap().exists() {
             continue;
         }
         scanned += 1;
         // Resolve skills directory using path_utils to handle ~/  and %APPDATA%/ paths correctly
-        let dir = crate::coding::tools::path_utils::resolve_storage_path(&adapter.relative_skills_dir);
+        let dir =
+            crate::coding::tools::path_utils::resolve_storage_path(&adapter.relative_skills_dir);
         if let Some(skills_dir) = dir {
             let detected = scan_runtime_tool_dir(adapter, &skills_dir)?;
-            all_detected.extend(filter_detected(
-                detected,
-                filter_ctx,
-            ));
+            all_detected.extend(filter_detected(detected, filter_ctx));
         }
     }
 
@@ -107,20 +126,33 @@ fn build_onboarding_plan_in_home(
                     relative_detect_dir: source.skills_dir.to_string(),
                     is_custom: false,
                     force_copy: false,
+                    icon_url: None,
                 };
                 scanned += 1;
                 let detected = scan_runtime_tool_dir(&adapter, &dir)?;
-                all_detected.extend(filter_detected(
-                    detected,
-                    filter_ctx,
-                ));
+                // Attach per-skill enable markers for CC Switch, matched by
+                // directory name against the CCS DB (case-insensitive).
+                let detected = if source.key == "cc_switch" {
+                    detected
+                        .into_iter()
+                        .map(|mut skill| {
+                            skill.source_enabled_tools = cc_switch_enabled
+                                .get(&skill.name.to_ascii_lowercase())
+                                .cloned()
+                                .unwrap_or_default();
+                            skill
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    detected
+                };
+                all_detected.extend(filter_detected(detected, filter_ctx));
             }
         }
     }
 
     // Scan Claude Code plugins for skills
-    let plugins = crate::coding::tools::claude_plugins::get_installed_plugins();
-    for plugin in &plugins {
+    for plugin in claude_plugins {
         let skills_dir = plugin.install_path.join("skills");
         if !skills_dir.exists() {
             continue;
@@ -132,13 +164,11 @@ fn build_onboarding_plan_in_home(
             relative_detect_dir: skills_dir.to_string_lossy().to_string(),
             is_custom: false,
             force_copy: true,
+            icon_url: None,
         };
         scanned += 1;
         let detected = scan_runtime_tool_dir(&adapter, &skills_dir)?;
-        all_detected.extend(filter_detected(
-            detected,
-            filter_ctx,
-        ));
+        all_detected.extend(filter_detected(detected, filter_ctx));
     }
 
     let mut grouped: HashMap<String, Vec<OnboardingVariant>> = HashMap::new();
@@ -152,8 +182,12 @@ fn build_onboarding_plan_in_home(
             path: skill.path.to_string_lossy().to_string(),
             fingerprint,
             is_link: skill.is_link,
-            link_target: skill.link_target.as_ref().map(|p| p.to_string_lossy().to_string()),
+            link_target: skill
+                .link_target
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             conflicting_tools: Vec::new(), // Will be calculated later
+            source_enabled_tools: skill.source_enabled_tools.clone(),
         });
     }
 
@@ -164,7 +198,10 @@ fn build_onboarding_plan_in_home(
             let mut fingerprint_tools: HashMap<String, Vec<String>> = HashMap::new();
             for v in &variants {
                 if let Some(ref fp) = v.fingerprint {
-                    fingerprint_tools.entry(fp.clone()).or_default().push(v.tool.clone());
+                    fingerprint_tools
+                        .entry(fp.clone())
+                        .or_default()
+                        .push(v.tool.clone());
                 }
             }
 
@@ -269,7 +306,10 @@ fn normalize_path_for_key(path: &Path) -> String {
 }
 
 /// Scan a tool directory for skills (using RuntimeToolAdapter)
-fn scan_runtime_tool_dir(adapter: &RuntimeToolAdapter, dir: &Path) -> Result<Vec<super::types::DetectedSkill>> {
+fn scan_runtime_tool_dir(
+    adapter: &RuntimeToolAdapter,
+    dir: &Path,
+) -> Result<Vec<super::types::DetectedSkill>> {
     let mut results = Vec::new();
     if !dir.exists() {
         return Ok(results);
@@ -310,6 +350,7 @@ fn scan_runtime_tool_dir(adapter: &RuntimeToolAdapter, dir: &Path) -> Result<Vec
             path,
             is_link,
             link_target,
+            source_enabled_tools: Vec::new(),
         });
     }
 

@@ -2,13 +2,49 @@ use chrono::Local;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use tauri::Manager;
 use zip::ZipArchive;
 
-use super::utils::{create_backup_zip, get_db_path, get_opencode_restore_dir, get_skills_dir};
-use crate::db::DbState;
+use super::utils::{
+    clear_restored_cli_custom_roots, create_backup_zip, get_claude_desktop_settings_paths,
+    get_claude_mcp_restore_path, get_claude_restore_dir, get_codex_restore_dir, get_db_path,
+    get_dsh_restore_dir, get_gemini_cli_restore_dir, get_grok_restore_dir, get_hermes_restore_dir,
+    get_image_assets_dir, get_kimi_restore_dir, get_opencode_auth_restore_path,
+    get_opencode_restore_dir, get_skills_dir, harden_restored_sensitive_file,
+    normalize_restore_entry_name, push_restore_warning, read_backup_meta_from_archive,
+    read_root_dir_override, record_restored_external_config_wsl_module,
+    resolve_external_config_restore_output_path, resolve_restore_dir_override,
+    resolve_skills_restore_output_path, restore_claude_external_config_file,
+    restore_custom_backup_entries, restore_sqlite_database_snapshot_from_zip,
+    sanitize_restored_claude_database_for_current_os, should_filter_external_config_entry,
+    should_reapply_applied_runtime, should_skip_external_config_on_restore,
+    should_use_root_override_for_tool, write_post_restore_flags, RestoreResult,
+};
+use crate::db::SqliteDbState;
 use crate::http_client;
+use crate::settings::store;
+use crate::settings::types::default_backup_file_filter_rules;
+
+fn get_home_dir() -> Result<std::path::PathBuf, String> {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .map_err(|_| "Failed to get home directory".to_string())
+}
+
+#[cfg(unix)]
+fn set_pi_auth_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_pi_auth_file_permissions(_path: &Path) {}
 
 /// Backup file info structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +116,33 @@ fn analyze_http_error(status: reqwest::StatusCode, url: &str) -> WebDAVError {
     }
 }
 
+/// 分析 WebDAV 下载（GET）失败响应，并识别「下载被重定向到外部 host」的场景。
+///
+/// 某些 WebDAV 服务端（如 OpenList/AList 开启「302 重定向」下载策略）对 GET 返回 3xx，
+/// 把下载重定向到上游网盘的 CDN 签名地址（如 115 防盗链链接）。通用客户端拿不到 CDN
+/// 要求的 Cookie/IP 绑定信息，会得到 403；这种 403 跟“账号认证失败”无关，直接映射成
+/// `authFailed` 会误导用户。当最终响应 host 与配置的 WebDAV host 不同且返回 403 时，
+/// 返回专门针对该场景的诊断提示；其余情况沿用通用 `analyze_http_error` 语义。
+fn analyze_download_error(resp: &reqwest::Response, original_url: &str) -> WebDAVError {
+    let original_host = reqwest::Url::parse(original_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let redirected_external = original_host
+        .as_deref()
+        .map(|origin| resp.url().host_str() != Some(origin))
+        .unwrap_or(false);
+
+    if resp.status().as_u16() == 403 && redirected_external {
+        WebDAVError::new(
+            "DOWNLOAD_REDIRECT",
+            "Download was redirected to an external CDN that refused access",
+            "settings.webdav.errors.downloadRedirect",
+        )
+    } else {
+        analyze_http_error(resp.status(), original_url)
+    }
+}
+
 /// 分析 reqwest 错误并返回详细信息
 fn analyze_reqwest_error(err: &reqwest::Error, url: &str) -> WebDAVError {
     if err.is_timeout() {
@@ -112,7 +175,7 @@ fn analyze_reqwest_error(err: &reqwest::Error, url: &str) -> WebDAVError {
 /// Test WebDAV connection
 #[tauri::command]
 pub async fn test_webdav_connection(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     url: String,
     username: String,
     password: String,
@@ -136,7 +199,10 @@ pub async fn test_webdav_connection(
     })?;
 
     let response = client
-        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &folder_url)
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            &folder_url,
+        )
         .basic_auth(&username, Some(&password))
         .header("Depth", "0")
         .send()
@@ -165,7 +231,7 @@ pub async fn test_webdav_connection(
 #[tauri::command]
 pub async fn backup_to_webdav(
     app_handle: tauri::AppHandle,
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     url: String,
     username: String,
     password: String,
@@ -178,15 +244,27 @@ pub async fn backup_to_webdav(
 
     // Ensure database directory exists
     if !db_path.exists() {
-        fs::create_dir_all(&db_path)
-            .map_err(|e| {
-                error!("Failed to create database dir: {}", e);
-                format!("Failed to create database dir: {}", e)
-            })?;
+        fs::create_dir_all(&db_path).map_err(|e| {
+            error!("Failed to create database dir: {}", e);
+            format!("Failed to create database dir: {}", e)
+        })?;
     }
 
+    let sqlite_state = app_handle.state::<SqliteDbState>();
+    let settings = store::load_settings_from_sqlite_state(&sqlite_state)?;
+    let backup_image_assets_enabled = settings.backup_image_assets_enabled;
+    let backup_cli_config_files_enabled = settings.backup_cli_config_files_enabled;
+    let filter_rules = settings.backup_file_filter_rules.clone();
+
     // Create backup zip in memory
-    let zip_data = create_backup_zip(&app_handle, &db_path)?;
+    let zip_data = create_backup_zip(
+        &app_handle,
+        &db_path,
+        backup_image_assets_enabled,
+        backup_cli_config_files_enabled,
+        &filter_rules,
+    )
+    .await?;
 
     // Generate backup filename with timestamp and optional host label
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
@@ -244,7 +322,7 @@ pub async fn backup_to_webdav(
 
 /// Internal function: List backup files from WebDAV server
 pub(crate) async fn list_webdav_backups_internal(
-    db_state: &DbState,
+    db_state: &SqliteDbState,
     url: &str,
     username: &str,
     password: &str,
@@ -273,7 +351,10 @@ pub(crate) async fn list_webdav_backups_internal(
 </d:propfind>"#;
 
     let response = client
-        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &folder_url)
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            &folder_url,
+        )
         .basic_auth(username, Some(password))
         .header("Depth", "1")
         .header("Content-Type", "application/xml; charset=utf-8")
@@ -330,7 +411,8 @@ pub(crate) async fn list_webdav_backups_internal(
 
             // Try to find size in the same block
             let size = if let Some(size_match) = size_re.captures(response_block) {
-                size_match.get(1)
+                size_match
+                    .get(1)
                     .and_then(|m| m.as_str().parse::<u64>().ok())
                     .unwrap_or(0)
             } else {
@@ -351,7 +433,7 @@ pub(crate) async fn list_webdav_backups_internal(
 /// List backup files from WebDAV server
 #[tauri::command]
 pub async fn list_webdav_backups(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     url: String,
     username: String,
     password: String,
@@ -362,7 +444,7 @@ pub async fn list_webdav_backups(
 
 /// Internal function: Delete a backup file from WebDAV server
 pub(crate) async fn delete_webdav_backup_internal(
-    db_state: &DbState,
+    db_state: &SqliteDbState,
     url: &str,
     username: &str,
     password: &str,
@@ -414,7 +496,7 @@ pub(crate) async fn delete_webdav_backup_internal(
 /// Delete a backup file from WebDAV server
 #[tauri::command]
 pub async fn delete_webdav_backup(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     url: String,
     username: String,
     password: String,
@@ -424,25 +506,19 @@ pub async fn delete_webdav_backup(
     delete_webdav_backup_internal(&state, &url, &username, &password, &remote_path, &filename).await
 }
 
-/// Get home directory
-fn get_home_dir() -> Result<PathBuf, String> {
-    std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .map(PathBuf::from)
-        .map_err(|_| "Failed to get home directory".to_string())
-}
-
 /// Restore database from WebDAV server
 #[tauri::command]
 pub async fn restore_from_webdav(
     app_handle: tauri::AppHandle,
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     url: String,
     username: String,
     password: String,
     remote_path: String,
     filename: String,
-) -> Result<(), String> {
+    skip_cli_custom_roots: Option<bool>,
+) -> Result<RestoreResult, String> {
+    let skip_cli_custom_roots = skip_cli_custom_roots.unwrap_or(false);
     info!("Starting WebDAV restore from: {}/{}", url, filename);
 
     let db_path = get_db_path(&app_handle)?;
@@ -480,7 +556,7 @@ pub async fn restore_from_webdav(
                     format!("Failed to read response: {}", e)
                 })?
             } else {
-                let error = analyze_http_error(resp.status(), &full_url);
+                let error = analyze_download_error(&resp, &full_url);
                 error!("WebDAV download failed: {:?}", error);
                 return Err(error.to_json());
             }
@@ -496,11 +572,10 @@ pub async fn restore_from_webdav(
 
     // Extract zip contents
     let cursor = std::io::Cursor::new(zip_data);
-    let mut archive =
-        ZipArchive::new(cursor).map_err(|e| {
-            error!("Failed to read zip archive: {}", e);
-            format!("Failed to read zip archive: {}", e)
-        })?;
+    let mut archive = ZipArchive::new(cursor).map_err(|e| {
+        error!("Failed to read zip archive: {}", e);
+        format!("Failed to read zip archive: {}", e)
+    })?;
 
     // Check if this is a new format backup (with db/ prefix) or old format
     let is_new_format = (0..archive.len()).any(|i| {
@@ -510,35 +585,232 @@ pub async fn restore_from_webdav(
             .unwrap_or(false)
     });
 
+    // Read pre-restore settings BEFORE overwriting SQLite.
+    let (filter_rules, include_cli_config_files) = {
+        let sqlite_state = app_handle.state::<SqliteDbState>();
+        match store::load_settings_from_sqlite_state(&sqlite_state) {
+            Ok(settings) => (
+                settings.backup_file_filter_rules,
+                settings.backup_cli_config_files_enabled,
+            ),
+            Err(_) => (default_backup_file_filter_rules(), true),
+        }
+    };
+    // When false, only optional (DB-backed) CLI runtime files are skipped on restore.
+    // OpenCode / OpenClaw / Pi remain always-restored when present in the zip.
+    let skipped_optional_cli_runtime = !include_cli_config_files;
+    let backup_meta = read_backup_meta_from_archive(&mut archive);
+
+    let restored_sqlite = restore_sqlite_database_snapshot_from_zip(&mut archive, &app_handle)?;
+    if restored_sqlite {
+        sanitize_restored_claude_database_for_current_os(&app_handle)?;
+        // Only clear roots on the restored snapshot — never mutate the live DB when
+        // the backup did not include/replace sqlite/.
+        if skip_cli_custom_roots {
+            let sqlite_state = app_handle.state::<SqliteDbState>();
+            clear_restored_cli_custom_roots(&sqlite_state)?;
+        }
+    }
+
+    // Legacy SurrealDB-only backups (db/ entries, no sqlite/ snapshot) cannot be
+    // restored: the app no longer ships the SurrealDB import path, so a restored
+    // legacy dir would be silently ignored on next startup. Fail loudly instead of
+    // pretending success.
+    if !restored_sqlite && is_new_format {
+        return Err(
+            "该备份是旧版 SurrealDB 格式，当前应用已不再支持，无法恢复此备份。请使用新版应用创建的备份文件。"
+                .to_string(),
+        );
+    }
+
     // Remove existing database directory
     if db_path.exists() {
         info!("Removing existing database directory");
-        fs::remove_dir_all(&db_path)
-            .map_err(|e| {
-                error!("Failed to remove existing database: {}", e);
-                format!("Failed to remove existing database: {}", e)
-            })?;
+        fs::remove_dir_all(&db_path).map_err(|e| {
+            error!("Failed to remove existing database: {}", e);
+            format!("Failed to remove existing database: {}", e)
+        })?;
     }
 
     // Create database directory
-    fs::create_dir_all(&db_path)
-        .map_err(|e| {
-            error!("Failed to create database directory: {}", e);
-            format!("Failed to create database directory: {}", e)
-        })?;
+    fs::create_dir_all(&db_path).map_err(|e| {
+        error!("Failed to create database directory: {}", e);
+        format!("Failed to create database directory: {}", e)
+    })?;
 
-    // Get home directory for external configs
     let home_dir = get_home_dir()?;
+    // Always-include tools may still read root-dir.txt when optional CLI files are skipped.
+    // Never read overrides when the user explicitly requested local/default roots.
+    let opencode_restore_dir_override = should_use_root_override_for_tool(
+        "opencode",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/opencode/root-dir.txt"))
+    .flatten();
+    let claude_restore_dir_override = should_use_root_override_for_tool(
+        "claude",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/claude/root-dir.txt"))
+    .flatten();
+    let codex_restore_dir_override =
+        should_use_root_override_for_tool("codex", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/codex/root-dir.txt"))
+            .flatten();
+    let grok_restore_dir_override =
+        should_use_root_override_for_tool("grok", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/grok/root-dir.txt"))
+            .flatten();
+    let kimi_restore_dir_override =
+        should_use_root_override_for_tool("kimi", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/kimi/root-dir.txt"))
+            .flatten();
+    let openclaw_restore_dir_override = should_use_root_override_for_tool(
+        "openclaw",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/openclaw/root-dir.txt"))
+    .flatten();
+    let gemini_cli_restore_dir_override = should_use_root_override_for_tool(
+        "geminicli",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/geminicli/root-dir.txt"))
+    .flatten();
+    let pi_restore_dir_override =
+        should_use_root_override_for_tool("pi", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/pi/root-dir.txt"))
+            .flatten();
+    let oh_my_pi_restore_dir_override = should_use_root_override_for_tool(
+        "oh_my_pi",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/oh_my_pi/root-dir.txt"))
+    .flatten();
+    let hermes_restore_dir_override = should_use_root_override_for_tool(
+        "hermes",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/hermes/root-dir.txt"))
+    .flatten();
+    let dsh_restore_dir_override =
+        should_use_root_override_for_tool("dsh", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/dsh/root-dir.txt"))
+            .flatten();
+    let mut restore_result = RestoreResult::default();
+    let mut restored_wsl_modules = Vec::new();
+
+    let (opencode_restore_dir, opencode_warning) = resolve_restore_dir_override(
+        "opencode",
+        opencode_restore_dir_override,
+        get_opencode_restore_dir()?,
+    );
+    if let Some(warning) = opencode_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (claude_restore_dir, claude_warning) = resolve_restore_dir_override(
+        "claude",
+        claude_restore_dir_override,
+        get_claude_restore_dir()?,
+    );
+    if let Some(warning) = claude_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (codex_restore_dir, codex_warning) = resolve_restore_dir_override(
+        "codex",
+        codex_restore_dir_override,
+        get_codex_restore_dir()?,
+    );
+    if let Some(warning) = codex_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+    let (grok_restore_dir, grok_warning) =
+        resolve_restore_dir_override("grok", grok_restore_dir_override, get_grok_restore_dir()?);
+    if let Some(warning) = grok_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+    let (kimi_restore_dir, kimi_warning) =
+        resolve_restore_dir_override("kimi", kimi_restore_dir_override, get_kimi_restore_dir()?);
+    if let Some(warning) = kimi_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (openclaw_restore_dir, openclaw_warning) = resolve_restore_dir_override(
+        "openclaw",
+        openclaw_restore_dir_override,
+        home_dir.join(".openclaw"),
+    );
+    if let Some(warning) = openclaw_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (gemini_cli_restore_dir, gemini_cli_warning) = resolve_restore_dir_override(
+        "geminicli",
+        gemini_cli_restore_dir_override,
+        get_gemini_cli_restore_dir()?,
+    );
+    if let Some(warning) = gemini_cli_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (pi_restore_dir, pi_warning) = resolve_restore_dir_override(
+        "pi",
+        pi_restore_dir_override,
+        home_dir.join(".pi").join("agent"),
+    );
+    if let Some(warning) = pi_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (oh_my_pi_restore_dir, oh_my_pi_warning) = resolve_restore_dir_override(
+        "oh_my_pi",
+        oh_my_pi_restore_dir_override,
+        home_dir.join(".omp").join("agent"),
+    );
+    if let Some(warning) = oh_my_pi_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (hermes_restore_dir, hermes_warning) = resolve_restore_dir_override(
+        "hermes",
+        hermes_restore_dir_override,
+        get_hermes_restore_dir()?,
+    );
+    if let Some(warning) = hermes_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (dsh_restore_dir, dsh_warning) =
+        resolve_restore_dir_override("dsh", dsh_restore_dir_override, get_dsh_restore_dir()?);
+    if let Some(warning) = dsh_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
 
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
             .map_err(|e| format!("Failed to read zip entry: {}", e))?;
 
-        let file_name = file.name().to_string();
+        let file_name = normalize_restore_entry_name(file.name());
 
         // Skip backup marker file
         if file_name == ".backup_marker" || file_name == "db/.backup_marker" {
+            continue;
+        }
+        if file_name == "backup_meta.json" {
+            continue;
+        }
+        // Skip optional (DB-backed) CLI runtime configs when the pre-restore setting disables them.
+        // OpenCode / OpenClaw / Pi always restore when present.
+        if should_skip_external_config_on_restore(include_cli_config_files, &file_name) {
             continue;
         }
 
@@ -571,31 +843,40 @@ pub async fn restore_from_webdav(
             } else if file_name.starts_with("external-configs/opencode/") {
                 // OpenCode config - restore to appropriate directory based on env/shell/default
                 let relative_path = &file_name[26..]; // Remove "external-configs/opencode/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
                     continue;
                 }
 
-                // auth.json should be restored to ~/.local/share/opencode/
-                // config files (opencode.json, opencode.jsonc) should go to config dir
+                if should_filter_external_config_entry(&filter_rules, "opencode", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "opencode");
+
                 if relative_path == "auth.json" {
-                    let auth_dir = home_dir.join(".local").join("share").join("opencode");
+                    let outpath = get_opencode_auth_restore_path(Some(&opencode_restore_dir))?;
+                    let auth_dir = outpath.parent().ok_or_else(|| {
+                        "Failed to determine OpenCode auth parent directory".to_string()
+                    })?;
                     if !auth_dir.exists() {
-                        fs::create_dir_all(&auth_dir)
-                            .map_err(|e| format!("Failed to create opencode auth directory: {}", e))?;
+                        fs::create_dir_all(&auth_dir).map_err(|e| {
+                            format!("Failed to create opencode auth directory: {}", e)
+                        })?;
                     }
-                    let outpath = auth_dir.join("auth.json");
                     let mut outfile = std::fs::File::create(&outpath)
                         .map_err(|e| format!("Failed to create file: {}", e))?;
                     std::io::copy(&mut file, &mut outfile)
                         .map_err(|e| format!("Failed to extract file: {}", e))?;
                 } else {
-                    let opencode_dir = get_opencode_restore_dir()?;
-                    if !opencode_dir.exists() {
-                        fs::create_dir_all(&opencode_dir)
-                            .map_err(|e| format!("Failed to create opencode config directory: {}", e))?;
+                    if !opencode_restore_dir.exists() {
+                        fs::create_dir_all(&opencode_restore_dir).map_err(|e| {
+                            format!("Failed to create opencode config directory: {}", e)
+                        })?;
                     }
 
-                    let outpath = opencode_dir.join(relative_path);
+                    let outpath = opencode_restore_dir.join(relative_path);
 
                     // Just copy the file - MCP cmd /c normalization will be handled
                     // by mcp_sync_all during startup resync (triggered by .resync_required flag)
@@ -607,38 +888,80 @@ pub async fn restore_from_webdav(
             } else if file_name.starts_with("external-configs/claude/") {
                 // Claude settings
                 let relative_path = &file_name[24..]; // Remove "external-configs/claude/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
                     continue;
                 }
 
-                let claude_dir = home_dir.join(".claude");
-                if !claude_dir.exists() {
-                    fs::create_dir_all(&claude_dir)
-                        .map_err(|e| format!("Failed to create claude config directory: {}", e))?;
+                if should_filter_external_config_entry(&filter_rules, "claude", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "claude");
+
+                let outpath = if relative_path == ".claude.json" {
+                    get_claude_mcp_restore_path(Some(&claude_restore_dir))?
+                } else {
+                    claude_restore_dir.join(relative_path)
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create claude config directory: {}", e)
+                        })?;
+                    }
+                }
+                restore_claude_external_config_file(&mut file, &outpath, relative_path)?;
+            } else if file_name.starts_with("external-configs/openclaw/") {
+                let relative_path = &file_name[26..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
                 }
 
-                let outpath = claude_dir.join(relative_path);
+                if should_filter_external_config_entry(&filter_rules, "openclaw", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "openclaw");
 
-                // Note: Claude's MCP config is in ~/.claude.json, not ~/.claude/settings.json
-                // settings.json contains other settings without MCP, so just copy it directly
+                if !openclaw_restore_dir.exists() {
+                    fs::create_dir_all(&openclaw_restore_dir).map_err(|e| {
+                        format!("Failed to create openclaw config directory: {}", e)
+                    })?;
+                }
+
+                let outpath = openclaw_restore_dir.join(relative_path);
                 let mut outfile = std::fs::File::create(&outpath)
                     .map_err(|e| format!("Failed to create file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile)
                     .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == "auth.json" {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
             } else if file_name.starts_with("external-configs/codex/") {
                 // Codex settings
                 let relative_path = &file_name[23..]; // Remove "external-configs/codex/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
                     continue;
                 }
 
-                let codex_dir = home_dir.join(".codex");
-                if !codex_dir.exists() {
-                    fs::create_dir_all(&codex_dir)
+                if should_filter_external_config_entry(&filter_rules, "codex", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "codex");
+
+                if !codex_restore_dir.exists() {
+                    fs::create_dir_all(&codex_restore_dir)
                         .map_err(|e| format!("Failed to create codex config directory: {}", e))?;
                 }
 
-                let outpath = codex_dir.join(relative_path);
+                let outpath = codex_restore_dir.join(relative_path);
 
                 // Just copy the file - MCP cmd /c normalization will be handled
                 // by mcp_sync_all during startup resync (triggered by .resync_required flag)
@@ -646,9 +969,313 @@ pub async fn restore_from_webdav(
                     .map_err(|e| format!("Failed to create file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile)
                     .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == "auth.json" {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/grok/") {
+                let relative_path = &file_name["external-configs/grok/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+                if should_filter_external_config_entry(&filter_rules, "grok", relative_path) {
+                    continue;
+                }
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&grok_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "grok");
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create Grok restore directory: {}", e))?;
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if matches!(relative_path, "auth.json" | "config.toml") {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/kimi/") {
+                let relative_path = &file_name["external-configs/kimi/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+                if should_filter_external_config_entry(&filter_rules, "kimi", relative_path) {
+                    continue;
+                }
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&kimi_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "kimi");
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create Kimi restore directory: {}", e))?;
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if matches!(relative_path, "config.toml")
+                    || relative_path.starts_with("credentials/")
+                {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/geminicli/") {
+                let relative_path = &file_name["external-configs/geminicli/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "geminicli", relative_path) {
+                    continue;
+                }
+
+                if !gemini_cli_restore_dir.exists() {
+                    fs::create_dir_all(&gemini_cli_restore_dir).map_err(|e| {
+                        format!("Failed to create Gemini CLI config directory: {}", e)
+                    })?;
+                }
+
+                let Some(outpath) = resolve_external_config_restore_output_path(
+                    &gemini_cli_restore_dir,
+                    relative_path,
+                )?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "geminicli");
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Gemini CLI parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            } else if file_name.starts_with("external-configs/pi/") {
+                let relative_path = &file_name["external-configs/pi/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "pi", relative_path) {
+                    continue;
+                }
+
+                if !pi_restore_dir.exists() {
+                    fs::create_dir_all(&pi_restore_dir)
+                        .map_err(|e| format!("Failed to create Pi config directory: {}", e))?;
+                }
+
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&pi_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "pi");
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Pi config parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == "auth.json" {
+                    set_pi_auth_file_permissions(&outpath);
+                }
+            } else if file_name.starts_with("external-configs/oh_my_pi/") {
+                let relative_path = &file_name["external-configs/oh_my_pi/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "oh_my_pi", relative_path) {
+                    continue;
+                }
+
+                if !oh_my_pi_restore_dir.exists() {
+                    fs::create_dir_all(&oh_my_pi_restore_dir).map_err(|e| {
+                        format!("Failed to create Oh My Pi config directory: {}", e)
+                    })?;
+                }
+
+                let Some(outpath) = resolve_external_config_restore_output_path(
+                    &oh_my_pi_restore_dir,
+                    relative_path,
+                )?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "oh_my_pi");
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Oh My Pi config parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            } else if file_name.starts_with("external-configs/hermes/") {
+                let relative_path = &file_name["external-configs/hermes/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "hermes", relative_path) {
+                    continue;
+                }
+
+                if !hermes_restore_dir.exists() {
+                    fs::create_dir_all(&hermes_restore_dir)
+                        .map_err(|e| format!("Failed to create Hermes config directory: {}", e))?;
+                }
+
+                let Some(outpath) = resolve_external_config_restore_output_path(
+                    &hermes_restore_dir,
+                    relative_path,
+                )?
+                else {
+                    continue;
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Hermes parent directory: {}", e)
+                        })?;
+                    }
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "hermes");
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            } else if file_name.starts_with("external-configs/dsh/") {
+                let relative_path = &file_name["external-configs/dsh/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "dsh", relative_path) {
+                    continue;
+                }
+
+                if !dsh_restore_dir.exists() {
+                    fs::create_dir_all(&dsh_restore_dir)
+                        .map_err(|e| format!("Failed to create dsh config directory: {}", e))?;
+                }
+
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&dsh_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent)
+                            .map_err(|e| format!("Failed to create dsh parent directory: {}", e))?;
+                    }
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "dsh");
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == ".credentials.yaml" {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/claude_desktop/") {
+                let relative_path = &file_name["external-configs/claude_desktop/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(
+                    &filter_rules,
+                    "claude_desktop",
+                    relative_path,
+                ) {
+                    continue;
+                }
+
+                let Some((normal_config_path, config_library_path)) =
+                    get_claude_desktop_settings_paths()
+                else {
+                    continue;
+                };
+                let outpath = if relative_path == "claude_desktop_config.json" {
+                    let parent = normal_config_path.parent().ok_or_else(|| {
+                        "Failed to resolve Claude Desktop config directory".to_string()
+                    })?;
+                    let Some(outpath) =
+                        resolve_external_config_restore_output_path(parent, relative_path)?
+                    else {
+                        continue;
+                    };
+                    outpath
+                } else if let Some(rest) = relative_path.strip_prefix("configLibrary/") {
+                    let Some(outpath) =
+                        resolve_external_config_restore_output_path(&config_library_path, rest)?
+                    else {
+                        continue;
+                    };
+                    outpath
+                } else {
+                    continue;
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Claude Desktop parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
             } else if file_name == "models.dev.json" {
                 // Restore models.dev.json to app data directory
-                if let Some(cache_path) = crate::coding::open_code::free_models::get_models_cache_path() {
+                if let Some(cache_path) =
+                    crate::coding::open_code::free_models::get_models_cache_path()
+                {
                     if let Some(parent) = cache_path.parent() {
                         if !parent.exists() {
                             fs::create_dir_all(parent)
@@ -660,30 +1287,110 @@ pub async fn restore_from_webdav(
                     std::io::copy(&mut file, &mut outfile)
                         .map_err(|e| format!("Failed to extract models cache file: {}", e))?;
                 }
+            } else if file_name == "preset_models.json" {
+                // Restore preset_models.json to app data directory
+                if let Some(cache_path) =
+                    crate::coding::preset_models::get_preset_models_cache_path()
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        if !parent.exists() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+                        }
+                    }
+                    let mut outfile = std::fs::File::create(&cache_path)
+                        .map_err(|e| format!("Failed to create preset models cache file: {}", e))?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                        format!("Failed to extract preset models cache file: {}", e)
+                    })?;
+                }
+            } else if file_name == "model_pricing.json" {
+                // Restore model_pricing.json to app data directory
+                if let Some(cache_path) =
+                    crate::db::model_pricing_seed::get_model_pricing_cache_path()
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        if !parent.exists() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+                        }
+                    }
+                    let mut outfile = std::fs::File::create(&cache_path)
+                        .map_err(|e| format!("Failed to create model pricing cache file: {}", e))?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                        format!("Failed to extract model pricing cache file: {}", e)
+                    })?;
+                }
+            } else if file_name == "gateway_provider_profiles.json" {
+                // Restore gateway_provider_profiles.json to app data directory
+                if let Some(cache_path) =
+                    crate::coding::proxy_gateway::provider_profiles::get_gateway_provider_profiles_cache_path()
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        if !parent.exists() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+                        }
+                    }
+                    let mut outfile = std::fs::File::create(&cache_path).map_err(|e| {
+                        format!("Failed to create gateway provider profiles cache file: {}", e)
+                    })?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                        format!("Failed to extract gateway provider profiles cache file: {}", e)
+                    })?;
+                }
             } else if file_name.starts_with("skills/") {
                 // Restore skills directory
-                let relative_path = &file_name[7..]; // Remove "skills/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
-                    continue;
-                }
-
                 let skills_dir = get_skills_dir(&app_handle)?;
                 if !skills_dir.exists() {
                     fs::create_dir_all(&skills_dir)
                         .map_err(|e| format!("Failed to create skills directory: {}", e))?;
                 }
 
-                let outpath = skills_dir.join(relative_path);
+                let Some((outpath, warning)) =
+                    resolve_skills_restore_output_path(&skills_dir, &file_name)?
+                else {
+                    continue;
+                };
+                if let Some(warning) = warning {
+                    push_restore_warning(&mut restore_result, warning);
+                }
+
                 if let Some(parent) = outpath.parent() {
                     if !parent.exists() {
-                        fs::create_dir_all(parent)
-                            .map_err(|e| format!("Failed to create skills parent directory: {}", e))?;
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create skills parent directory: {}", e)
+                        })?;
                     }
                 }
                 let mut outfile = std::fs::File::create(&outpath)
                     .map_err(|e| format!("Failed to create skills file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile)
                     .map_err(|e| format!("Failed to extract skills file: {}", e))?;
+            } else if file_name.starts_with("image-studio/assets/") {
+                let relative_path = &file_name["image-studio/assets/".len()..];
+                if relative_path.is_empty() || file_name.ends_with('/') {
+                    continue;
+                }
+
+                let image_assets_dir = get_image_assets_dir(&app_handle)?;
+                if !image_assets_dir.exists() {
+                    fs::create_dir_all(&image_assets_dir)
+                        .map_err(|e| format!("Failed to create image assets directory: {}", e))?;
+                }
+
+                let outpath = image_assets_dir.join(relative_path);
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create image asset parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile = std::fs::File::create(&outpath)
+                    .map_err(|e| format!("Failed to create image asset file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract image asset file: {}", e))?;
             }
         } else {
             // Old format: all files are database files
@@ -707,14 +1414,13 @@ pub async fn restore_from_webdav(
         }
     }
 
-    // Create resync flag file to trigger skills and MCP resync on next startup
-    let app_data_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    let resync_flag = app_data_dir.join(".resync_required");
-    let _ = fs::write(&resync_flag, "1");
+    restore_custom_backup_entries(&mut archive)?;
+
+    let need_reapply =
+        should_reapply_applied_runtime(skipped_optional_cli_runtime, backup_meta.as_ref());
+    restore_result.will_reapply_applied = need_reapply;
+    write_post_restore_flags(&app_handle, need_reapply, &restored_wsl_modules)?;
 
     info!("WebDAV restore completed successfully");
-    Ok(())
+    Ok(restore_result)
 }

@@ -1,129 +1,467 @@
 use serde_json::Value;
+use std::collections::HashSet;
 
-use crate::coding::db_id::{db_record_id, db_new_id};
-use crate::DbState;
+use crate::coding::db_id::db_new_id;
+use crate::db::helpers::{
+    db_delete, db_delete_all, db_get, db_list, db_max_i64, db_put, db_query_by_field,
+};
+use crate::db::schema::{DbTable, JsonFieldPath, OrderDirection, OrderField, OrderSpec};
+use crate::db::SqliteDbState;
 
 use super::adapter::{
-    from_db_skill, from_db_skill_preferences, from_db_skill_repo, get_sync_detail,
-    parse_sync_details, remove_sync_detail, set_sync_detail, to_clean_skill_payload,
-    to_skill_preferences_payload, to_skill_repo_payload,
+    from_db_skill, from_db_skill_group, from_db_skill_preferences, from_db_skill_repo,
+    get_sync_detail, parse_sync_details, remove_sync_detail, set_sync_detail,
+    to_clean_skill_payload, to_skill_group_payload, to_skill_preferences_payload,
+    to_skill_repo_payload,
 };
-use super::types::{now_ms, Skill, SkillPreferences, SkillRepo, SkillTarget};
 use super::tool_adapters::CustomTool;
+use super::types::{now_ms, Skill, SkillGroupRecord, SkillPreferences, SkillRepo, SkillTarget};
+
+const SKILL_PREFERENCES_ID: &str = "default";
+
+fn skill_order() -> Result<OrderSpec, String> {
+    Ok(OrderSpec::single(OrderField::json_integer(
+        "sort_index",
+        OrderDirection::Asc,
+    )?))
+}
+
+fn skill_group_order() -> Result<OrderSpec, String> {
+    Ok(OrderSpec::new(vec![
+        OrderField::json_integer("sort_index", OrderDirection::Asc)?,
+        OrderField::json_text("name", OrderDirection::Asc)?,
+    ]))
+}
+
+fn skill_repo_order() -> Result<OrderSpec, String> {
+    Ok(OrderSpec::new(vec![
+        OrderField::json_text("owner", OrderDirection::Asc)?,
+        OrderField::json_text("name", OrderDirection::Asc)?,
+    ]))
+}
+
+fn sqlite_get_managed_skills(sqlite_state: &SqliteDbState) -> Result<Vec<Skill>, String> {
+    let order = skill_order()?;
+    sqlite_state.with_conn(|conn| {
+        Ok(db_list(conn, DbTable::Skill, Some(&order))?
+            .into_iter()
+            .map(from_db_skill)
+            .collect())
+    })
+}
+
+fn sqlite_get_skill_groups(sqlite_state: &SqliteDbState) -> Result<Vec<SkillGroupRecord>, String> {
+    let order = skill_group_order()?;
+    sqlite_state.with_conn(|conn| {
+        Ok(db_list(conn, DbTable::SkillGroup, Some(&order))?
+            .into_iter()
+            .map(from_db_skill_group)
+            .collect())
+    })
+}
+
+fn sqlite_get_skill_by_id(
+    sqlite_state: &SqliteDbState,
+    skill_id: &str,
+) -> Result<Option<Skill>, String> {
+    sqlite_state.with_conn(|conn| Ok(db_get(conn, DbTable::Skill, skill_id)?.map(from_db_skill)))
+}
+
+fn sqlite_put_skill(sqlite_state: &SqliteDbState, id: &str, skill: &Skill) -> Result<(), String> {
+    sqlite_state.with_conn(|conn| db_put(conn, DbTable::Skill, id, &to_clean_skill_payload(skill)))
+}
+
+fn sqlite_patch_skill(
+    sqlite_state: &SqliteDbState,
+    skill_id: &str,
+    update: impl FnOnce(&mut Skill),
+) -> Result<Option<Skill>, String> {
+    let Some(mut skill) = sqlite_get_skill_by_id(sqlite_state, skill_id)? else {
+        return Ok(None);
+    };
+    update(&mut skill);
+    sqlite_put_skill(sqlite_state, skill_id, &skill)?;
+    Ok(Some(skill))
+}
+
+fn sqlite_put_skill_group(
+    sqlite_state: &SqliteDbState,
+    id: &str,
+    group: &SkillGroupRecord,
+) -> Result<(), String> {
+    sqlite_state.with_conn(|conn| {
+        db_put(
+            conn,
+            DbTable::SkillGroup,
+            id,
+            &to_skill_group_payload(group),
+        )
+    })
+}
+
+fn sqlite_put_skill_repo(
+    sqlite_state: &SqliteDbState,
+    id: &str,
+    repo: &SkillRepo,
+) -> Result<(), String> {
+    sqlite_state
+        .with_conn(|conn| db_put(conn, DbTable::SkillRepo, id, &to_skill_repo_payload(repo)))
+}
+
+fn sqlite_put_skill_preferences(
+    sqlite_state: &SqliteDbState,
+    prefs: &SkillPreferences,
+) -> Result<(), String> {
+    sqlite_state.with_conn(|conn| {
+        db_put(
+            conn,
+            DbTable::SkillPreferences,
+            SKILL_PREFERENCES_ID,
+            &to_skill_preferences_payload(prefs),
+        )
+    })
+}
 
 // ==================== Skill CRUD ====================
 
 /// Get all managed skills
-pub async fn get_managed_skills(state: &DbState) -> Result<Vec<Skill>, String> {
-    let db = state.0.lock().await;
+pub async fn get_managed_skills(state: &SqliteDbState) -> Result<Vec<Skill>, String> {
+    migrate_legacy_skill_groups(state).await?;
+    clear_dangling_skill_groups(state).await?;
+    sqlite_get_managed_skills(state)
+}
 
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM skill ORDER BY sort_index ASC")
-        .await
-        .map_err(|e| format!("Failed to query skills: {}", e))?;
+pub async fn get_skill_groups(state: &SqliteDbState) -> Result<Vec<SkillGroupRecord>, String> {
+    migrate_legacy_skill_groups(state).await?;
+    clear_dangling_skill_groups(state).await?;
+    sqlite_get_skill_groups(state)
+}
 
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.into_iter().map(from_db_skill).collect())
+pub async fn save_skill_group(
+    state: &SqliteDbState,
+    group: &SkillGroupRecord,
+) -> Result<String, String> {
+    let id = if group.id.is_empty() {
+        db_new_id()
+    } else {
+        group.id.clone()
+    };
+    sqlite_put_skill_group(state, &id, group)?;
+    Ok(id)
+}
+
+pub async fn delete_skill_group(state: &SqliteDbState, group_id: &str) -> Result<(), String> {
+    let skills = sqlite_get_managed_skills(state)?;
+    for mut skill in skills
+        .into_iter()
+        .filter(|skill| skill.group_id.as_deref() == Some(group_id))
+    {
+        skill.group_id = None;
+        skill.user_group = None;
+        let skill_id = skill.id.clone();
+        sqlite_put_skill(state, &skill_id, &skill)?;
+    }
+    state.with_conn(|conn| db_delete(conn, DbTable::SkillGroup, group_id).map(|_| ()))?;
+    Ok(())
+}
+
+pub async fn replace_skill_groups(
+    state: &SqliteDbState,
+    groups: &[SkillGroupRecord],
+) -> Result<Vec<SkillGroupRecord>, String> {
+    state.with_conn(|conn| db_delete_all(conn, DbTable::SkillGroup).map(|_| ()))?;
+    let mut saved = Vec::new();
+    for group in groups {
+        let id = save_skill_group(state, group).await?;
+        let mut group = group.clone();
+        group.id = id;
+        saved.push(group);
+    }
+    Ok(saved)
+}
+
+pub async fn migrate_legacy_skill_groups(state: &SqliteDbState) -> Result<(), String> {
+    let records = sqlite_get_managed_skills(state)?
+        .into_iter()
+        .filter(|skill| {
+            skill.group_id.is_none()
+                && skill
+                    .user_group
+                    .as_ref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let existing = get_skill_groups_without_migration(state).await?;
+    let mut by_name: std::collections::HashMap<String, String> = existing
+        .into_iter()
+        .map(|group| (group.name.trim().to_lowercase(), group.id))
+        .collect();
+    let mut next_index = by_name.len() as i32;
+
+    for mut skill in records {
+        let Some(group_name) = skill
+            .user_group
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let key = group_name.to_lowercase();
+        let group_id = if let Some(id) = by_name.get(&key) {
+            id.clone()
+        } else {
+            let now = now_ms();
+            let group = SkillGroupRecord {
+                id: db_new_id(),
+                name: group_name,
+                note: None,
+                sort_index: next_index,
+                created_at: now,
+                updated_at: now,
+            };
+            next_index += 1;
+            let id = save_skill_group(state, &group).await?;
+            by_name.insert(key, id.clone());
+            id
+        };
+        skill.group_id = Some(group_id);
+        let skill_id = skill.id.clone();
+        sqlite_put_skill(state, &skill_id, &skill)?;
+    }
+    Ok(())
+}
+
+async fn clear_dangling_skill_groups(state: &SqliteDbState) -> Result<(), String> {
+    let groups = get_skill_groups_without_migration(state).await?;
+    let valid_group_ids: HashSet<String> = groups.into_iter().map(|group| group.id).collect();
+    let skills = sqlite_get_managed_skills(state)?;
+    for mut skill in skills.into_iter().filter(|skill| skill.group_id.is_some()) {
+        let Some(group_id) = skill.group_id.as_ref() else {
+            continue;
+        };
+        if valid_group_ids.contains(group_id) {
+            continue;
+        }
+        skill.group_id = None;
+        skill.user_group = None;
+        let skill_id = skill.id.clone();
+        sqlite_put_skill(state, &skill_id, &skill)?;
+    }
+    Ok(())
+}
+
+async fn get_skill_groups_without_migration(
+    state: &SqliteDbState,
+) -> Result<Vec<SkillGroupRecord>, String> {
+    sqlite_get_skill_groups(state)
 }
 
 /// Get a single skill by ID
-pub async fn get_skill_by_id(state: &DbState, skill_id: &str) -> Result<Option<Skill>, String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("skill", skill_id);
-
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| format!("Failed to query skill: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.first().map(|r| from_db_skill(r.clone())))
+pub async fn get_skill_by_id(
+    state: &SqliteDbState,
+    skill_id: &str,
+) -> Result<Option<Skill>, String> {
+    sqlite_get_skill_by_id(state, skill_id)
 }
 
 /// Create or update a skill
-pub async fn upsert_skill(state: &DbState, skill: &Skill) -> Result<String, String> {
-    let db = state.0.lock().await;
-
-    if skill.id.is_empty() {
-        // Get max sort_index for new skill
-        let mut max_result = db
-            .query("SELECT sort_index FROM skill ORDER BY sort_index DESC LIMIT 1")
-            .await
-            .map_err(|e| format!("Failed to query max sort_index: {}", e))?;
-        let max_records: Vec<Value> = max_result.take(0).map_err(|e| e.to_string())?;
-        let max_index = max_records
-            .first()
-            .and_then(|v| v.get("sort_index"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1) as i32;
-
-        // Create new skill with sort_index = max + 1
+pub async fn upsert_skill(state: &SqliteDbState, skill: &Skill) -> Result<String, String> {
+    let id = if skill.id.is_empty() {
+        let max_index = state.with_conn(|conn| {
+            db_max_i64(conn, DbTable::Skill, &JsonFieldPath::new("sort_index")?)
+        })?;
         let mut new_skill = skill.clone();
-        new_skill.sort_index = max_index + 1;
-        let payload = to_clean_skill_payload(&new_skill);
-
+        new_skill.sort_index = max_index.unwrap_or(-1) as i32 + 1;
         let id = db_new_id();
-        let record_id = db_record_id("skill", &id);
-        db.query(&format!("CREATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-            .await
-            .map_err(|e| format!("Failed to create skill: {}", e))?;
-        Ok(id)
+        sqlite_put_skill(state, &id, &new_skill)?;
+        id
     } else {
-        // Update existing skill
-        let payload = to_clean_skill_payload(skill);
-        let record_id = db_record_id("skill", &skill.id);
-        db.query(&format!("UPDATE {} CONTENT $data", record_id))
-            .bind(("data", payload))
-            .await
-            .map_err(|e| format!("Failed to update skill: {}", e))?;
-        Ok(skill.id.clone())
-    }
+        sqlite_put_skill(state, &skill.id, skill)?;
+        skill.id.clone()
+    };
+    Ok(id)
 }
 
 /// Get a skill by name
-pub async fn get_skill_by_name(state: &DbState, name: &str) -> Result<Option<Skill>, String> {
-    let db = state.0.lock().await;
-    let name_owned = name.to_string();
-
-    let mut result = db
-        .query(
-            "SELECT *, type::string(id) as id FROM skill WHERE name = $name LIMIT 1",
-        )
-        .bind(("name", name_owned))
-        .await
-        .map_err(|e| format!("Failed to query skill by name: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.first().map(|r| from_db_skill(r.clone())))
+pub async fn get_skill_by_name(state: &SqliteDbState, name: &str) -> Result<Option<Skill>, String> {
+    let name_value = Value::String(name.to_string());
+    state.with_conn(|conn| {
+        Ok(db_query_by_field(
+            conn,
+            DbTable::Skill,
+            &JsonFieldPath::new("name")?,
+            &name_value,
+            Some(&skill_order()?),
+            Some(1),
+        )?
+        .into_iter()
+        .next()
+        .map(from_db_skill))
+    })
 }
 
 /// Delete a skill
-pub async fn delete_skill(state: &DbState, skill_id: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("skill", skill_id);
+pub async fn delete_skill(state: &SqliteDbState, skill_id: &str) -> Result<(), String> {
+    state.with_conn(|conn| db_delete(conn, DbTable::Skill, skill_id).map(|_| ()))?;
+    Ok(())
+}
 
-    db.query(&format!("DELETE {}", record_id))
-        .await
-        .map_err(|e| format!("Failed to delete skill: {}", e))?;
+/// Update user-managed metadata for a skill without touching content timestamps or sync state.
+/// `tags` uses tri-state semantics: None keeps existing tags untouched; Some replaces the whole list.
+pub async fn update_skill_metadata(
+    state: &SqliteDbState,
+    skill_id: &str,
+    group_id: Option<String>,
+    user_note: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<(), String> {
+    let user_group = group_name_for_id(state, group_id.clone()).await?;
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.group_id = group_id.clone();
+        skill.user_group = user_group.clone();
+        skill.user_note = user_note.clone();
+        if let Some(new_tags) = &tags {
+            skill.tags = new_tags.clone();
+        }
+    })?;
+    Ok(())
+}
 
+pub async fn update_skill_central_path_and_hash(
+    state: &SqliteDbState,
+    skill_id: &str,
+    central_path: String,
+    content_hash: Option<String>,
+) -> Result<(), String> {
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.central_path = central_path;
+        skill.content_hash = content_hash.clone();
+        skill.status = "ok".to_string();
+        skill.updated_at = now_ms();
+    })?
+    .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+    Ok(())
+}
+
+pub async fn update_skill_content_hash(
+    state: &SqliteDbState,
+    skill_id: &str,
+    content_hash: Option<String>,
+) -> Result<(), String> {
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.content_hash = content_hash.clone();
+        skill.updated_at = now_ms();
+    })?
+    .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+    Ok(())
+}
+
+/// Update user-managed group for multiple skills.
+pub async fn update_skills_group(
+    state: &SqliteDbState,
+    skill_ids: &[String],
+    group_id: Option<String>,
+) -> Result<(), String> {
+    let user_group = group_name_for_id(state, group_id.clone()).await?;
+    for skill_id in skill_ids {
+        sqlite_patch_skill(state, skill_id, |skill| {
+            skill.group_id = group_id.clone();
+            skill.user_group = user_group.clone();
+        })?;
+    }
+    Ok(())
+}
+
+async fn group_name_for_id(
+    state: &SqliteDbState,
+    group_id: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(group_id) = group_id else {
+        return Ok(None);
+    };
+    let groups = get_skill_groups_without_migration(state).await?;
+    Ok(groups
+        .into_iter()
+        .find(|group| group.id == group_id)
+        .map(|group| group.name))
+}
+
+pub async fn set_skill_management_enabled(
+    state: &SqliteDbState,
+    skill_id: &str,
+    enabled: bool,
+) -> Result<Vec<String>, String> {
+    let Some(skill) = get_skill_by_id(state, skill_id).await? else {
+        return Err(format!("Skill not found: {}", skill_id));
+    };
+    if enabled {
+        sqlite_patch_skill(state, skill_id, |skill| {
+            skill.management_enabled = true;
+        })?
+        .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+        return Ok(skill.disabled_previous_tools);
+    }
+
+    let previous_tools = if skill.enabled_tools.is_empty() {
+        skill.disabled_previous_tools.clone()
+    } else {
+        skill.enabled_tools.clone()
+    };
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.management_enabled = false;
+        skill.disabled_previous_tools = previous_tools.clone();
+        skill.enabled_tools = Vec::new();
+        skill.sync_details = Some(Value::Object(serde_json::Map::new()));
+    })?
+    .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+    Ok(previous_tools)
+}
+
+pub async fn record_disabled_previous_tools(
+    state: &SqliteDbState,
+    skill_id: &str,
+    previous_tools: Vec<String>,
+) -> Result<(), String> {
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.disabled_previous_tools = previous_tools.clone();
+    })?;
+    Ok(())
+}
+
+pub async fn disable_skill_with_previous_tools(
+    state: &SqliteDbState,
+    skill_id: &str,
+    previous_tools: Vec<String>,
+) -> Result<(), String> {
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.management_enabled = false;
+        skill.disabled_previous_tools = previous_tools.clone();
+        skill.enabled_tools = Vec::new();
+        skill.sync_details = Some(Value::Object(serde_json::Map::new()));
+    })?;
     Ok(())
 }
 
 // ==================== Skill sync_details operations ====================
 
 /// Get all targets for a specific skill (parsed from sync_details)
-pub async fn get_skill_targets(state: &DbState, skill_id: &str) -> Result<Vec<SkillTarget>, String> {
+pub async fn get_skill_targets(
+    state: &SqliteDbState,
+    skill_id: &str,
+) -> Result<Vec<SkillTarget>, String> {
     let skill = get_skill_by_id(state, skill_id).await?;
     Ok(skill.map(|s| parse_sync_details(&s)).unwrap_or_default())
 }
 
 /// Get a skill target (from sync_details for specified tool)
 pub async fn get_skill_target(
-    state: &DbState,
+    state: &SqliteDbState,
     skill_id: &str,
     tool: &str,
 ) -> Result<Option<SkillTarget>, String> {
@@ -133,182 +471,115 @@ pub async fn get_skill_target(
 
 /// Upsert a skill target (update sync_details tool entry)
 pub async fn upsert_skill_target(
-    state: &DbState,
+    state: &SqliteDbState,
     skill_id: &str,
     target: &SkillTarget,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("skill", skill_id);
-
-    // Get existing skill
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    let skill = records
-        .first()
-        .map(|r| from_db_skill(r.clone()))
-        .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
-
-    // Update sync_details
-    let new_sync_details = set_sync_detail(&skill.sync_details, &target.tool, target);
-
-    // Update enabled_tools
-    let mut enabled_tools = skill.enabled_tools.clone();
-    if !enabled_tools.contains(&target.tool) {
-        enabled_tools.push(target.tool.clone());
-    }
-
-    // Save updates (don't update updated_at to preserve sort order)
-    db.query(&format!("UPDATE {} SET sync_details = $sync_details, enabled_tools = $enabled_tools", record_id))
-        .bind(("sync_details", new_sync_details))
-        .bind(("enabled_tools", enabled_tools))
-        .await
-        .map_err(|e| format!("Failed to update skill target: {}", e))?;
-
+    let target = target.clone();
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.sync_details = Some(set_sync_detail(&skill.sync_details, &target.tool, &target));
+        if !skill.enabled_tools.contains(&target.tool) {
+            skill.enabled_tools.push(target.tool.clone());
+        }
+    })?
+    .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
     Ok(())
 }
 
 /// Delete a skill target (remove tool entry from sync_details)
-pub async fn delete_skill_target(state: &DbState, skill_id: &str, tool: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("skill", skill_id);
+pub async fn delete_skill_target(
+    state: &SqliteDbState,
+    skill_id: &str,
+    tool: &str,
+) -> Result<(), String> {
     let tool_owned = tool.to_string();
-
-    // Get existing skill
-    let mut result = db
-        .query(&format!(
-            "SELECT *, type::string(id) as id FROM {} LIMIT 1",
-            record_id
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    let Some(skill) = records.first().map(|r| from_db_skill(r.clone())) else {
-        return Ok(()); // Skill not found, nothing to delete
-    };
-
-    // Update sync_details
-    let new_sync_details = remove_sync_detail(&skill.sync_details, &tool_owned);
-
-    // Update enabled_tools
-    let enabled_tools: Vec<String> = skill
-        .enabled_tools
-        .into_iter()
-        .filter(|t| t != &tool_owned)
-        .collect();
-
-    // Save updates (don't update updated_at to preserve sort order)
-    db.query(&format!("UPDATE {} SET sync_details = $sync_details, enabled_tools = $enabled_tools", record_id))
-        .bind(("sync_details", new_sync_details))
-        .bind(("enabled_tools", enabled_tools))
-        .await
-        .map_err(|e| format!("Failed to delete skill target: {}", e))?;
-
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.sync_details = Some(remove_sync_detail(&skill.sync_details, &tool_owned));
+        skill.enabled_tools = skill
+            .enabled_tools
+            .iter()
+            .filter(|value| *value != &tool_owned)
+            .cloned()
+            .collect();
+    })?;
     Ok(())
 }
 
 // ==================== SkillRepo CRUD ====================
 
 /// Get all skill repos
-pub async fn get_skill_repos(state: &DbState) -> Result<Vec<SkillRepo>, String> {
-    let db = state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM skill_repo ORDER BY owner ASC, name ASC")
-        .await
-        .map_err(|e| format!("Failed to query skill repos: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-    Ok(records.into_iter().map(from_db_skill_repo).collect())
+pub async fn get_skill_repos(state: &SqliteDbState) -> Result<Vec<SkillRepo>, String> {
+    let order = skill_repo_order()?;
+    state.with_conn(|conn| {
+        Ok(db_list(conn, DbTable::SkillRepo, Some(&order))?
+            .into_iter()
+            .map(from_db_skill_repo)
+            .collect())
+    })
 }
 
 /// Save a skill repo
-pub async fn save_skill_repo(state: &DbState, repo: &SkillRepo) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let payload = to_skill_repo_payload(repo);
-
-    // Use owner/name as ID
+pub async fn save_skill_repo(state: &SqliteDbState, repo: &SkillRepo) -> Result<(), String> {
     let id = format!("{}/{}", repo.owner, repo.name);
-    let record_id = db_record_id("skill_repo", &id);
-
-    db.query(&format!("UPSERT {} CONTENT $data", record_id))
-        .bind(("data", payload))
-        .await
-        .map_err(|e| format!("Failed to save skill repo: {}", e))?;
-
+    sqlite_put_skill_repo(state, &id, repo)?;
     Ok(())
 }
 
 /// Delete a skill repo
-pub async fn delete_skill_repo(state: &DbState, owner: &str, name: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
+pub async fn delete_skill_repo(
+    state: &SqliteDbState,
+    owner: &str,
+    name: &str,
+) -> Result<(), String> {
     let id = format!("{}/{}", owner, name);
-    let record_id = db_record_id("skill_repo", &id);
-
-    db.query(&format!("DELETE {}", record_id))
-        .await
-        .map_err(|e| format!("Failed to delete skill repo: {}", e))?;
-
+    state.with_conn(|conn| db_delete(conn, DbTable::SkillRepo, &id).map(|_| ()))?;
     Ok(())
 }
 
 // ==================== SkillPreferences CRUD ====================
 
 /// Get skill preferences (singleton record)
-pub async fn get_skill_preferences(state: &DbState) -> Result<SkillPreferences, String> {
-    let db = state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT *, type::string(id) as id FROM skill_preferences:`default` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query skill preferences: {}", e))?;
-
-    let records: Vec<Value> = result.take(0).map_err(|e| e.to_string())?;
-
-    if let Some(record) = records.first() {
-        Ok(from_db_skill_preferences(record.clone()))
-    } else {
-        Ok(SkillPreferences::default())
-    }
+pub async fn get_skill_preferences(state: &SqliteDbState) -> Result<SkillPreferences, String> {
+    state.with_conn(|conn| {
+        Ok(
+            db_get(conn, DbTable::SkillPreferences, SKILL_PREFERENCES_ID)?
+                .map(from_db_skill_preferences)
+                .unwrap_or_default(),
+        )
+    })
 }
 
 /// Save skill preferences (singleton record)
-pub async fn save_skill_preferences(state: &DbState, prefs: &SkillPreferences) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let payload = to_skill_preferences_payload(prefs);
-
-    db.query("UPSERT skill_preferences:`default` CONTENT $data")
-        .bind(("data", payload))
-        .await
-        .map_err(|e| format!("Failed to save skill preferences: {}", e))?;
-
+pub async fn save_skill_preferences(
+    state: &SqliteDbState,
+    prefs: &SkillPreferences,
+) -> Result<(), String> {
+    sqlite_put_skill_preferences(state, prefs)?;
     Ok(())
 }
 
 // ==================== Settings (compatibility layer using preferences) ====================
 
 /// Get setting value (read from skill_preferences)
-pub async fn get_setting(state: &DbState, key: &str) -> Result<Option<String>, String> {
+pub async fn get_setting(state: &SqliteDbState, key: &str) -> Result<Option<String>, String> {
     let prefs = get_skill_preferences(state).await?;
 
     let value = match key {
-        "central_repo_path" => Some(prefs.central_repo_path),
         "preferred_tools_v1" => prefs
             .preferred_tools
             .map(|v| serde_json::to_string(&v).unwrap_or_default()),
+        "default_view_mode" => Some(prefs.default_view_mode),
         "installed_tools_v1" => prefs
             .installed_tools
             .map(|v| serde_json::to_string(&v).unwrap_or_default()),
         "git_cache_cleanup_days" => Some(prefs.git_cache_cleanup_days.to_string()),
         "git_cache_ttl_secs" => Some(prefs.git_cache_ttl_secs.to_string()),
         "show_skills_in_tray" => Some(prefs.show_skills_in_tray.to_string()),
+        "auto_update_enabled" => Some(prefs.auto_update_enabled.to_string()),
+        "auto_update_schedule" => Some(prefs.auto_update_schedule.clone()),
+        "limit_add_more_to_preferred_tools" => {
+            Some(prefs.limit_add_more_to_preferred_tools.to_string())
+        }
         _ => None,
     };
 
@@ -316,14 +587,19 @@ pub async fn get_setting(state: &DbState, key: &str) -> Result<Option<String>, S
 }
 
 /// Set setting value (update skill_preferences)
-pub async fn set_setting(state: &DbState, key: &str, value: &str) -> Result<(), String> {
+pub async fn set_setting(state: &SqliteDbState, key: &str, value: &str) -> Result<(), String> {
     let mut prefs = get_skill_preferences(state).await?;
     prefs.updated_at = now_ms();
 
     match key {
-        "central_repo_path" => prefs.central_repo_path = value.to_string(),
         "preferred_tools_v1" => {
             prefs.preferred_tools = serde_json::from_str(value).ok();
+        }
+        "default_view_mode" => {
+            prefs.default_view_mode = match value {
+                "grouped" => "grouped".to_string(),
+                _ => "flat".to_string(),
+            };
         }
         "installed_tools_v1" => {
             prefs.installed_tools = serde_json::from_str(value).ok();
@@ -337,6 +613,15 @@ pub async fn set_setting(state: &DbState, key: &str, value: &str) -> Result<(), 
         "show_skills_in_tray" => {
             prefs.show_skills_in_tray = value == "true";
         }
+        "auto_update_enabled" => {
+            prefs.auto_update_enabled = value == "true";
+        }
+        "auto_update_schedule" => {
+            prefs.auto_update_schedule = value.to_string();
+        }
+        "limit_add_more_to_preferred_tools" => {
+            prefs.limit_add_more_to_preferred_tools = value == "true";
+        }
         _ => return Err(format!("Unknown setting key: {}", key)),
     };
 
@@ -344,7 +629,9 @@ pub async fn set_setting(state: &DbState, key: &str, value: &str) -> Result<(), 
 }
 
 /// Get all skill target paths for filtering
-pub async fn list_all_skill_target_paths(state: &DbState) -> Result<Vec<(String, String)>, String> {
+pub async fn list_all_skill_target_paths(
+    state: &SqliteDbState,
+) -> Result<Vec<(String, String)>, String> {
     let skills = get_managed_skills(state).await?;
 
     let mut paths = Vec::new();
@@ -362,17 +649,23 @@ pub async fn list_all_skill_target_paths(state: &DbState) -> Result<Vec<(String,
 // ==================== Skill Reorder ====================
 
 /// Reorder skills by updating sort_index for each skill
-pub async fn reorder_skills(state: &DbState, ids: &[String]) -> Result<(), String> {
-    let db = state.0.lock().await;
-
+pub async fn reorder_skills(state: &SqliteDbState, ids: &[String]) -> Result<(), String> {
     for (index, id) in ids.iter().enumerate() {
-        let record_id = db_record_id("skill", id);
-        db.query(&format!("UPDATE {} SET sort_index = $index", record_id))
-            .bind(("index", index as i32))
-            .await
-            .map_err(|e| format!("Failed to reorder skills: {}", e))?;
+        sqlite_patch_skill(state, id, |skill| {
+            skill.sort_index = index as i32;
+        })?;
     }
+    Ok(())
+}
 
+pub async fn update_skill_sort_index(
+    state: &SqliteDbState,
+    skill_id: &str,
+    sort_index: i32,
+) -> Result<(), String> {
+    sqlite_patch_skill(state, skill_id, |skill| {
+        skill.sort_index = sort_index;
+    })?;
     Ok(())
 }
 
@@ -380,13 +673,13 @@ pub async fn reorder_skills(state: &DbState, ids: &[String]) -> Result<(), Strin
 
 /// Get all custom tools that support Skills
 /// Delegates to the shared tools module and converts to skills CustomTool type
-pub async fn get_custom_tools(state: &DbState) -> Result<Vec<CustomTool>, String> {
+pub async fn get_custom_tools(state: &SqliteDbState) -> Result<Vec<CustomTool>, String> {
     let tools = crate::coding::tools::custom_store::get_skills_custom_tools(state).await?;
     Ok(tools.into_iter().map(CustomTool::from).collect())
 }
 
 /// Save a custom tool (preserving MCP fields if they exist)
-pub async fn save_custom_tool(state: &DbState, tool: &CustomTool) -> Result<(), String> {
+pub async fn save_custom_tool(state: &SqliteDbState, tool: &CustomTool) -> Result<(), String> {
     // Use the shared tools module function that preserves MCP fields
     crate::coding::tools::custom_store::save_custom_tool_skills_fields(
         state,
@@ -395,19 +688,113 @@ pub async fn save_custom_tool(state: &DbState, tool: &CustomTool) -> Result<(), 
         Some(tool.relative_skills_dir.clone()),
         Some(tool.relative_detect_dir.clone()),
         tool.force_copy,
+        tool.icon_url.clone(),
         tool.created_at,
     )
     .await
 }
 
 /// Delete a custom tool
-pub async fn delete_custom_tool(state: &DbState, key: &str) -> Result<(), String> {
-    let db = state.0.lock().await;
-    let record_id = db_record_id("custom_tool", key);
+pub async fn delete_custom_tool(state: &SqliteDbState, key: &str) -> Result<(), String> {
+    crate::coding::tools::custom_store::delete_custom_tool(state, key).await
+}
 
-    db.query(&format!("DELETE {}", record_id))
-        .await
-        .map_err(|e| format!("Failed to delete custom tool: {}", e))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
 
-    Ok(())
+    fn create_test_db() -> (tempfile::TempDir, SqliteDbState) {
+        let temp_dir = tempfile::tempdir().expect("create temp db dir");
+        let db_path = temp_dir.path().join("ai-toolbox.db");
+        let state = SqliteDbState::open(db_path).expect("open sqlite test db");
+        (temp_dir, state)
+    }
+
+    fn load_raw_preferences(state: &SqliteDbState) -> Value {
+        state
+            .with_conn(|conn| db_get(conn, DbTable::SkillPreferences, SKILL_PREFERENCES_ID))
+            .expect("query preferences")
+            .expect("preferences record")
+    }
+
+    #[tokio::test]
+    async fn non_path_setting_write_does_not_create_central_repo_path() {
+        let (_temp, state) = create_test_db();
+
+        set_setting(&state, "default_view_mode", "grouped")
+            .await
+            .expect("save default view mode");
+
+        let record = load_raw_preferences(&state);
+        assert_eq!(
+            record.get("default_view_mode").and_then(Value::as_str),
+            Some("grouped")
+        );
+        assert!(record.get("central_repo_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn non_path_setting_write_removes_legacy_central_repo_path() {
+        let (_temp, state) = create_test_db();
+        let seed = serde_json::json!({
+            "central_repo_path": "/Users/ralph/.skills",
+            "default_view_mode": "flat"
+        });
+        state
+            .with_conn(|conn| db_put(conn, DbTable::SkillPreferences, SKILL_PREFERENCES_ID, &seed))
+            .expect("seed legacy preferences path");
+
+        set_setting(&state, "preferred_tools_v1", "[\"codex\"]")
+            .await
+            .expect("save preferred tools");
+
+        let record = load_raw_preferences(&state);
+        assert!(record.get("central_repo_path").is_none());
+        assert_eq!(
+            record
+                .get("preferred_tools")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str),
+            Some("codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_add_more_to_preferred_tools_setting_round_trips() {
+        let (_temp, state) = create_test_db();
+
+        // Defaults to off.
+        assert_eq!(
+            get_setting(&state, "limit_add_more_to_preferred_tools")
+                .await
+                .expect("read setting")
+                .as_deref(),
+            Some("false")
+        );
+
+        set_setting(&state, "limit_add_more_to_preferred_tools", "true")
+            .await
+            .expect("enable limit");
+
+        let record = load_raw_preferences(&state);
+        assert_eq!(
+            record
+                .get("limit_add_more_to_preferred_tools")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        set_setting(&state, "limit_add_more_to_preferred_tools", "false")
+            .await
+            .expect("disable limit");
+        let record = load_raw_preferences(&state);
+        assert_eq!(
+            record
+                .get("limit_add_more_to_preferred_tools")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
 }

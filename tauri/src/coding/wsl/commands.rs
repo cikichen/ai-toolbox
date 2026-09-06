@@ -1,9 +1,31 @@
-use super::{sync, adapter};
-use super::types::{FileMapping, SyncProgress, SyncResult, WSLErrorResult, WSLDetectResult, WSLStatusResult, WSLSyncConfig};
-use crate::db::DbState;
-use crate::coding::{open_code, oh_my_opencode, oh_my_opencode_slim};
-use tauri::Emitter;
+use super::types::{
+    FileMapping, SyncProgress, SyncResult, WSLDetectResult, WSLErrorResult, WSLStatusResult,
+    WSLSyncConfig,
+};
+use super::{adapter, sync};
+use crate::coding::claude_code::plugin_metadata_sync;
+use crate::coding::codex::constants::AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME;
+use crate::coding::config_cleanup;
+use crate::coding::dsh::constants::{
+    DSH_CREDENTIALS_FILE, DSH_MCP_FILE, DSH_PROMPT_FILE, DSH_SETTINGS_FILE,
+};
+use crate::coding::oh_my_pi::constants::{
+    OMP_CONFIG_FILE, OMP_MCP_FILE, OMP_MODELS_FILE, OMP_PROMPT_FILE,
+};
+use crate::coding::pi::constants::{
+    PI_AUTH_FILE, PI_MCP_FILE, PI_MODELS_FILE, PI_PROMPT_FILE, PI_SETTINGS_FILE,
+};
+use crate::coding::proxy_gateway::{
+    cli_proxy, paths::ProxyGatewayPaths, settings as proxy_gateway_settings,
+    types::ProxyGatewaySettings,
+};
+use crate::coding::runtime_location;
+use crate::db::helpers::{db_delete, db_delete_all, db_get, db_list, db_put};
+use crate::db::schema::{DbTable, OrderDirection, OrderField, OrderSpec};
+use crate::db::SqliteDbState;
 use chrono::Local;
+use std::path::Path;
+use tauri::{Emitter, Manager};
 
 // ============================================================================
 // WSL Detection Commands
@@ -18,14 +40,11 @@ pub fn wsl_detect() -> WSLDetectResult {
 /// Check if a specific WSL distro is available
 #[tauri::command]
 pub fn wsl_check_distro(distro: String) -> WSLErrorResult {
-    match sync::get_wsl_distros() {
-        Ok(distros) => {
-            let available = distros.contains(&distro);
-            WSLErrorResult {
-                available,
-                error: if available { None } else { Some(format!("Distro '{}' not found", distro)) },
-            }
-        }
+    match sync::get_effective_distro(&distro) {
+        Ok(_) => WSLErrorResult {
+            available: true,
+            error: None,
+        },
         Err(e) => WSLErrorResult {
             available: false,
             error: Some(e),
@@ -36,58 +55,58 @@ pub fn wsl_check_distro(distro: String) -> WSLErrorResult {
 /// Get running state of a specific WSL distro
 #[tauri::command]
 pub fn wsl_get_distro_state(distro: String) -> String {
-    sync::get_wsl_distro_state(&distro)
+    match sync::get_effective_distro(&distro) {
+        Ok(effective_distro) => sync::get_wsl_distro_state(&effective_distro),
+        Err(_) => "Unknown".to_string(),
+    }
 }
 
 // ============================================================================
 // WSL Config Commands
 // ============================================================================
 
+fn wsl_mapping_order() -> Result<OrderSpec, String> {
+    Ok(OrderSpec::new(vec![
+        OrderField::json_text("module", OrderDirection::Asc)?,
+        OrderField::json_text("name", OrderDirection::Asc)?,
+    ]))
+}
+
+fn load_wsl_config(state: &SqliteDbState) -> Result<WSLSyncConfig, String> {
+    state.with_conn(|conn| {
+        Ok(db_get(conn, DbTable::WslSyncConfig, "config")?
+            .map(|record| adapter::config_from_db_value(record, vec![]))
+            .unwrap_or_default())
+    })
+}
+
+fn load_wsl_file_mappings(state: &SqliteDbState) -> Result<Vec<FileMapping>, String> {
+    let order = wsl_mapping_order()?;
+    state.with_conn(|conn| {
+        Ok(db_list(conn, DbTable::WslFileMapping, Some(&order))?
+            .into_iter()
+            .map(adapter::mapping_from_db_value)
+            .collect())
+    })
+}
+
 /// Get WSL sync configuration
 #[tauri::command]
-pub async fn wsl_get_config(state: tauri::State<'_, DbState>) -> Result<WSLSyncConfig, String> {
-    let db = state.0.lock().await;
+pub async fn wsl_get_config(
+    state: tauri::State<'_, SqliteDbState>,
+) -> Result<WSLSyncConfig, String> {
+    let db = state.db();
 
-    // Get config
-    let config_result: Result<Vec<serde_json::Value>, _> = db
-        .query("SELECT *, type::string(id) as id FROM wsl_sync_config:`config` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query WSL config: {}", e))?
-        .take(0);
-
-    let config = match config_result {
-        Ok(records) => {
-            if let Some(record) = records.first() {
-                adapter::config_from_db_value(record.clone(), vec![])
-            } else {
-                WSLSyncConfig::default()
-            }
-        }
-        Err(_) => WSLSyncConfig::default(),
-    };
-
-    // Get file mappings
-    let mappings_result: Result<Vec<serde_json::Value>, _> = db
-        .query("SELECT *, type::string(id) as id FROM wsl_file_mapping ORDER BY module, name")
-        .await
-        .map_err(|e| format!("Failed to query file mappings: {}", e))?
-        .take(0);
-
-    let file_mappings = match mappings_result {
-        Ok(records) => {
-            records
-                .into_iter()
-                .map(adapter::mapping_from_db_value)
-                .collect()
-        }
-        Err(_) => vec![],
-    };
+    let config = load_wsl_config(db).unwrap_or_default();
+    let file_mappings = load_wsl_file_mappings(db).unwrap_or_default();
 
     // Auto-insert missing default mappings for upgrading users
-    let file_mappings = backfill_default_mappings(&db, file_mappings).await;
+    let file_mappings = backfill_default_mappings(db, file_mappings).await;
+    let module_statuses = runtime_location::get_wsl_direct_status_map_async(db).await?;
 
     Ok(WSLSyncConfig {
         file_mappings,
+        module_statuses,
         ..config
     })
 }
@@ -95,45 +114,62 @@ pub async fn wsl_get_config(state: tauri::State<'_, DbState>) -> Result<WSLSyncC
 /// Save WSL sync configuration
 #[tauri::command]
 pub async fn wsl_save_config(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
     config: WSLSyncConfig,
 ) -> Result<(), String> {
     // Check if WSL sync is being enabled (was disabled, now enabled)
     let was_enabled = {
-        let db = state.0.lock().await;
-        let result: Result<Vec<serde_json::Value>, _> = db
-            .query("SELECT enabled FROM wsl_sync_config:`config` LIMIT 1")
-            .await
-            .map_err(|e| format!("Failed to query WSL config: {}", e))?
-            .take(0);
-        result
-            .ok()
-            .and_then(|records| records.first().cloned())
-            .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()))
-            .unwrap_or(false)
+        let db = state.db();
+        load_wsl_config(db)?.enabled
     };
 
     let is_being_enabled = !was_enabled && config.enabled;
 
-    {
-        let db = state.0.lock().await;
+    for mapping in config.file_mappings.iter() {
+        validate_file_mapping_cleanup_paths(mapping)?;
+    }
 
+    {
         // Save config
-        let config_data = adapter::config_to_db_value(&config);
-        db.query("UPSERT wsl_sync_config:`config` CONTENT $data")
-            .bind(("data", config_data))
-            .await
-            .map_err(|e| format!("Failed to save WSL config: {}", e))?;
+        let existing_status = state
+            .with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "config"))
+            .ok()
+            .flatten();
+
+        let mut config_data = adapter::config_to_db_value(&config);
+        if let Some(payload) = config_data.as_object_mut() {
+            payload.insert(
+                "last_sync_time".to_string(),
+                existing_status
+                    .as_ref()
+                    .and_then(|row| row.get("last_sync_time").cloned())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            payload.insert(
+                "last_sync_status".to_string(),
+                existing_status
+                    .as_ref()
+                    .and_then(|row| row.get("last_sync_status").cloned())
+                    .unwrap_or_else(|| serde_json::Value::String("never".to_string())),
+            );
+            payload.insert(
+                "last_sync_error".to_string(),
+                existing_status
+                    .as_ref()
+                    .and_then(|row| row.get("last_sync_error").cloned())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+
+        state.with_conn(|conn| db_put(conn, DbTable::WslSyncConfig, "config", &config_data))?;
 
         // Update file mappings - follow open_code/free_models pattern: use backtick format table:`id`
         for mapping in config.file_mappings.iter() {
             let mapping_data = adapter::mapping_to_db_value(mapping);
-            let query = format!("UPSERT wsl_file_mapping:`{}` CONTENT $data", mapping.id);
-            db.query(&query)
-                .bind(("data", mapping_data))
-                .await
-                .map_err(|e| format!("Failed to save file mapping: {}", e))?;
+            state.with_conn(|conn| {
+                db_put(conn, DbTable::WslFileMapping, &mapping.id, &mapping_data)
+            })?;
         }
     }
 
@@ -164,20 +200,27 @@ pub async fn wsl_save_config(
 // File Mapping Commands
 // ============================================================================
 
+fn validate_file_mapping_cleanup_paths(mapping: &FileMapping) -> Result<(), String> {
+    config_cleanup::cleanup_paths_for_mapping(
+        mapping.is_directory,
+        mapping.is_pattern,
+        &mapping.wsl_path,
+        &mapping.windows_path,
+        &mapping.cleanup_paths,
+    )
+    .map(|_| ())
+}
+
 /// Add a new file mapping
 #[tauri::command]
 pub async fn wsl_add_file_mapping(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
     mapping: FileMapping,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-
+    validate_file_mapping_cleanup_paths(&mapping)?;
     let mapping_data = adapter::mapping_to_db_value(&mapping);
-    db.query(format!("UPSERT wsl_file_mapping:`{}` CONTENT $data", mapping.id))
-        .bind(("data", mapping_data))
-        .await
-        .map_err(|e| format!("Failed to add file mapping: {}", e))?;
+    state.with_conn(|conn| db_put(conn, DbTable::WslFileMapping, &mapping.id, &mapping_data))?;
 
     let _ = app.emit("wsl-config-changed", ());
 
@@ -187,17 +230,13 @@ pub async fn wsl_add_file_mapping(
 /// Update an existing file mapping
 #[tauri::command]
 pub async fn wsl_update_file_mapping(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
     mapping: FileMapping,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-
+    validate_file_mapping_cleanup_paths(&mapping)?;
     let mapping_data = adapter::mapping_to_db_value(&mapping);
-    db.query(format!("UPSERT wsl_file_mapping:`{}` CONTENT $data", mapping.id))
-        .bind(("data", mapping_data))
-        .await
-        .map_err(|e| format!("Failed to update file mapping: {}", e))?;
+    state.with_conn(|conn| db_put(conn, DbTable::WslFileMapping, &mapping.id, &mapping_data))?;
 
     let _ = app.emit("wsl-config-changed", ());
 
@@ -207,15 +246,11 @@ pub async fn wsl_update_file_mapping(
 /// Delete a file mapping
 #[tauri::command]
 pub async fn wsl_delete_file_mapping(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
     id: String,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-
-    db.query(format!("DELETE wsl_file_mapping:`{}`", id))
-        .await
-        .map_err(|e| format!("Failed to delete file mapping: {}", e))?;
+    state.with_conn(|conn| db_delete(conn, DbTable::WslFileMapping, &id).map(|_| ()))?;
 
     let _ = app.emit("wsl-config-changed", ());
 
@@ -225,14 +260,10 @@ pub async fn wsl_delete_file_mapping(
 /// Delete all file mappings (reset)
 #[tauri::command]
 pub async fn wsl_reset_file_mappings(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-
-    db.query("DELETE wsl_file_mapping")
-        .await
-        .map_err(|e| format!("Failed to reset file mappings: {}", e))?;
+    state.with_conn(|conn| db_delete_all(conn, DbTable::WslFileMapping).map(|_| ()))?;
 
     let _ = app.emit("wsl-config-changed", ());
 
@@ -245,12 +276,20 @@ pub async fn wsl_reset_file_mappings(
 
 /// Internal full sync implementation (reusable)
 pub(super) async fn do_full_sync(
-    state: &DbState,
+    state: &SqliteDbState,
     app: &tauri::AppHandle,
     config: &WSLSyncConfig,
     module: Option<&str>,
     skip_modules: Option<&[String]>,
 ) -> SyncResult {
+    let direct_modules: std::collections::HashSet<String> = config
+        .module_statuses
+        .iter()
+        .filter(|status| status.is_wsl_direct)
+        .map(|status| status.module.clone())
+        .collect();
+    let merged_skip_modules = merge_skip_modules(skip_modules, &direct_modules);
+
     // Get effective distro (auto-resolve if configured one doesn't exist)
     let distro = match sync::get_effective_distro(&config.distro) {
         Ok(d) => d,
@@ -268,19 +307,42 @@ pub(super) async fn do_full_sync(
     // Emit initial progress for file mappings
     let enabled_mappings: Vec<_> = config.file_mappings.iter().filter(|m| m.enabled).collect();
     let total_files = enabled_mappings.len() as u32;
-    let _ = app.emit("wsl-sync-progress", SyncProgress {
-        phase: "files".to_string(),
-        current_item: "准备中...".to_string(),
-        current: 0,
-        total: total_files,
-        message: format!("文件同步: 0/{}", total_files),
-    });
+    let _ = app.emit(
+        "wsl-sync-progress",
+        SyncProgress {
+            phase: "files".to_string(),
+            current_item: "准备中...".to_string(),
+            current: 0,
+            total: total_files,
+            message: format!("文件同步: 0/{}", total_files),
+            current_file: None,
+        },
+    );
 
-    // Dynamically resolve config file paths for opencode and oh-my-opencode
-    let file_mappings = resolve_dynamic_paths(config.file_mappings.clone());
+    // Resolve effective local/WSL paths based on current runtime locations.
+    let db = state.db();
+    let file_mappings = resolve_dynamic_paths_with_db(&db, config.file_mappings.clone()).await;
+    let gateway_wsl_rewrite_context = build_gateway_wsl_rewrite_context(&db, app);
 
     // Sync file mappings with progress
-    let mut result = sync_mappings_with_progress(&file_mappings, &distro, module, skip_modules, app);
+    let mut result = sync_mappings_with_progress(
+        &file_mappings,
+        &distro,
+        module,
+        Some(merged_skip_modules.as_slice()),
+        app,
+        gateway_wsl_rewrite_context.as_ref(),
+    );
+
+    let skip_claude = merged_skip_modules.iter().any(|m| m == "claude");
+    if !skip_claude && (module.is_none() || module == Some("claude")) {
+        if let Err(error) = rewrite_claude_plugin_metadata_in_wsl(&db, &distro).await {
+            log::warn!("Claude plugin metadata WSL rewrite failed: {}", error);
+            result
+                .errors
+                .push(format!("Claude plugins metadata rewrite: {}", error));
+        }
+    }
 
     // Also sync MCP and Skills to WSL (full sync)
     if config.sync_mcp {
@@ -300,9 +362,8 @@ pub(super) async fn do_full_sync(
 
     // Sync Claude Code onboarding status from Windows to WSL
     // Mirror the hasCompletedOnboarding field so WSL skips/shows initial setup accordingly
-    let skip_claude = skip_modules.map_or(false, |s| s.iter().any(|m| m == "claude"));
     if !skip_claude && (module.is_none() || module == Some("claude")) {
-        if let Err(e) = sync_onboarding_to_wsl(&distro).await {
+        if let Err(e) = sync_onboarding_to_wsl(state, &distro).await {
             log::warn!("Onboarding WSL sync failed: {}", e);
             result.errors.push(format!("Onboarding sync: {}", e));
             result.success = false;
@@ -310,14 +371,106 @@ pub(super) async fn do_full_sync(
     }
 
     // Ensure OpenClaw config exists in WSL (create empty {} if missing)
-    let skip_openclaw = skip_modules.map_or(false, |s| s.iter().any(|m| m == "openclaw"));
+    let skip_openclaw = merged_skip_modules.iter().any(|m| m == "openclaw");
     if !skip_openclaw && (module.is_none() || module == Some("openclaw")) {
-        if let Err(e) = ensure_openclaw_config_in_wsl(&distro) {
+        if let Err(e) = ensure_openclaw_config_in_wsl(state, &distro).await {
             log::warn!("OpenClaw WSL config init failed: {}", e);
         }
     }
 
     result
+}
+
+async fn rewrite_claude_plugin_metadata_in_wsl(
+    db: &SqliteDbState,
+    distro: &str,
+) -> Result<(), String> {
+    let source_plugins_root = runtime_location::get_claude_plugins_dir_async(db)
+        .await?
+        .to_string_lossy()
+        .to_string();
+    let target_plugins_root_raw =
+        runtime_location::get_claude_wsl_target_path_async(db, "plugins").await;
+
+    // Claude CLI 2.1.126+ validates marketplace `installLocation` / `installPath`
+    // as a literal Linux path and does NOT expand `~`. The WSL read/write helpers
+    // expand `~` via bash `$HOME`, so file paths still work — but the same `~` must
+    // not survive into the JSON values we write back. Resolve the real Linux home
+    // once and substitute it before handing the string to the rewrite helper.
+    let target_plugins_root = expand_tilde_with_wsl_home(distro, &target_plugins_root_raw)?;
+
+    for file_name in ["known_marketplaces.json", "installed_plugins.json"] {
+        let target_file_path = format!(
+            "{}/{}",
+            target_plugins_root_raw.trim_end_matches('/'),
+            file_name
+        );
+        let existing_content = sync::read_wsl_file(distro, &target_file_path)?;
+        if existing_content.trim().is_empty() {
+            continue;
+        }
+
+        let Some(rewritten_content) =
+            plugin_metadata_sync::rewrite_claude_plugin_metadata_if_needed(
+                file_name,
+                &existing_content,
+                &source_plugins_root,
+                &target_plugins_root,
+            )?
+        else {
+            continue;
+        };
+
+        sync::write_wsl_file(distro, &target_file_path, &rewritten_content)?;
+    }
+
+    Ok(())
+}
+
+fn expand_tilde_with_wsl_home(distro: &str, path: &str) -> Result<String, String> {
+    if !path.starts_with('~') {
+        return Ok(path.to_string());
+    }
+    let home = sync::get_wsl_user_home(distro)?;
+    Ok(runtime_location::expand_home_from_user_root(
+        Some(&home),
+        path,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct GatewayWslRewriteContext {
+    paths: ProxyGatewayPaths,
+    settings: ProxyGatewaySettings,
+}
+
+fn build_gateway_wsl_rewrite_context(
+    db: &SqliteDbState,
+    app: &tauri::AppHandle,
+) -> Option<GatewayWslRewriteContext> {
+    let settings = match proxy_gateway_settings::load_settings_from_sqlite_state(db) {
+        Ok(settings) => settings,
+        Err(error) => {
+            log::warn!("Gateway WSL endpoint rewrite skipped: {}", error);
+            return None;
+        }
+    };
+    if settings.wsl_host.trim().is_empty() {
+        return None;
+    }
+
+    let app_data_dir = match app.path().app_data_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!("Gateway WSL endpoint rewrite skipped: {}", error);
+            return None;
+        }
+    };
+
+    Some(GatewayWslRewriteContext {
+        paths: ProxyGatewayPaths::new(app_data_dir),
+        settings,
+    })
 }
 
 /// Sync file mappings with progress events
@@ -327,6 +480,7 @@ fn sync_mappings_with_progress(
     module_filter: Option<&str>,
     skip_modules: Option<&[String]>,
     app: &tauri::AppHandle,
+    gateway_wsl_rewrite_context: Option<&GatewayWslRewriteContext>,
 ) -> SyncResult {
     let mut synced_files = vec![];
     let mut skipped_files = vec![];
@@ -343,21 +497,52 @@ fn sync_mappings_with_progress(
 
     for (idx, mapping) in filtered_mappings.iter().enumerate() {
         let current = (idx + 1) as u32;
-        
+
         // Emit progress
-        let _ = app.emit("wsl-sync-progress", SyncProgress {
-            phase: "files".to_string(),
-            current_item: mapping.name.clone(),
-            current,
-            total,
-            message: format!("文件同步: {}/{} - {}", current, total, mapping.name),
-        });
+        let _ = app.emit(
+            "wsl-sync-progress",
+            SyncProgress {
+                phase: "files".to_string(),
+                current_item: mapping.name.clone(),
+                current,
+                total,
+                message: format!("文件同步: {}/{} - {}", current, total, mapping.name),
+                current_file: None,
+            },
+        );
 
         match sync::sync_file_mapping(mapping, distro) {
-            Ok(files) if files.is_empty() => {
-                skipped_files.push(mapping.name.clone());
-            }
-            Ok(files) => {
+            Ok(mut files) => {
+                if !files.is_empty() {
+                    match rewrite_gateway_managed_wsl_copy(
+                        mapping,
+                        distro,
+                        gateway_wsl_rewrite_context,
+                    ) {
+                        Ok(Some(rewritten_file)) => files.push(rewritten_file),
+                        Ok(None) => {}
+                        Err(error) => errors.push(format!("{}: {}", mapping.name, error)),
+                    }
+
+                    match cleanup_synced_file_in_wsl(mapping, distro) {
+                        Ok(Some(cleaned_file)) => files.push(cleaned_file),
+                        Ok(None) => {}
+                        Err(error) => errors.push(format!("{}: {}", mapping.name, error)),
+                    }
+                }
+
+                match reconcile_codex_prompt_files_in_wsl(mapping, distro) {
+                    Ok(prompt_files) => files.extend(prompt_files),
+                    Err(error) => errors.push(format!("{}: {}", mapping.name, error)),
+                }
+                match sync_codex_model_catalog_in_wsl(mapping, distro) {
+                    Ok(catalog_files) => files.extend(catalog_files),
+                    Err(error) => errors.push(format!("{}: {}", mapping.name, error)),
+                }
+                if files.is_empty() {
+                    skipped_files.push(mapping.name.clone());
+                    continue;
+                }
                 synced_files.extend(files);
             }
             Err(e) => {
@@ -374,17 +559,193 @@ fn sync_mappings_with_progress(
     }
 }
 
+fn rewrite_gateway_managed_wsl_copy(
+    mapping: &FileMapping,
+    distro: &str,
+    context: Option<&GatewayWslRewriteContext>,
+) -> Result<Option<String>, String> {
+    if mapping.is_directory || mapping.is_pattern {
+        return Ok(None);
+    }
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let Some((cli_key, target_kind)) =
+        cli_proxy::wsl_synced_gateway_target_for_mapping(&mapping.id)
+    else {
+        return Ok(None);
+    };
+
+    let content = sync::read_wsl_file(distro, &mapping.wsl_path)?;
+    let Some(rewritten_content) = cli_proxy::rewrite_wsl_synced_gateway_target_content(
+        &context.paths,
+        &context.settings,
+        cli_key,
+        target_kind,
+        &content,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    sync::write_wsl_file(distro, &mapping.wsl_path, &rewritten_content)?;
+    Ok(Some(format!(
+        "Gateway WSL endpoint rewrite: {}",
+        mapping.wsl_path
+    )))
+}
+
+fn cleanup_synced_file_in_wsl(
+    mapping: &FileMapping,
+    distro: &str,
+) -> Result<Option<String>, String> {
+    let mut cleanup_paths = Vec::new();
+    if mapping.id == "claude-settings" {
+        cleanup_paths.extend(
+            config_cleanup::CLAUDE_NON_WINDOWS_TARGET_CLEANUP_PATHS
+                .iter()
+                .map(|path| (*path).to_string()),
+        );
+    }
+    cleanup_paths.extend(mapping.cleanup_paths.iter().cloned());
+
+    let cleanup_paths = config_cleanup::cleanup_paths_for_mapping(
+        mapping.is_directory,
+        mapping.is_pattern,
+        &mapping.wsl_path,
+        &mapping.windows_path,
+        &cleanup_paths,
+    )?;
+    if cleanup_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let format = config_cleanup::cleanup_file_format_for_mapping_paths(
+        &mapping.wsl_path,
+        &mapping.windows_path,
+    )
+    .ok_or_else(|| "字段清理路径仅支持 JSON/TOML 单文件映射".to_string())?;
+    let content = sync::read_wsl_file(distro, &mapping.wsl_path)?;
+    let Some(cleaned_content) =
+        config_cleanup::apply_cleanup_paths_to_content(&content, format, &cleanup_paths)?
+    else {
+        return Ok(None);
+    };
+
+    sync::write_wsl_file(distro, &mapping.wsl_path, &cleaned_content)?;
+    Ok(Some(format!("Field cleanup: {}", mapping.wsl_path)))
+}
+
+fn reconcile_codex_prompt_files_in_wsl(
+    mapping: &FileMapping,
+    distro: &str,
+) -> Result<Vec<String>, String> {
+    if mapping.id != "codex-prompt" || mapping.is_directory || mapping.is_pattern {
+        return Ok(vec![]);
+    }
+
+    if runtime_location::parse_wsl_unc_path(&mapping.windows_path).is_some() {
+        return Ok(vec![]);
+    }
+
+    let mut synced_files = Vec::new();
+    for file_name in runtime_location::CODEX_PROMPT_FILE_NAMES {
+        let windows_path =
+            runtime_location::replace_path_file_name(&mapping.windows_path, file_name);
+        let wsl_path = runtime_location::replace_path_file_name(&mapping.wsl_path, file_name);
+        let expanded_windows_path = sync::expand_env_vars(&windows_path)?;
+
+        if Path::new(&expanded_windows_path).exists() {
+            if windows_path == mapping.windows_path && wsl_path == mapping.wsl_path {
+                continue;
+            }
+            synced_files.extend(sync::sync_single_file(
+                &expanded_windows_path,
+                &wsl_path,
+                distro,
+            )?);
+        } else {
+            sync::remove_wsl_path(distro, &wsl_path)?;
+            synced_files.push(format!("removed stale Codex prompt: {}", wsl_path));
+        }
+    }
+
+    Ok(synced_files)
+}
+
+fn codex_config_uses_ai_toolbox_model_catalog(config_toml: &str) -> bool {
+    let Ok(document) = config_toml.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+
+    document
+        .get("model_catalog_json")
+        .and_then(|item| item.as_str())
+        == Some(AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME)
+}
+
+fn sync_codex_model_catalog_in_wsl(
+    mapping: &FileMapping,
+    distro: &str,
+) -> Result<Vec<String>, String> {
+    if mapping.id != "codex-config" || mapping.is_directory || mapping.is_pattern {
+        return Ok(vec![]);
+    }
+
+    if runtime_location::parse_wsl_unc_path(&mapping.windows_path).is_some() {
+        return Ok(vec![]);
+    }
+
+    let expanded_config_path = sync::expand_env_vars(&mapping.windows_path)?;
+    if !Path::new(&expanded_config_path).exists() {
+        return Ok(vec![]);
+    }
+
+    let config_toml = std::fs::read_to_string(&expanded_config_path)
+        .map_err(|error| format!("Failed to read Codex config.toml: {}", error))?;
+    if !codex_config_uses_ai_toolbox_model_catalog(&config_toml) {
+        return Ok(vec![]);
+    }
+
+    let windows_catalog_path = runtime_location::replace_path_file_name(
+        &mapping.windows_path,
+        AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME,
+    );
+    let wsl_catalog_path = runtime_location::replace_path_file_name(
+        &mapping.wsl_path,
+        AI_TOOLBOX_CODEX_MODEL_CATALOG_FILENAME,
+    );
+    let expanded_catalog_path = sync::expand_env_vars(&windows_catalog_path)?;
+
+    if Path::new(&expanded_catalog_path).exists() {
+        sync::sync_single_file(&expanded_catalog_path, &wsl_catalog_path, distro)
+    } else {
+        sync::remove_wsl_path(distro, &wsl_catalog_path)?;
+        Ok(vec![format!(
+            "removed stale Codex model catalog: {}",
+            wsl_catalog_path
+        )])
+    }
+}
+
 /// Sync all files or specific module to WSL
 #[tauri::command]
 pub async fn wsl_sync(
-    state: tauri::State<'_, DbState>,
+    state: tauri::State<'_, SqliteDbState>,
     app: tauri::AppHandle,
     module: Option<String>,
     skip_modules: Option<Vec<String>>,
 ) -> Result<SyncResult, String> {
     let config = wsl_get_config(state.clone()).await?;
 
-    let result = do_full_sync(&state, &app, &config, module.as_deref(), skip_modules.as_deref()).await;
+    let result = do_full_sync(
+        &state,
+        &app,
+        &config,
+        module.as_deref(),
+        skip_modules.as_deref(),
+    )
+    .await;
 
     // Update sync status
     update_sync_status(state.inner(), &result).await?;
@@ -399,38 +760,73 @@ pub async fn wsl_sync(
 ///
 /// Automatic triggers include startup sync and event-driven sync from
 /// model/MCP/skills changes. Manual sync is intentionally not gated by this.
-pub async fn is_wsl_auto_sync_enabled(state: &DbState) -> bool {
-    let db = state.0.lock().await;
-
-    let query_result = db
-        .query("SELECT enabled FROM wsl_sync_config:`config` LIMIT 1")
-        .await;
-
-    let Ok(mut query_result) = query_result else {
-        return false;
-    };
-
-    let records: Result<Vec<serde_json::Value>, _> = query_result.take(0);
-    let Ok(records) = records else {
-        return false;
-    };
-
-    records
-        .first()
+pub async fn is_wsl_auto_sync_enabled(state: &SqliteDbState) -> bool {
+    state
+        .with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "config"))
+        .ok()
+        .flatten()
         .and_then(|record| record.get("enabled").and_then(|v| v.as_bool()))
         .unwrap_or(false)
 }
 
+/// Remove the WSL target for an enabled file mapping when automatic sync is on.
+///
+/// Normal file sync intentionally skips missing local sources. Delete-style tool
+/// actions must call this helper before clearing local state, otherwise the WSL
+/// target keeps the stale runtime file.
+pub async fn remove_auto_synced_wsl_mapping_target(
+    state: &SqliteDbState,
+    mapping_id: &str,
+) -> Result<bool, String> {
+    let db = state.db();
+
+    let config = load_wsl_config(db).unwrap_or_default();
+
+    if !config.enabled {
+        return Ok(false);
+    }
+
+    let file_mappings = load_wsl_file_mappings(db).unwrap_or_default();
+
+    let file_mappings = backfill_default_mappings(db, file_mappings).await;
+    let file_mappings = resolve_dynamic_paths_with_db(db, file_mappings).await;
+    let Some(mapping) = file_mappings
+        .into_iter()
+        .find(|mapping| mapping.id == mapping_id)
+    else {
+        return Ok(false);
+    };
+
+    if !mapping.enabled {
+        return Ok(false);
+    }
+
+    if mapping.is_directory || mapping.is_pattern {
+        return Err(format!(
+            "Refusing to remove non-file WSL mapping target '{}'",
+            mapping.id
+        ));
+    }
+
+    if runtime_location::parse_wsl_unc_path(&mapping.windows_path).is_some() {
+        return Ok(false);
+    }
+
+    let distro = sync::get_effective_distro(&config.distro)?;
+    sync::remove_wsl_path(&distro, &mapping.wsl_path)?;
+
+    Ok(true)
+}
+
 /// Get current WSL sync status
 #[tauri::command]
-pub async fn wsl_get_status(state: tauri::State<'_, DbState>) -> Result<WSLStatusResult, String> {
+pub async fn wsl_get_status(
+    state: tauri::State<'_, SqliteDbState>,
+) -> Result<WSLStatusResult, String> {
     let config = wsl_get_config(state).await?;
 
     let wsl_available = if config.enabled {
-        match sync::get_wsl_distros() {
-            Ok(distros) => distros.contains(&config.distro),
-            Err(_) => false,
-        }
+        sync::get_effective_distro(&config.distro).is_ok()
     } else {
         false
     };
@@ -440,6 +836,7 @@ pub async fn wsl_get_status(state: tauri::State<'_, DbState>) -> Result<WSLStatu
         last_sync_time: config.last_sync_time,
         last_sync_status: config.last_sync_status,
         last_sync_error: config.last_sync_error,
+        module_statuses: config.module_statuses,
     })
 }
 
@@ -467,8 +864,10 @@ pub fn wsl_open_terminal(distro: String) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+    let effective_distro = sync::get_effective_distro(&distro)?;
+
     std::process::Command::new("cmd")
-        .args(["/c", "start", "wsl", "-d", &distro, "--cd", "~"])
+        .args(["/c", "start", "wsl", "-d", &effective_distro, "--cd", "~"])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("Failed to open WSL terminal: {}", e))?;
@@ -489,9 +888,18 @@ pub fn wsl_open_folder(distro: String) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+    let effective_distro = sync::get_effective_distro(&distro)?;
+
     // Get actual home directory from WSL (handles root user whose home is /root, not /home/root)
     let output = std::process::Command::new("wsl")
-        .args(["-d", &distro, "--exec", "bash", "-c", "echo $HOME"])
+        .args([
+            "-d",
+            &effective_distro,
+            "--exec",
+            "bash",
+            "-c",
+            "echo $HOME",
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("Failed to get WSL home directory: {}", e))?;
@@ -503,7 +911,7 @@ pub fn wsl_open_folder(distro: String) -> Result<(), String> {
 
     // Convert WSL path (e.g. /root or /home/user) to UNC path: \\wsl$\<distro>\root or \\wsl$\<distro>\home\user
     let home_unix = home_dir.replace('/', "\\");
-    let wsl_path = format!(r"\\wsl$\{}{}", distro, home_unix);
+    let wsl_path = format!(r"\\wsl$\{}{}", effective_distro, home_unix);
     std::process::Command::new("explorer.exe")
         .arg(&wsl_path)
         .creation_flags(CREATE_NO_WINDOW)
@@ -523,46 +931,109 @@ pub fn wsl_open_folder(_distro: String) -> Result<(), String> {
 // Internal Functions
 // ============================================================================
 
-/// Auto-insert any default mappings whose IDs are missing from the database.
-/// This ensures upgrading users get newly added default mappings (e.g. OpenClaw).
+/// Auto-insert newly added default mappings.
 ///
 /// Uses a version guard (`wsl_defaults_version`) so the migration runs only once
 /// per schema bump. If the user deletes a backfilled mapping afterwards, it will
 /// NOT be re-added.
 async fn backfill_default_mappings(
-    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    db: &SqliteDbState,
     mut file_mappings: Vec<FileMapping>,
 ) -> Vec<FileMapping> {
     // Bump this number whenever new default mappings are added.
-    const CURRENT_DEFAULTS_VERSION: u64 = 2;
+    const CURRENT_DEFAULTS_VERSION: u64 = 16;
+    const DEFAULTS_VERSION_BEFORE_AGENT_DIRECTORIES: u64 = 7;
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V8: &[&str] = &["opencode-agents"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V9: &[&str] =
+        &["grok-auth", "grok-config", "grok-prompt", "grok-plugins"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V11: &[&str] = &[
+        "omp-config",
+        "omp-models",
+        "omp-mcp",
+        "omp-agents",
+        "omp-rules",
+    ];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V12: &[&str] = &["hermes-config", "hermes-prompt"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V13: &[&str] =
+        &["dsh-config", "dsh-credentials", "dsh-prompt"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V14: &[&str] = &["dsh-mcp"];
+    const DEFAULT_MAPPING_IDS_ADDED_IN_V16: &[&str] = &[
+        "kimi-config",
+        "kimi-prompt",
+        "kimi-credentials",
+        "kimi-plugins",
+    ];
 
     // Read stored version
     let stored_version: u64 = db
-        .query("SELECT version FROM wsl_sync_config:`defaults_version` LIMIT 1")
-        .await
+        .with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "defaults_version"))
         .ok()
-        .and_then(|mut r| {
-            let vals: Result<Vec<serde_json::Value>, _> = r.take(0);
-            vals.ok()
-        })
-        .and_then(|records| records.first().cloned())
-        .and_then(|v| v.get("version").and_then(|v| v.as_u64()))
+        .flatten()
+        .and_then(|value| value.get("version").and_then(|value| value.as_u64()))
         .unwrap_or(0);
 
     if stored_version >= CURRENT_DEFAULTS_VERSION {
         return file_mappings;
     }
 
-    // Collect existing IDs
+    let existing_mapping_count = file_mappings.len();
     let existing_ids: std::collections::HashSet<String> =
         file_mappings.iter().map(|m| m.id.clone()).collect();
 
     for default_mapping in default_file_mappings() {
-        if !existing_ids.contains(&default_mapping.id) {
+        if !existing_ids.contains(&default_mapping.id)
+            && (should_backfill_default_mapping(
+                stored_version,
+                existing_mapping_count,
+                &default_mapping.id,
+                DEFAULTS_VERSION_BEFORE_AGENT_DIRECTORIES,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V8,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                9,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V9,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                11,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V11,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                12,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V12,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                13,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V13,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                14,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V14,
+            ) || should_backfill_versioned_mapping(
+                stored_version,
+                16,
+                &default_mapping.id,
+                DEFAULT_MAPPING_IDS_ADDED_IN_V16,
+            ))
+        {
             let mapping_data = adapter::mapping_to_db_value(&default_mapping);
-            let query = format!("UPSERT wsl_file_mapping:`{}` CONTENT $data", default_mapping.id);
-            if let Err(e) = db.query(&query).bind(("data", mapping_data)).await {
-                log::warn!("Failed to backfill WSL mapping '{}': {}", default_mapping.id, e);
+            if let Err(e) = db.with_conn(|conn| {
+                db_put(
+                    conn,
+                    DbTable::WslFileMapping,
+                    &default_mapping.id,
+                    &mapping_data,
+                )
+            }) {
+                log::warn!(
+                    "Failed to backfill WSL mapping '{}': {}",
+                    default_mapping.id,
+                    e
+                );
                 continue;
             }
             log::info!("Backfilled default WSL mapping: {}", default_mapping.id);
@@ -570,64 +1041,524 @@ async fn backfill_default_mappings(
         }
     }
 
+    // v10: migrate the persisted Oh My OpenAgent mapping from the legacy default
+    // (~/.config/opencode/oh-my-openagent.jsonc) to the unified ~/.omo/omo.jsonc,
+    // so the WSL/SSH settings page shows the path that dynamic sync actually uses.
+    if stored_version < 10 {
+        const OLD_OMO_MAPPING_PATH: &str = "~/.config/opencode/oh-my-openagent.jsonc";
+        const NEW_OMO_MAPPING_PATH: &str = "~/.omo/omo.jsonc";
+        for mapping in file_mappings.iter_mut() {
+            if mapping.id == "opencode-oh-my"
+                && (mapping.windows_path == OLD_OMO_MAPPING_PATH
+                    || mapping.wsl_path == OLD_OMO_MAPPING_PATH)
+            {
+                let mapping_id = mapping.id.clone();
+                mapping.windows_path = NEW_OMO_MAPPING_PATH.to_string();
+                mapping.wsl_path = NEW_OMO_MAPPING_PATH.to_string();
+                let data = adapter::mapping_to_db_value(mapping);
+                if let Err(e) =
+                    db.with_conn(|conn| db_put(conn, DbTable::WslFileMapping, &mapping_id, &data))
+                {
+                    log::warn!("Failed to migrate WSL mapping '{}': {}", mapping_id, e);
+                } else {
+                    log::info!(
+                        "Migrated WSL mapping '{}' to {}",
+                        mapping_id,
+                        NEW_OMO_MAPPING_PATH
+                    );
+                }
+            }
+        }
+    }
+
+    // v15: drop the Claude Desktop default mapping. Claude Desktop is a Windows
+    // GUI app that cannot run inside WSL, so syncing its config there was
+    // meaningless (the mapping was disabled-by-default anyway). Remove any
+    // persisted row so the generic sync_mappings loop stops touching it, even
+    // if a user had manually enabled it.
+    if stored_version < 15 {
+        if let Err(e) =
+            db.with_conn(|conn| db_delete(conn, DbTable::WslFileMapping, "claude-desktop-config"))
+        {
+            log::warn!("Failed to drop legacy claude-desktop-config mapping: {}", e);
+        }
+    }
+
     // Mark migration as done
-    let _ = db
-        .query("UPSERT wsl_sync_config:`defaults_version` CONTENT { version: $v }")
-        .bind(("v", CURRENT_DEFAULTS_VERSION))
-        .await;
+    let version_data = serde_json::json!({ "version": CURRENT_DEFAULTS_VERSION });
+    let _ = db.with_conn(|conn| {
+        db_put(
+            conn,
+            DbTable::WslSyncConfig,
+            "defaults_version",
+            &version_data,
+        )
+    });
 
     file_mappings
 }
 
-/// Dynamically resolve config file paths for opencode and oh-my-opencode
+fn should_backfill_versioned_mapping(
+    stored_version: u64,
+    introduced_version: u64,
+    mapping_id: &str,
+    introduced_mapping_ids: &[&str],
+) -> bool {
+    stored_version < introduced_version && introduced_mapping_ids.contains(&mapping_id)
+}
+
+fn should_backfill_default_mapping(
+    stored_version: u64,
+    existing_mapping_count: usize,
+    mapping_id: &str,
+    previous_defaults_version: u64,
+    new_mapping_ids: &[&str],
+) -> bool {
+    if stored_version == 0 && existing_mapping_count == 0 {
+        return true;
+    }
+    if stored_version < previous_defaults_version {
+        return true;
+    }
+    new_mapping_ids.contains(&mapping_id)
+}
+
+/// Dynamically resolve config file paths for OpenCode and Oh My OpenAgent.
 /// This ensures we sync the actual config file format (.jsonc or .json) being used
 pub(super) fn resolve_dynamic_paths(mappings: Vec<FileMapping>) -> Vec<FileMapping> {
-    mappings.into_iter().map(|mut mapping| {
+    // Keep a minimal fallback for paths that do not require DB.
+    mappings
+        .into_iter()
+        .map(|mapping| {
+            match mapping.id.as_str() {
+                "opencode-prompt" => {
+                    // prompt path is resolved by the async wrapper
+                }
+                _ => {}
+            }
+            mapping
+        })
+        .collect()
+}
+
+pub(super) async fn resolve_dynamic_paths_with_db(
+    db: &SqliteDbState,
+    mappings: Vec<FileMapping>,
+) -> Vec<FileMapping> {
+    let mut resolved = Vec::with_capacity(mappings.len());
+    let legacy_omo_config = runtime_location::uses_legacy_omo_config_async(db).await;
+    for mut mapping in resolve_dynamic_paths(mappings) {
         match mapping.id.as_str() {
             "opencode-main" => {
-                // Use dynamic path detection for OpenCode main config
-                if let Ok(actual_path) = open_code::get_default_config_path() {
-                    // Extract filename from the actual path
-                    if let Some(filename) = std::path::Path::new(&actual_path).file_name() {
-                        let filename_str = filename.to_string_lossy();
-                        mapping.windows_path = actual_path.clone();
-                        mapping.wsl_path = format!("~/.config/opencode/{}", filename_str);
-                    }
+                if let Ok(location) =
+                    runtime_location::get_opencode_runtime_location_async(db).await
+                {
+                    mapping.windows_path = location.host_path.to_string_lossy().to_string();
+                    mapping.wsl_path = match location.wsl {
+                        Some(wsl) => wsl.linux_path,
+                        None => runtime_location::get_opencode_wsl_target_path_async(db).await,
+                    };
                 }
             }
             "opencode-oh-my" => {
-                // Use dynamic path detection for Oh My OpenCode config
-                if let Ok(actual_path) = oh_my_opencode::get_oh_my_opencode_config_path() {
-                    if let Some(filename) = actual_path.file_name() {
-                        let filename_str = filename.to_string_lossy();
-                        mapping.windows_path = actual_path.to_string_lossy().to_string();
-                        mapping.wsl_path = format!("~/.config/opencode/{}", filename_str);
-                    }
+                if let Ok(path) = runtime_location::get_omo_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = path
+                        .to_str()
+                        .and_then(runtime_location::parse_wsl_unc_path)
+                        .map(|wsl| wsl.linux_path)
+                        .unwrap_or_else(|| {
+                            if !legacy_omo_config {
+                                "~/.omo/omo.jsonc".to_string()
+                            } else {
+                                path.file_name()
+                                    .map(|name| {
+                                        format!("~/.config/opencode/{}", name.to_string_lossy())
+                                    })
+                                    .unwrap_or_else(|| {
+                                        "~/.config/opencode/oh-my-openagent.jsonc".to_string()
+                                    })
+                            }
+                        });
                 }
             }
             "opencode-oh-my-slim" => {
-                // Use dynamic path detection for Oh My OpenCode Slim config
-                if let Ok(actual_path) = oh_my_opencode_slim::get_oh_my_opencode_slim_config_path() {
-                    if let Some(filename) = actual_path.file_name() {
-                        let filename_str = filename.to_string_lossy();
-                        mapping.windows_path = actual_path.to_string_lossy().to_string();
-                        mapping.wsl_path = format!("~/.config/opencode/{}", filename_str);
-                    }
+                if let Ok(path) = runtime_location::get_omos_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = path
+                        .to_str()
+                        .and_then(runtime_location::parse_wsl_unc_path)
+                        .map(|wsl| wsl.linux_path)
+                        .unwrap_or_else(|| {
+                            "~/.config/opencode/oh-my-opencode-slim.json".to_string()
+                        });
+                }
+            }
+            "opencode-prompt" => {
+                if let Ok(path) = runtime_location::get_opencode_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = if let Some(wsl) =
+                        path.to_str().and_then(runtime_location::parse_wsl_unc_path)
+                    {
+                        wsl.linux_path
+                    } else {
+                        runtime_location::get_opencode_prompt_wsl_target_path_async(db).await
+                    };
+                }
+            }
+            "claude-settings" => {
+                if let Ok(path) = runtime_location::get_claude_settings_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_claude_wsl_target_path_async(db, "settings.json")
+                            .await;
+                }
+            }
+            "claude-config" => {
+                if let Ok(path) = runtime_location::get_claude_plugin_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_claude_wsl_target_path_async(db, "config.json").await;
+                }
+            }
+            "claude-prompt" => {
+                if let Ok(path) = runtime_location::get_claude_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_claude_wsl_target_path_async(db, "CLAUDE.md").await;
+                }
+            }
+            "claude-plugins" => {
+                if let Ok(path) = runtime_location::get_claude_plugins_dir_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_claude_wsl_target_path_async(db, "plugins").await;
+                }
+            }
+            "codex-auth" => {
+                if let Ok(path) = runtime_location::get_codex_auth_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_codex_wsl_target_path_async(db, "auth.json").await;
+                }
+            }
+            "codex-config" => {
+                if let Ok(path) = runtime_location::get_codex_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_codex_wsl_target_path_async(db, "config.toml").await;
+                }
+            }
+            "codex-prompt" => {
+                if let Ok(path) = runtime_location::get_codex_prompt_path_async(db).await {
+                    let file_name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(runtime_location::CODEX_DEFAULT_PROMPT_FILE_NAME);
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_codex_wsl_target_path_async(db, file_name).await;
+                }
+            }
+            "codex-plugins" => {
+                if let Ok(location) = runtime_location::get_codex_runtime_location_async(db).await {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("plugins")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = location
+                        .wsl
+                        .map(|wsl| format!("{}/plugins", wsl.linux_path.trim_end_matches('/')))
+                        .unwrap_or_else(|| "~/.codex/plugins".to_string());
+                }
+            }
+            "grok-auth" => {
+                if let Ok(path) = runtime_location::get_grok_auth_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_grok_wsl_target_path_async(db, "auth.json").await;
+                }
+            }
+            "grok-config" => {
+                if let Ok(path) = runtime_location::get_grok_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_grok_wsl_target_path_async(db, "config.toml").await;
+                }
+            }
+            "grok-prompt" => {
+                if let Ok(path) = runtime_location::get_grok_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_grok_wsl_target_path_async(db, "AGENTS.md").await;
+                }
+            }
+            "grok-plugins" => {
+                if let Ok(location) = runtime_location::get_grok_runtime_location_async(db).await {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("plugins")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = location
+                        .wsl
+                        .map(|wsl| format!("{}/plugins", wsl.linux_path.trim_end_matches('/')))
+                        .unwrap_or_else(|| "~/.grok/plugins".to_string());
+                }
+            }
+            "kimi-config" => {
+                if let Ok(path) = runtime_location::get_kimi_config_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_kimi_wsl_target_path_async(db, "config.toml").await;
+                }
+            }
+            "kimi-prompt" => {
+                if let Ok(path) = runtime_location::get_kimi_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_kimi_wsl_target_path_async(db, "AGENTS.md").await;
+                }
+            }
+            "kimi-credentials" | "kimi-plugins" => {
+                if let Ok(location) = runtime_location::get_kimi_runtime_location_async(db).await {
+                    let dir_name = if mapping.id == "kimi-credentials" {
+                        crate::coding::kimi::constants::KIMI_CREDENTIALS_DIR
+                    } else {
+                        crate::coding::kimi::constants::KIMI_PLUGINS_DIR
+                    };
+                    mapping.windows_path = location
+                        .host_path
+                        .join(dir_name)
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = location
+                        .wsl
+                        .map(|wsl| format!("{}/{}", wsl.linux_path.trim_end_matches('/'), dir_name))
+                        .unwrap_or_else(|| format!("~/.kimi-code/{dir_name}"));
+                }
+            }
+            "openclaw-config" => {
+                if let Ok(location) =
+                    runtime_location::get_openclaw_runtime_location_async(db).await
+                {
+                    mapping.windows_path = location.host_path.to_string_lossy().to_string();
+                    mapping.wsl_path = match location.wsl {
+                        Some(wsl) => wsl.linux_path,
+                        None => runtime_location::get_openclaw_wsl_target_path_async(db).await,
+                    };
+                }
+            }
+            "geminicli-env" => {
+                if let Ok(path) = runtime_location::get_gemini_cli_env_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_gemini_cli_wsl_target_path_async(db, ".env").await;
+                }
+            }
+            "geminicli-settings" => {
+                if let Ok(path) = runtime_location::get_gemini_cli_settings_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_gemini_cli_wsl_target_path_async(db, "settings.json")
+                            .await;
+                }
+            }
+            "geminicli-prompt" => {
+                if let Ok(path) = runtime_location::get_gemini_cli_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path =
+                        runtime_location::get_gemini_cli_prompt_wsl_target_path_async(db).await;
+                }
+            }
+            "geminicli-oauth" => {
+                if let Ok(path) = runtime_location::get_gemini_cli_oauth_creds_path_async(db).await
+                {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = runtime_location::get_gemini_cli_wsl_target_path_async(
+                        db,
+                        "oauth_creds.json",
+                    )
+                    .await;
+                }
+            }
+            "pi-settings" => {
+                if let Ok(path) = crate::coding::pi::get_pi_settings_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = pi_wsl_target_path(db, PI_SETTINGS_FILE).await;
+                }
+            }
+            "pi-auth" => {
+                if let Ok(path) = crate::coding::pi::get_pi_auth_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = pi_wsl_target_path(db, PI_AUTH_FILE).await;
+                }
+            }
+            "pi-models" => {
+                if let Ok(path) = crate::coding::pi::get_pi_models_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = pi_wsl_target_path(db, PI_MODELS_FILE).await;
+                }
+            }
+            "pi-mcp" => {
+                if let Ok(path) = crate::coding::pi::get_pi_mcp_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = pi_wsl_target_path(db, PI_MCP_FILE).await;
+                }
+            }
+            "pi-prompt" => {
+                if let Ok(path) = crate::coding::pi::get_pi_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = pi_wsl_target_path(db, PI_PROMPT_FILE).await;
+                }
+            }
+            "pi-system" => {
+                if let Ok(location) = runtime_location::get_pi_runtime_location_async(db).await {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("SYSTEM.md")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = pi_wsl_target_path_from_location(&location, "SYSTEM.md");
+                }
+            }
+            "pi-append-system" => {
+                if let Ok(location) = runtime_location::get_pi_runtime_location_async(db).await {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("APPEND_SYSTEM.md")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path =
+                        pi_wsl_target_path_from_location(&location, "APPEND_SYSTEM.md");
+                }
+            }
+            "pi-trust" => {
+                if let Ok(location) = runtime_location::get_pi_runtime_location_async(db).await {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("trust.json")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = pi_wsl_target_path_from_location(&location, "trust.json");
+                }
+            }
+            "omp-config" => {
+                if let Ok(path) = crate::coding::oh_my_pi::get_omp_config_path_async(db).await {
+                    let file_name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| OMP_CONFIG_FILE.to_string());
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = omp_wsl_target_path(db, &file_name).await;
+                }
+            }
+            "omp-models" => {
+                if let Ok(path) = crate::coding::oh_my_pi::get_omp_models_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = omp_wsl_target_path(db, OMP_MODELS_FILE).await;
+                }
+            }
+            "omp-mcp" => {
+                if let Ok(path) = crate::coding::oh_my_pi::get_omp_mcp_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = omp_wsl_target_path(db, OMP_MCP_FILE).await;
+                }
+            }
+            "omp-agents" => {
+                if let Ok(path) = crate::coding::oh_my_pi::get_omp_prompt_path_async(db).await {
+                    mapping.windows_path = path.to_string_lossy().to_string();
+                    mapping.wsl_path = omp_wsl_target_path(db, OMP_PROMPT_FILE).await;
+                }
+            }
+            "omp-rules" => {
+                if let Ok(location) =
+                    runtime_location::get_oh_my_pi_runtime_location_async(db).await
+                {
+                    mapping.windows_path = location
+                        .host_path
+                        .join("RULES.md")
+                        .to_string_lossy()
+                        .to_string();
+                    mapping.wsl_path = omp_wsl_target_path_from_location(&location, "RULES.md");
+                }
+            }
+            "hermes-config" | "hermes-prompt" => {
+                if let Ok((config_dir, _)) =
+                    crate::coding::hermes::get_hermes_config_dir_from_db_async(db).await
+                {
+                    let file_name = if mapping.id == "hermes-config" {
+                        crate::coding::hermes::constants::HERMES_CONFIG_FILE
+                    } else {
+                        crate::coding::hermes::constants::HERMES_PROMPT_FILE
+                    };
+                    mapping.windows_path = config_dir.join(file_name).to_string_lossy().to_string();
+                    mapping.wsl_path = format!("~/.hermes/{file_name}");
+                }
+            }
+            "dsh-config" | "dsh-credentials" | "dsh-prompt" | "dsh-mcp" => {
+                if let Ok((config_dir, _)) =
+                    crate::coding::dsh::get_dsh_config_dir_from_db_async(db).await
+                {
+                    let file_name = match mapping.id.as_str() {
+                        "dsh-credentials" => DSH_CREDENTIALS_FILE,
+                        "dsh-prompt" => DSH_PROMPT_FILE,
+                        "dsh-mcp" => DSH_MCP_FILE,
+                        _ => DSH_SETTINGS_FILE,
+                    };
+                    mapping.windows_path = config_dir.join(file_name).to_string_lossy().to_string();
+                    mapping.wsl_path = format!("~/.dsh/{file_name}");
                 }
             }
             _ => {}
         }
-        mapping
-    }).collect()
+        resolved.push(mapping);
+    }
+    resolved
+}
+
+fn omp_wsl_target_path_from_location(
+    location: &runtime_location::RuntimeLocationInfo,
+    file_name: &str,
+) -> String {
+    location
+        .wsl
+        .as_ref()
+        .map(|wsl| format!("{}/{}", wsl.linux_path.trim_end_matches('/'), file_name))
+        .unwrap_or_else(|| format!("~/.omp/agent/{file_name}"))
+}
+
+async fn omp_wsl_target_path(db: &SqliteDbState, file_name: &str) -> String {
+    runtime_location::get_oh_my_pi_runtime_location_async(db)
+        .await
+        .map(|location| omp_wsl_target_path_from_location(&location, file_name))
+        .unwrap_or_else(|_| format!("~/.omp/agent/{file_name}"))
+}
+
+fn pi_wsl_target_path_from_location(
+    location: &runtime_location::RuntimeLocationInfo,
+    file_name: &str,
+) -> String {
+    location
+        .wsl
+        .as_ref()
+        .map(|wsl| format!("{}/{}", wsl.linux_path.trim_end_matches('/'), file_name))
+        .unwrap_or_else(|| format!("~/.pi/agent/{file_name}"))
+}
+
+async fn pi_wsl_target_path(db: &SqliteDbState, file_name: &str) -> String {
+    runtime_location::get_pi_runtime_location_async(db)
+        .await
+        .map(|location| pi_wsl_target_path_from_location(&location, file_name))
+        .unwrap_or_else(|_| format!("~/.pi/agent/{file_name}"))
 }
 
 /// Update sync status in database
 pub(super) async fn update_sync_status(
-    state: &DbState,
+    state: &SqliteDbState,
     result: &SyncResult,
 ) -> Result<(), String> {
-    let db = state.0.lock().await;
-
     let (status, error) = if result.success {
         ("success".to_string(), None)
     } else {
@@ -637,12 +1568,23 @@ pub(super) async fn update_sync_status(
 
     let now = Local::now().to_rfc3339();
 
-    db.query("UPDATE wsl_sync_config SET last_sync_time = $time, last_sync_status = $status, last_sync_error = $error WHERE id = wsl_sync_config:`config`")
-        .bind(("time", now))
-        .bind(("status", status))
-        .bind(("error", error))
-        .await
-        .map_err(|e| format!("Failed to update sync status: {}", e))?;
+    let mut config_data = state
+        .with_conn(|conn| db_get(conn, DbTable::WslSyncConfig, "config"))?
+        .unwrap_or_else(|| adapter::config_to_db_value(&WSLSyncConfig::default()));
+    if let Some(payload) = config_data.as_object_mut() {
+        payload.insert("last_sync_time".to_string(), serde_json::Value::String(now));
+        payload.insert(
+            "last_sync_status".to_string(),
+            serde_json::Value::String(status),
+        );
+        payload.insert(
+            "last_sync_error".to_string(),
+            error
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    state.with_conn(|conn| db_put(conn, DbTable::WslSyncConfig, "config", &config_data))?;
 
     Ok(())
 }
@@ -660,16 +1602,20 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         FileMapping {
             id: "opencode-oh-my".to_string(),
-            name: "Oh My OpenCode 配置".to_string(),
+            name: "Oh My OpenAgent 配置".to_string(),
             module: "opencode".to_string(),
-            windows_path: "~/.config/opencode/oh-my-opencode.jsonc".to_string(),
-            wsl_path: "~/.config/opencode/oh-my-opencode.jsonc".to_string(),
+            windows_path: "~/.omo/omo.jsonc".to_string(),
+            wsl_path: "~/.omo/omo.jsonc".to_string(),
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         FileMapping {
             id: "opencode-oh-my-slim".to_string(),
@@ -680,6 +1626,8 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: false, // Disabled by default: this file is optional and not present on all systems
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         FileMapping {
             id: "opencode-auth".to_string(),
@@ -690,6 +1638,8 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         FileMapping {
             id: "opencode-plugins".to_string(),
@@ -700,6 +1650,32 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: true,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "opencode-prompt".to_string(),
+            name: "OpenCode 全局提示词".to_string(),
+            module: "opencode".to_string(),
+            windows_path: "~/.config/opencode/AGENTS.md".to_string(),
+            wsl_path: "~/.config/opencode/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "opencode-agents".to_string(),
+            name: "OpenCode Agent 配置（agents）".to_string(),
+            module: "opencode".to_string(),
+            windows_path: "~/.config/opencode/agents".to_string(),
+            wsl_path: "~/.config/opencode/agents".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         // ClaudeCode
         FileMapping {
@@ -711,6 +1687,8 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         FileMapping {
             id: "claude-config".to_string(),
@@ -721,6 +1699,32 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "claude-prompt".to_string(),
+            name: "Claude Code 全局提示词".to_string(),
+            module: "claude".to_string(),
+            windows_path: "~/.claude/CLAUDE.md".to_string(),
+            wsl_path: "~/.claude/CLAUDE.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "claude-plugins".to_string(),
+            name: "Claude Code 插件目录".to_string(),
+            module: "claude".to_string(),
+            windows_path: "~/.claude/plugins".to_string(),
+            wsl_path: "~/.claude/plugins".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         // Codex
         FileMapping {
@@ -732,6 +1736,8 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         FileMapping {
             id: "codex-config".to_string(),
@@ -742,6 +1748,81 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "codex-prompt".to_string(),
+            name: "Codex 全局提示词".to_string(),
+            module: "codex".to_string(),
+            windows_path: "~/.codex/AGENTS.md".to_string(),
+            wsl_path: "~/.codex/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "codex-plugins".to_string(),
+            name: "Codex 插件目录".to_string(),
+            module: "codex".to_string(),
+            windows_path: "~/.codex/plugins".to_string(),
+            wsl_path: "~/.codex/plugins".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Grok
+        FileMapping {
+            id: "grok-auth".to_string(),
+            name: "Grok 认证".to_string(),
+            module: "grok".to_string(),
+            windows_path: "~/.grok/auth.json".to_string(),
+            wsl_path: "~/.grok/auth.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "grok-config".to_string(),
+            name: "Grok 配置".to_string(),
+            module: "grok".to_string(),
+            windows_path: "~/.grok/config.toml".to_string(),
+            wsl_path: "~/.grok/config.toml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "grok-prompt".to_string(),
+            name: "Grok 全局提示词".to_string(),
+            module: "grok".to_string(),
+            windows_path: "~/.grok/AGENTS.md".to_string(),
+            wsl_path: "~/.grok/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "grok-plugins".to_string(),
+            name: "Grok 插件目录".to_string(),
+            module: "grok".to_string(),
+            windows_path: "~/.grok/plugins".to_string(),
+            wsl_path: "~/.grok/plugins".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
         // OpenClaw
         FileMapping {
@@ -753,6 +1834,337 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
             enabled: true,
             is_pattern: false,
             is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Gemini CLI
+        FileMapping {
+            id: "geminicli-env".to_string(),
+            name: "Gemini CLI 环境变量".to_string(),
+            module: "geminicli".to_string(),
+            windows_path: "~/.gemini/.env".to_string(),
+            wsl_path: "~/.gemini/.env".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "geminicli-settings".to_string(),
+            name: "Gemini CLI 设置".to_string(),
+            module: "geminicli".to_string(),
+            windows_path: "~/.gemini/settings.json".to_string(),
+            wsl_path: "~/.gemini/settings.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "geminicli-prompt".to_string(),
+            name: "Gemini CLI 全局提示词".to_string(),
+            module: "geminicli".to_string(),
+            windows_path: "~/.gemini/GEMINI.md".to_string(),
+            wsl_path: "~/.gemini/GEMINI.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "geminicli-oauth".to_string(),
+            name: "Gemini CLI OAuth 凭证".to_string(),
+            module: "geminicli".to_string(),
+            windows_path: "~/.gemini/oauth_creds.json".to_string(),
+            wsl_path: "~/.gemini/oauth_creds.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Pi
+        FileMapping {
+            id: "pi-settings".to_string(),
+            name: "Pi 设置".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/settings.json".to_string(),
+            wsl_path: "~/.pi/agent/settings.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-auth".to_string(),
+            name: "Pi 认证信息".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/auth.json".to_string(),
+            wsl_path: "~/.pi/agent/auth.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-models".to_string(),
+            name: "Pi 模型供应商".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/models.json".to_string(),
+            wsl_path: "~/.pi/agent/models.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-mcp".to_string(),
+            name: "Pi MCP 配置".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/mcp.json".to_string(),
+            wsl_path: "~/.pi/agent/mcp.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-prompt".to_string(),
+            name: "Pi 全局提示词".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/AGENTS.md".to_string(),
+            wsl_path: "~/.pi/agent/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-system".to_string(),
+            name: "Pi System Prompt".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/SYSTEM.md".to_string(),
+            wsl_path: "~/.pi/agent/SYSTEM.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-append-system".to_string(),
+            name: "Pi 追加 System Prompt".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/APPEND_SYSTEM.md".to_string(),
+            wsl_path: "~/.pi/agent/APPEND_SYSTEM.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "pi-trust".to_string(),
+            name: "Pi 信任记录".to_string(),
+            module: "pi".to_string(),
+            windows_path: "~/.pi/agent/trust.json".to_string(),
+            wsl_path: "~/.pi/agent/trust.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "omp-config".to_string(),
+            name: "Oh My Pi 配置".to_string(),
+            module: "oh_my_pi".to_string(),
+            windows_path: "~/.omp/agent/config.yml".to_string(),
+            wsl_path: "~/.omp/agent/config.yml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "omp-models".to_string(),
+            name: "Oh My Pi 模型供应商".to_string(),
+            module: "oh_my_pi".to_string(),
+            windows_path: "~/.omp/agent/models.yml".to_string(),
+            wsl_path: "~/.omp/agent/models.yml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "omp-mcp".to_string(),
+            name: "Oh My Pi MCP 配置".to_string(),
+            module: "oh_my_pi".to_string(),
+            windows_path: "~/.omp/agent/mcp.json".to_string(),
+            wsl_path: "~/.omp/agent/mcp.json".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "omp-agents".to_string(),
+            name: "Oh My Pi 全局提示词".to_string(),
+            module: "oh_my_pi".to_string(),
+            windows_path: "~/.omp/agent/AGENTS.md".to_string(),
+            wsl_path: "~/.omp/agent/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "omp-rules".to_string(),
+            name: "Oh My Pi 规则".to_string(),
+            module: "oh_my_pi".to_string(),
+            windows_path: "~/.omp/agent/RULES.md".to_string(),
+            wsl_path: "~/.omp/agent/RULES.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Hermes - runtime config.yaml + authored global prompt.
+        FileMapping {
+            id: "hermes-config".to_string(),
+            name: "Hermes 配置".to_string(),
+            module: "hermes".to_string(),
+            windows_path: "~/.hermes/config.yaml".to_string(),
+            wsl_path: "~/.hermes/config.yaml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "hermes-prompt".to_string(),
+            name: "Hermes 全局提示词".to_string(),
+            module: "hermes".to_string(),
+            windows_path: "~/.hermes/SOUL.md".to_string(),
+            wsl_path: "~/.hermes/SOUL.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // dsh - runtime settings.yaml + separate credentials file + authored prompt.
+        FileMapping {
+            id: "dsh-config".to_string(),
+            name: "DeepSeek Harness 配置".to_string(),
+            module: "dsh".to_string(),
+            windows_path: "~/.dsh/settings.yaml".to_string(),
+            wsl_path: "~/.dsh/settings.yaml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "dsh-credentials".to_string(),
+            name: "DeepSeek Harness 凭据".to_string(),
+            module: "dsh".to_string(),
+            windows_path: "~/.dsh/.credentials.yaml".to_string(),
+            wsl_path: "~/.dsh/.credentials.yaml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "dsh-prompt".to_string(),
+            name: "DeepSeek Harness 全局提示词".to_string(),
+            module: "dsh".to_string(),
+            windows_path: "~/.dsh/AGENTS.md".to_string(),
+            wsl_path: "~/.dsh/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "dsh-mcp".to_string(),
+            name: "DeepSeek Harness MCP 配置".to_string(),
+            module: "dsh".to_string(),
+            windows_path: "~/.dsh/cordis.patch.yml".to_string(),
+            wsl_path: "~/.dsh/cordis.patch.yml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        // Kimi Code CLI - runtime config.toml + authored prompt + credentials + plugins.
+        FileMapping {
+            id: "kimi-config".to_string(),
+            name: "Kimi Code CLI 配置".to_string(),
+            module: "kimi".to_string(),
+            windows_path: "~/.kimi-code/config.toml".to_string(),
+            wsl_path: "~/.kimi-code/config.toml".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "kimi-prompt".to_string(),
+            name: "Kimi Code CLI 全局提示词".to_string(),
+            module: "kimi".to_string(),
+            windows_path: "~/.kimi-code/AGENTS.md".to_string(),
+            wsl_path: "~/.kimi-code/AGENTS.md".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: false,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "kimi-credentials".to_string(),
+            name: "Kimi Code CLI 凭据".to_string(),
+            module: "kimi".to_string(),
+            windows_path: "~/.kimi-code/credentials".to_string(),
+            wsl_path: "~/.kimi-code/credentials".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
+        },
+        FileMapping {
+            id: "kimi-plugins".to_string(),
+            name: "Kimi Code CLI 插件目录".to_string(),
+            module: "kimi".to_string(),
+            windows_path: "~/.kimi-code/plugins".to_string(),
+            wsl_path: "~/.kimi-code/plugins".to_string(),
+            enabled: true,
+            is_pattern: false,
+            is_directory: true,
+            directory_excludes: vec![],
+            cleanup_paths: vec![],
         },
     ]
 }
@@ -765,13 +2177,15 @@ pub fn default_file_mappings() -> Vec<FileMapping> {
 ///
 /// Reads the Windows-side ~/.claude.json status and mirrors it to WSL's ~/.claude.json,
 /// preserving all other fields in the WSL file.
-async fn sync_onboarding_to_wsl(distro: &str) -> Result<(), String> {
+async fn sync_onboarding_to_wsl(state: &SqliteDbState, distro: &str) -> Result<(), String> {
     // 1. Read Windows-side onboarding status
-    let windows_status = crate::coding::claude_code::get_claude_onboarding_status().await?;
+    let db = state.db();
+    let windows_config_path = runtime_location::get_claude_mcp_config_path_async(&db).await?;
+    let windows_status = read_claude_onboarding_status_from_path(&windows_config_path)?;
 
     // 2. Read existing WSL ~/.claude.json
-    let wsl_config_path = "~/.claude.json";
-    let existing_content = sync::read_wsl_file(distro, wsl_config_path)?;
+    let wsl_config_path = runtime_location::get_claude_wsl_claude_json_path_async(&db).await;
+    let existing_content = sync::read_wsl_file(distro, wsl_config_path.as_str())?;
 
     // 3. Parse JSON or create empty object
     let mut config: serde_json::Value = if existing_content.trim().is_empty() {
@@ -809,7 +2223,7 @@ async fn sync_onboarding_to_wsl(distro: &str) -> Result<(), String> {
     // 7. Write back to WSL
     let content = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    sync::write_wsl_file(distro, wsl_config_path, &content)?;
+    sync::write_wsl_file(distro, wsl_config_path.as_str(), &content)?;
 
     log::info!(
         "Synced onboarding status to WSL: hasCompletedOnboarding={}",
@@ -823,9 +2237,10 @@ async fn sync_onboarding_to_wsl(distro: &str) -> Result<(), String> {
 ///
 /// Checks if `~/.openclaw/openclaw.json` exists in the target WSL distro.
 /// If the file is missing, creates it with an empty JSON object `{}`.
-fn ensure_openclaw_config_in_wsl(distro: &str) -> Result<(), String> {
-    let config_path = "~/.openclaw/openclaw.json";
-    let content = sync::read_wsl_file(distro, config_path);
+async fn ensure_openclaw_config_in_wsl(state: &SqliteDbState, distro: &str) -> Result<(), String> {
+    let db = state.db();
+    let config_path = runtime_location::get_openclaw_wsl_target_path_async(&db).await;
+    let content = sync::read_wsl_file(distro, config_path.as_str());
 
     match content {
         Ok(c) if !c.trim().is_empty() => {
@@ -834,9 +2249,193 @@ fn ensure_openclaw_config_in_wsl(distro: &str) -> Result<(), String> {
         }
         _ => {
             // File missing or empty – write_wsl_file already does mkdir -p
-            sync::write_wsl_file(distro, config_path, "{}")?;
+            sync::write_wsl_file(distro, config_path.as_str(), "{}")?;
             log::info!("Created default OpenClaw config in WSL: {}", config_path);
             Ok(())
         }
+    }
+}
+
+fn merge_skip_modules(
+    skip_modules: Option<&[String]>,
+    direct_modules: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut merged = skip_modules.map(|items| items.to_vec()).unwrap_or_default();
+    for module in direct_modules {
+        if !merged.iter().any(|item| item == module) {
+            merged.push(module.clone());
+        }
+    }
+    merged
+}
+
+fn read_claude_onboarding_status_from_path(path: &std::path::Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read config file: {}", e))?;
+
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+
+    Ok(value
+        .get("hasCompletedOnboarding")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        codex_config_uses_ai_toolbox_model_catalog, default_file_mappings,
+        should_backfill_default_mapping, should_backfill_versioned_mapping,
+    };
+
+    #[test]
+    fn pi_mcp_default_mapping_is_regular_file() {
+        let mapping = default_file_mappings()
+            .into_iter()
+            .find(|mapping| mapping.id == "pi-mcp")
+            .expect("pi-mcp default mapping exists");
+
+        assert_eq!(mapping.module, "pi");
+        assert_eq!(mapping.windows_path, "~/.pi/agent/mcp.json");
+        assert_eq!(mapping.wsl_path, "~/.pi/agent/mcp.json");
+        assert!(!mapping.is_directory);
+    }
+
+    #[test]
+    fn defaults_backfill_v7_only_adds_pi_mcp_for_existing_v6_users() {
+        assert!(should_backfill_default_mapping(
+            6,
+            4,
+            "pi-mcp",
+            6,
+            &["pi-mcp"],
+        ));
+        assert!(!should_backfill_default_mapping(
+            6,
+            4,
+            "codex-config",
+            6,
+            &["pi-mcp"],
+        ));
+    }
+
+    #[test]
+    fn defaults_backfill_v8_only_adds_opencode_agents_directory_for_existing_v7_users() {
+        assert!(should_backfill_default_mapping(
+            7,
+            4,
+            "opencode-agents",
+            7,
+            &["opencode-agents"],
+        ));
+        assert!(!should_backfill_default_mapping(
+            7,
+            4,
+            "opencode-prompt",
+            7,
+            &["opencode-agents"],
+        ));
+    }
+
+    #[test]
+    fn defaults_backfill_v9_only_adds_grok_mappings_for_existing_v8_users() {
+        for mapping_id in ["grok-auth", "grok-config", "grok-prompt", "grok-plugins"] {
+            assert!(should_backfill_versioned_mapping(
+                8,
+                9,
+                mapping_id,
+                &["grok-auth", "grok-config", "grok-prompt", "grok-plugins"],
+            ));
+        }
+        assert!(!should_backfill_versioned_mapping(
+            8,
+            9,
+            "codex-config",
+            &["grok-auth", "grok-config", "grok-prompt", "grok-plugins"],
+        ));
+        assert!(!should_backfill_versioned_mapping(
+            9,
+            9,
+            "grok-config",
+            &["grok-auth", "grok-config", "grok-prompt", "grok-plugins"],
+        ));
+    }
+
+    #[test]
+    fn defaults_backfill_v16_only_adds_kimi_mappings_for_existing_v15_users() {
+        let kimi_ids = [
+            "kimi-config",
+            "kimi-prompt",
+            "kimi-credentials",
+            "kimi-plugins",
+        ];
+        for mapping_id in kimi_ids {
+            assert!(should_backfill_versioned_mapping(
+                15, 16, mapping_id, &kimi_ids,
+            ));
+        }
+        assert!(!should_backfill_versioned_mapping(
+            15,
+            16,
+            "grok-config",
+            &kimi_ids,
+        ));
+        assert!(!should_backfill_versioned_mapping(
+            16,
+            16,
+            "kimi-config",
+            &kimi_ids,
+        ));
+    }
+
+    #[test]
+    fn opencode_agents_default_mapping_is_the_only_agent_directory() {
+        let mappings = default_file_mappings();
+        // OpenCode's canonical Markdown Agent directory is the plural `agents/`;
+        // the singular `agent/` is only a legacy alias and is no longer shipped.
+        assert!(mappings.iter().all(|m| m.id != "opencode-agent"));
+        let mapping = mappings
+            .iter()
+            .find(|mapping| mapping.id == "opencode-agents")
+            .expect("OpenCode agents mapping exists");
+        assert!(mapping.is_directory);
+        assert_eq!(mapping.windows_path, "~/.config/opencode/agents");
+        assert_eq!(mapping.wsl_path, "~/.config/opencode/agents");
+    }
+
+    #[test]
+    fn defaults_backfill_keeps_new_install_full_defaults() {
+        assert!(should_backfill_default_mapping(
+            0,
+            0,
+            "codex-config",
+            6,
+            &["pi-mcp"],
+        ));
+    }
+
+    #[test]
+    fn detects_ai_toolbox_codex_model_catalog_pointer() {
+        assert!(codex_config_uses_ai_toolbox_model_catalog(
+            r#"model_catalog_json = "ai-toolbox-codex-model-catalog.json""#
+        ));
+    }
+
+    #[test]
+    fn ignores_external_codex_model_catalog_pointer() {
+        assert!(!codex_config_uses_ai_toolbox_model_catalog(
+            r#"model_catalog_json = "external-catalog.json""#
+        ));
+        assert!(!codex_config_uses_ai_toolbox_model_catalog(
+            r#"model_catalog_json = "subdir/ai-toolbox-codex-model-catalog.json""#
+        ));
+        assert!(!codex_config_uses_ai_toolbox_model_catalog(
+            "model_catalog_json = ["
+        ));
     }
 }

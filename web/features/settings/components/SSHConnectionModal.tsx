@@ -55,7 +55,8 @@ export const SSHConnectionModal: React.FC<SSHConnectionModalProps> = ({
     try {
       const values = await form.validateFields();
       const id = connection?.id || `ssh-${Date.now()}`;
-      const keyInput = values.authMethod === 'key' ? values.privateKeyPath || '' : '';
+      const selectedAuthMethod = values.authMethod as SSHConnection['authMethod'];
+      const keyInput = selectedAuthMethod === 'key' ? values.privateKeyPath || '' : '';
       const isContent = isPrivateKeyContent(keyInput);
       onSave({
         id,
@@ -63,11 +64,11 @@ export const SSHConnectionModal: React.FC<SSHConnectionModalProps> = ({
         host: values.host,
         port: values.port || 22,
         username: values.username,
-        authMethod: values.authMethod,
-        password: values.authMethod === 'password' ? values.password || '' : '',
+        authMethod: selectedAuthMethod,
+        password: selectedAuthMethod === 'password' ? values.password || '' : '',
         privateKeyPath: isContent ? '' : keyInput,
         privateKeyContent: isContent ? keyInput : '',
-        passphrase: values.authMethod === 'key' ? values.passphrase || '' : '',
+        passphrase: selectedAuthMethod === 'key' ? values.passphrase || '' : '',
         sortOrder: connection?.sortOrder || 0,
       });
       onClose();
@@ -75,8 +76,6 @@ export const SSHConnectionModal: React.FC<SSHConnectionModalProps> = ({
       // validation failed
     }
   };
-
-  const authMethod = Form.useWatch('authMethod', form);
 
   return (
     <Modal
@@ -86,7 +85,7 @@ export const SSHConnectionModal: React.FC<SSHConnectionModalProps> = ({
       onCancel={onClose}
       okText={t('common.save')}
       cancelText={t('common.cancel')}
-      destroyOnClose
+      destroyOnHidden
     >
       <Form form={form} layout="horizontal" labelCol={{ span: 6 }} wrapperCol={{ span: 18 }}>
         <Form.Item
@@ -122,33 +121,49 @@ export const SSHConnectionModal: React.FC<SSHConnectionModalProps> = ({
             <Space direction="horizontal">
               <Radio value="key">{t('settings.ssh.authKey')}</Radio>
               <Radio value="password">{t('settings.ssh.authPassword')}</Radio>
+              <Radio value="none">{t('settings.ssh.authNone')}</Radio>
             </Space>
           </Radio.Group>
         </Form.Item>
 
-        {authMethod === 'key' && (
-          <>
-            <Form.Item name="privateKeyPath" label={t('settings.ssh.privateKey')}>
-              <Input.TextArea
-                placeholder={t('settings.ssh.privateKeyPlaceholder')}
-                autoSize={{ minRows: 1, maxRows: 6 }}
-              />
-            </Form.Item>
-            <Form.Item name="passphrase" label={t('settings.ssh.passphrase')}>
-              <Input.Password placeholder={t('settings.ssh.passphrasePlaceholder')} />
-            </Form.Item>
-          </>
-        )}
+        <Form.Item
+          noStyle
+          shouldUpdate={(previousValues, currentValues) => previousValues.authMethod !== currentValues.authMethod}
+        >
+          {({ getFieldValue }) => {
+            const authMethod = getFieldValue('authMethod');
 
-        {authMethod === 'password' && (
-          <Form.Item
-            name="password"
-            label={t('settings.ssh.password')}
-            rules={[{ required: true, message: t('settings.ssh.passwordRequired') }]}
-          >
-            <Input.Password />
-          </Form.Item>
-        )}
+            if (authMethod === 'key') {
+              return (
+                <>
+                  <Form.Item name="privateKeyPath" label={t('settings.ssh.privateKey')}>
+                    <Input.TextArea
+                      placeholder={t('settings.ssh.privateKeyPlaceholder')}
+                      autoSize={{ minRows: 1, maxRows: 6 }}
+                    />
+                  </Form.Item>
+                  <Form.Item name="passphrase" label={t('settings.ssh.passphrase')}>
+                    <Input.Password placeholder={t('settings.ssh.passphrasePlaceholder')} />
+                  </Form.Item>
+                </>
+              );
+            }
+
+            if (authMethod === 'password') {
+              return (
+                <Form.Item
+                  name="password"
+                  label={t('settings.ssh.password')}
+                  rules={[{ required: true, message: t('settings.ssh.passwordRequired') }]}
+                >
+                  <Input.Password />
+                </Form.Item>
+              );
+            }
+
+            return null;
+          }}
+        </Form.Item>
       </Form>
     </Modal>
   );

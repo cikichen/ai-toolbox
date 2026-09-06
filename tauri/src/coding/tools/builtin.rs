@@ -32,6 +32,26 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         mcp_config_format: Some("toml"),
         mcp_field: Some("mcp_servers"),
     },
+    // Grok CLI - supports both Skills and MCP
+    BuiltinTool {
+        key: "grok",
+        display_name: "Grok",
+        relative_skills_dir: Some("~/.grok/skills"),
+        relative_detect_dir: Some("~/.grok"),
+        mcp_config_path: Some("~/.grok/config.toml"),
+        mcp_config_format: Some("toml"),
+        mcp_field: Some("mcp_servers"),
+    },
+    // Kimi Code CLI - supports both Skills and MCP
+    BuiltinTool {
+        key: "kimi",
+        display_name: "Kimi",
+        relative_skills_dir: Some("~/.kimi-code/skills"),
+        relative_detect_dir: Some("~/.kimi-code"),
+        mcp_config_path: Some("~/.kimi-code/config.toml"),
+        mcp_config_format: Some("toml"),
+        mcp_field: Some("mcp_servers"),
+    },
     // Gemini CLI - supports both Skills and MCP
     BuiltinTool {
         key: "gemini_cli",
@@ -39,6 +59,16 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         relative_skills_dir: Some("~/.gemini/skills"),
         relative_detect_dir: Some("~/.gemini"),
         mcp_config_path: Some("~/.gemini/settings.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // Qwen Code - supports both Skills and MCP (forked from Gemini CLI)
+    BuiltinTool {
+        key: "qwen_code",
+        display_name: "Qwen Code",
+        relative_skills_dir: Some("~/.qwen/skills"),
+        relative_detect_dir: Some("~/.qwen"),
+        mcp_config_path: Some("~/.qwen/settings.json"),
         mcp_config_format: Some("json"),
         mcp_field: Some("mcpServers"),
     },
@@ -92,7 +122,9 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         display_name: "Kilo Code",
         relative_skills_dir: Some("~/.kilocode/skills"),
         relative_detect_dir: Some("%APPDATA%/Code/User/globalStorage/kilocode.kilo-code"),
-        mcp_config_path: Some("%APPDATA%/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"),
+        mcp_config_path: Some(
+            "%APPDATA%/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+        ),
         mcp_config_format: Some("json"),
         mcp_field: Some("mcpServers"),
     },
@@ -104,7 +136,9 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         display_name: "Roo Code",
         relative_skills_dir: Some("~/.roo/skills"),
         relative_detect_dir: Some("%APPDATA%/Code/User/globalStorage/rooveterinaryinc.roo-cline"),
-        mcp_config_path: Some("%APPDATA%/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json"),
+        mcp_config_path: Some(
+            "%APPDATA%/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json",
+        ),
         mcp_config_format: Some("json"),
         mcp_field: Some("mcpServers"),
     },
@@ -119,7 +153,8 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         mcp_field: None,
     },
     // GitHub Copilot - supports both Skills and MCP
-    // MCP path uses VSCode plugin config path (same as Amp)
+    // MCP path uses the VSCode plugin config path (same as Amp).
+    // The MCP page renames this entry to "GitHub Copilot (VSCode)".
     BuiltinTool {
         key: "github_copilot",
         display_name: "GitHub Copilot",
@@ -129,15 +164,96 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         mcp_config_format: Some("json"),
         mcp_field: Some("servers"),
     },
-    // OpenClaw - Skills only
+    // GitHub Copilot (IntelliJ) - MCP only
+    // The actual config path is resolved per-OS in detection.rs.
+    BuiltinTool {
+        key: "github_copilot_intellij",
+        display_name: "GitHub Copilot (IntelliJ)",
+        relative_skills_dir: None,
+        relative_detect_dir: Some("%APPDATA%/github-copilot/intellij"),
+        mcp_config_path: Some("%APPDATA%/github-copilot/intellij/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("servers"),
+    },
+    // OpenClaw - supports both Skills and MCP
     BuiltinTool {
         key: "openclaw",
         display_name: "OpenClaw",
         relative_skills_dir: Some("~/.openclaw/skills"),
         relative_detect_dir: Some("~/.openclaw"),
+        mcp_config_path: Some("~/.openclaw/openclaw.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcp.servers"),
+    },
+    // QClaw - Skills only (OpenClaw-family; skills dir per skills-manager reference)
+    BuiltinTool {
+        key: "qclaw",
+        display_name: "QClaw",
+        relative_skills_dir: Some("~/.qclaw/skills"),
+        relative_detect_dir: Some("~/.qclaw"),
         mcp_config_path: None,
         mcp_config_format: None,
         mcp_field: None,
+    },
+    // EasyClaw - Skills only (OpenClaw-family; skills dir per skills-manager reference)
+    BuiltinTool {
+        key: "easyclaw",
+        display_name: "EasyClaw",
+        relative_skills_dir: Some("~/.easyclaw/skills"),
+        relative_detect_dir: Some("~/.easyclaw"),
+        mcp_config_path: None,
+        mcp_config_format: None,
+        mcp_field: None,
+    },
+    // AutoClaw - Skills only (OpenClaw-family; note the `.openclaw-autoclaw` dir)
+    BuiltinTool {
+        key: "autoclaw",
+        display_name: "AutoClaw",
+        relative_skills_dir: Some("~/.openclaw-autoclaw/skills"),
+        relative_detect_dir: Some("~/.openclaw-autoclaw"),
+        mcp_config_path: None,
+        mcp_config_format: None,
+        mcp_field: None,
+    },
+    // Pi - Skills plus MCP config consumed by the pi-mcp-adapter extension.
+    BuiltinTool {
+        key: "pi",
+        display_name: "Pi",
+        relative_skills_dir: Some("~/.pi/agent/skills"),
+        relative_detect_dir: Some("~/.pi/agent"),
+        mcp_config_path: Some("~/.pi/agent/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // Oh My Pi - runtime root ~/.omp/agent; native skills dir is <agentDir>/skills.
+    BuiltinTool {
+        key: "oh_my_pi",
+        display_name: "Oh My Pi",
+        relative_skills_dir: Some("~/.omp/agent/skills"),
+        relative_detect_dir: Some("~/.omp/agent"),
+        mcp_config_path: Some("~/.omp/agent/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // QoderWork - supports both Skills and MCP
+    BuiltinTool {
+        key: "qoder_work",
+        display_name: "QoderWork",
+        relative_skills_dir: Some("~/.qoderwork/skills"),
+        relative_detect_dir: Some("~/.qoderwork"),
+        mcp_config_path: Some("~/.qoderwork/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // Qoder - supports both Skills and MCP
+    BuiltinTool {
+        key: "qoder",
+        display_name: "Qoder",
+        relative_skills_dir: Some("~/.qoder/skills"),
+        relative_detect_dir: Some("%APPDATA%/Qoder"),
+        mcp_config_path: Some("~/.qoder/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
     },
     // Droid - supports both Skills and MCP
     BuiltinTool {
@@ -158,6 +274,97 @@ pub const BUILTIN_TOOLS: &[BuiltinTool] = &[
         mcp_config_path: Some("~/.codeium/mcp_config.json"),
         mcp_config_format: Some("json"),
         mcp_field: Some("mcpServers"),
+    },
+    // TRAE IDE - Skills only (skills dir per skills-manager reference)
+    BuiltinTool {
+        key: "trae",
+        display_name: "TRAE IDE",
+        relative_skills_dir: Some("~/.trae/skills"),
+        relative_detect_dir: Some("~/.trae"),
+        mcp_config_path: None,
+        mcp_config_format: None,
+        mcp_field: None,
+    },
+    // TRAE CN - Skills only (skills dir per skills-manager reference)
+    BuiltinTool {
+        key: "trae_cn",
+        display_name: "TRAE CN",
+        relative_skills_dir: Some("~/.trae-cn/skills"),
+        relative_detect_dir: Some("~/.trae-cn"),
+        mcp_config_path: None,
+        mcp_config_format: None,
+        mcp_field: None,
+    },
+    // WorkBuddy AI (international) - supports both Skills and MCP
+    BuiltinTool {
+        key: "workbuddy_ai",
+        display_name: "WorkBuddy AI",
+        relative_skills_dir: Some("~/.workbuddy-ai/skills"),
+        relative_detect_dir: Some("~/.workbuddy-ai"),
+        mcp_config_path: Some("~/.workbuddy-ai/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // WorkBuddy (domestic) - supports both Skills and MCP
+    BuiltinTool {
+        key: "workbuddy",
+        display_name: "WorkBuddy",
+        relative_skills_dir: Some("~/.workbuddy/skills"),
+        relative_detect_dir: Some("~/.workbuddy"),
+        mcp_config_path: Some("~/.workbuddy/mcp.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // Claude Desktop - config-file module; MCP lives in the normal config JSON's
+    // `mcpServers`. Path is platform-resolved in detection.rs.
+    BuiltinTool {
+        key: "claude_desktop",
+        display_name: "Claude Desktop",
+        relative_skills_dir: None,
+        relative_detect_dir: None,
+        mcp_config_path: Some("%LOCALAPPDATA%/Claude/claude_desktop_config.json"),
+        mcp_config_format: Some("json"),
+        mcp_field: Some("mcpServers"),
+    },
+    // Hermes - runtime config.yaml holds `mcp_servers`; path is platform-resolved
+    // in detection.rs (Windows: %LOCALAPPDATA%/hermes, others ~/.hermes).
+    // Skills live at <hermes_root>/skills (SKILL.md compatible with agentskills.io).
+    // relative_skills_dir is a fallback; the actual path is resolved via
+    // resolve_special_skills_path in detection.rs to match the platform root.
+    BuiltinTool {
+        key: "hermes",
+        display_name: "Hermes",
+        relative_skills_dir: Some("~/.hermes/skills"),
+        relative_detect_dir: Some("~/.hermes"),
+        mcp_config_path: Some("~/.hermes/config.yaml"),
+        mcp_config_format: Some("yaml"),
+        mcp_field: Some("mcp_servers"),
+    },
+    // dsh - DeepSeek Harness. MCP is configured via Cordis patch DSL in
+    // `cordis.patch.yml` (a YAML array of insert/override/delete ops, each MCP
+    // server is an insert row with name `@deepseek-ai/dsh-mcp-client`).
+    // The `mcp_field` is None (the key is `serverName` inside `config`, not a
+    // top-level field). Format `cordis` dispatches to `mcp::cordis_patch`.
+    BuiltinTool {
+        key: "dsh",
+        display_name: "DeepSeek Harness",
+        relative_skills_dir: None,
+        relative_detect_dir: None,
+        mcp_config_path: Some("~/.dsh/cordis.patch.yml"),
+        mcp_config_format: Some("cordis"),
+        mcp_field: None,
+    },
+    // Universal - agentskills.io public shared skills directory.
+    // Cross-tool directory scanned by dsh (rank 500) and other agentskills.io-
+    // compliant tools. Skills-only sync target; no MCP config.
+    BuiltinTool {
+        key: "shared_agents",
+        display_name: "Universal",
+        relative_skills_dir: Some("~/.agents/skills"),
+        relative_detect_dir: Some("~/.agents"),
+        mcp_config_path: None,
+        mcp_config_format: None,
+        mcp_field: None,
     },
 ];
 

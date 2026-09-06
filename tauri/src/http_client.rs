@@ -6,24 +6,45 @@
 //!
 //! # Usage
 //!
-//! ```rust
-//! use crate::http_client;
-//! use crate::db::DbState;
+//! ```rust,no_run
+//! use ai_toolbox_lib::{http_client, SqliteDbState};
 //!
+//! # async fn demo(state: &SqliteDbState) -> Result<(), String> {
 //! // Create client with automatic proxy configuration (30s timeout)
-//! let client = http_client::client(&state).await?;
+//! let client = http_client::client(state).await?;
 //!
 //! // Create client with custom timeout
-//! let client = http_client::client_with_timeout(&state, 60).await?;
+//! let client = http_client::client_with_timeout(state, 60).await?;
 //!
 //! // Bypass proxy (special cases only)
-//! let client = http_client::client_no_proxy(30)?;
+//! let direct_client = http_client::create_client_no_proxy(30)?;
+//! # let _ = (client, direct_client);
+//! # Ok(())
+//! # }
 //! ```
 
 use reqwest::{Client, Proxy};
 use std::time::Duration;
 
-use crate::db::DbState;
+use crate::db::SqliteDbState;
+use crate::settings::store::load_settings_from_sqlite_state;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMode {
+    Direct,
+    Custom,
+    System,
+}
+
+impl ProxyMode {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "direct" => Self::Direct,
+            "custom" => Self::Custom,
+            _ => Self::System,
+        }
+    }
+}
 
 /// Create an HTTP client with automatic proxy configuration.
 ///
@@ -37,11 +58,21 @@ use crate::db::DbState;
 /// A configured reqwest::Client with 30 second timeout
 ///
 /// # Example
-/// ```rust
-/// let client = http_client::client(&state).await?;
-/// let response = client.get("https://api.example.com").send().await?;
+/// ```rust,no_run
+/// use ai_toolbox_lib::{http_client, SqliteDbState};
+///
+/// # async fn demo(state: &SqliteDbState) -> Result<(), String> {
+/// let client = http_client::client(state).await?;
+/// let response = client
+///     .get("https://api.example.com")
+///     .send()
+///     .await
+///     .map_err(|error| error.to_string())?;
+/// # let _ = response;
+/// # Ok(())
+/// # }
 /// ```
-pub async fn client(db_state: &DbState) -> Result<Client, String> {
+pub async fn client(db_state: &SqliteDbState) -> Result<Client, String> {
     client_with_timeout(db_state, 30).await
 }
 
@@ -55,15 +86,41 @@ pub async fn client(db_state: &DbState) -> Result<Client, String> {
 /// A configured reqwest::Client
 ///
 /// # Example
-/// ```rust
-/// let client = http_client::client_with_timeout(&state, 60).await?;
+/// ```rust,no_run
+/// use ai_toolbox_lib::{http_client, SqliteDbState};
+///
+/// # async fn demo(state: &SqliteDbState) -> Result<(), String> {
+/// let client = http_client::client_with_timeout(state, 60).await?;
+/// # let _ = client;
+/// # Ok(())
+/// # }
 /// ```
 pub async fn client_with_timeout(
-    db_state: &DbState,
+    db_state: &SqliteDbState,
     timeout_secs: u64,
 ) -> Result<Client, String> {
-    let proxy_url = get_proxy_from_settings(db_state).await?;
-    build_client(&proxy_url, timeout_secs)
+    let (proxy_mode, proxy_url) = get_proxy_from_settings(db_state).await?;
+    build_client(proxy_mode, &proxy_url, Some(timeout_secs), false)
+}
+
+/// Create an HTTP client with custom timeout and disabled automatic response decompression.
+///
+/// Use this for compatibility workarounds when an upstream gateway mishandles
+/// compressed responses for specific clients or platforms.
+pub async fn client_with_timeout_no_compression(
+    db_state: &SqliteDbState,
+    timeout_secs: u64,
+) -> Result<Client, String> {
+    let (proxy_mode, proxy_url) = get_proxy_from_settings(db_state).await?;
+    build_client(proxy_mode, &proxy_url, Some(timeout_secs), true)
+}
+
+/// Streaming-oriented HTTP client: no overall request timeout so long-lived SSE
+/// bodies are not cut off after a fixed wall-clock budget. Connect timeout still
+/// applies; first-byte and per-chunk idle timeouts are enforced by callers.
+pub async fn client_streaming_no_compression(db_state: &SqliteDbState) -> Result<Client, String> {
+    let (proxy_mode, proxy_url) = get_proxy_from_settings(db_state).await?;
+    build_client(proxy_mode, &proxy_url, None, true)
 }
 
 /// Build an HTTP client with explicit proxy URL.
@@ -71,27 +128,54 @@ pub async fn client_with_timeout(
 /// This is an internal function. Business code should use `client()` or `client_with_timeout()`.
 ///
 /// # Arguments
+/// * `proxy_mode` - Proxy mode selected by user
 /// * `proxy_url` - Proxy URL (e.g., "http://proxy.com:8080" or "socks5://proxy.com:1080")
-///                 Empty string means use system proxy (Windows/macOS) or env vars (Linux)
+///                 Only used when proxy_mode is custom
 /// * `timeout_secs` - Request timeout in seconds
 ///
 /// # Returns
 /// A configured reqwest::Client
 ///
 /// # Proxy Priority
-/// 1. User-configured proxy (if proxy_url is not empty)
-/// 2. System proxy (Windows/macOS) or environment variables (Linux)
-/// 3. Direct connection (if no proxy available)
-fn build_client(proxy_url: &str, timeout_secs: u64) -> Result<Client, String> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
-
-    if !proxy_url.is_empty() {
-        // User-configured proxy takes priority over system proxy
-        if let Some(proxy) = build_proxy(proxy_url)? {
-            builder = builder.proxy(proxy);
-        }
+/// 1. direct: explicitly disable all proxies (including system proxy)
+/// 2. custom: use user-configured proxy
+/// 3. system: use system proxy (Windows/macOS) or env vars (Linux)
+fn build_client(
+    proxy_mode: ProxyMode,
+    proxy_url: &str,
+    timeout_secs: Option<u64>,
+    disable_content_decoding: bool,
+) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .use_rustls_tls()
+        .http1_title_case_headers();
+    if let Some(timeout_secs) = timeout_secs {
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    } else {
+        // Streaming clients: keep connect bounded, leave body open for idle/first-byte control.
+        builder = builder.connect_timeout(Duration::from_secs(30));
     }
-    // If proxy_url is empty, system-proxy feature automatically detects system proxy
+
+    if disable_content_decoding {
+        builder = builder.no_gzip().no_brotli().no_zstd().no_deflate();
+    }
+
+    match proxy_mode {
+        ProxyMode::Direct => {
+            // User explicitly chose direct connection - bypass all proxies including system proxy
+            builder = builder.no_proxy();
+        }
+        ProxyMode::Custom => {
+            if proxy_url.is_empty() {
+                return Err("Custom proxy mode requires a proxy URL".to_string());
+            }
+            if let Some(proxy) = build_proxy(proxy_url)? {
+                builder = builder.proxy(proxy);
+            }
+        }
+        ProxyMode::System => {}
+    }
+    // In system mode, reqwest automatically detects system proxy or environment proxies
 
     builder
         .build()
@@ -109,8 +193,41 @@ fn build_client(proxy_url: &str, timeout_secs: u64) -> Result<Client, String> {
 /// A reqwest::Client without proxy
 pub fn create_client_no_proxy(timeout_secs: u64) -> Result<Client, String> {
     Client::builder()
+        .use_rustls_tls()
+        .http1_title_case_headers()
         .timeout(Duration::from_secs(timeout_secs))
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .no_proxy()
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
+/// Create an HTTP client that honors system / environment proxy without
+/// requiring a `SqliteDbState`.
+///
+/// Unlike `create_client_no_proxy`, this does **not** call `.no_proxy()`, so
+/// reqwest reads `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` from the
+/// environment. This is the recovery-mode client used when the database is not
+/// available (e.g. startup "schema too new" path) and the in-app proxy config
+/// cannot be read. `use_rustls_tls()` is retained per the global TLS rule.
+///
+/// # Arguments
+/// * `timeout_secs` - Request timeout in seconds
+///
+/// # Returns
+/// A reqwest::Client that respects environment proxy settings
+pub fn create_client_with_env_proxy(timeout_secs: u64) -> Result<Client, String> {
+    Client::builder()
+        .use_rustls_tls()
+        .http1_title_case_headers()
+        .timeout(Duration::from_secs(timeout_secs))
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))
 }
@@ -129,8 +246,8 @@ pub async fn test_proxy(proxy_url: &str) -> Result<(), String> {
         return Err("Proxy URL is empty".to_string());
     }
 
-    // Create client with proxy
-    let client = build_client(proxy_url, 10)?;
+    // Create client with custom proxy mode
+    let client = build_client(ProxyMode::Custom, proxy_url, Some(10), false)?;
 
     // Test with httpbin.org - it's designed for testing HTTP clients
     let response = client
@@ -149,37 +266,21 @@ pub async fn test_proxy(proxy_url: &str) -> Result<(), String> {
     }
 }
 
-/// Read proxy URL from database settings.
+/// Read proxy settings from database.
 ///
 /// This is a public function that can be used by any module needing proxy configuration.
-/// Returns an empty string if no proxy is configured.
+/// Returns (proxy_mode, proxy_url) tuple.
 ///
 /// # Arguments
 /// * `db_state` - Database state to read proxy settings from
 ///
 /// # Returns
-/// Proxy URL string (empty if not configured)
-pub async fn get_proxy_from_settings(db_state: &DbState) -> Result<String, String> {
-    let db = db_state.0.lock().await;
-
-    let mut result = db
-        .query("SELECT proxy_url OMIT id FROM settings:`app` LIMIT 1")
-        .await
-        .map_err(|e| format!("Failed to query proxy settings: {}", e))?;
-
-    let records: Vec<serde_json::Value> = result
-        .take(0)
-        .map_err(|e| format!("Failed to parse proxy settings: {}", e))?;
-
-    if let Some(record) = records.first() {
-        Ok(record
-            .get("proxy_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string())
-    } else {
-        Ok(String::new())
-    }
+/// Tuple of (proxy_mode, proxy_url)
+pub async fn get_proxy_from_settings(
+    db_state: &SqliteDbState,
+) -> Result<(ProxyMode, String), String> {
+    let settings = load_settings_from_sqlite_state(db_state)?;
+    Ok((ProxyMode::parse(&settings.proxy_mode), settings.proxy_url))
 }
 
 /// Build a reqwest::Proxy from URL string.
@@ -198,8 +299,8 @@ fn build_proxy(url: &str) -> Result<Option<Proxy>, String> {
     let normalized_url = normalize_proxy_url(url);
 
     // Use Proxy::all() to apply proxy to all protocols (HTTP and HTTPS)
-    let proxy = Proxy::all(&normalized_url)
-        .map_err(|e| format!("Invalid proxy URL '{}': {}", url, e))?;
+    let proxy =
+        Proxy::all(&normalized_url).map_err(|e| format!("Invalid proxy URL '{}': {}", url, e))?;
 
     Ok(Some(proxy))
 }

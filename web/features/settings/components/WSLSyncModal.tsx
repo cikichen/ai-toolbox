@@ -10,9 +10,15 @@ import { CheckCircleOutlined, CloseCircleOutlined, ReloadOutlined, DeleteOutline
 import { useTranslation } from 'react-i18next';
 import { useWSLSync } from '@/features/settings/hooks/useWSLSync';
 import { useSettingsStore } from '@/stores';
+import {
+  isBuiltInDefaultMappingName,
+  translateDefaultMappingName,
+  translateSyncMessage,
+} from '@/features/settings/utils/syncMessageTranslator';
 import { FileMappingModal } from './FileMappingModal';
 import { wslDeleteFileMapping, wslResetFileMappings, wslOpenTerminal, wslOpenFolder, wslGetDistroState } from '@/services/wslSyncApi';
-import type { FileMapping } from '@/types/wslsync';
+import { DEFAULT_SSH_DIRECTORY_EXCLUDES } from '@/types/sshsync';
+import type { FileMapping, WslDirectModuleStatus } from '@/types/wslsync';
 
 const { Text } = Typography;
 
@@ -21,7 +27,14 @@ const MODULE_NAMES: Record<string, string> = {
   opencode: 'OpenCode',
   claude: 'Claude Code',
   codex: 'Codex',
+  grok: 'Grok',
+  kimi: 'Kimi',
   openclaw: 'OpenClaw',
+  geminicli: 'Gemini',
+  pi: 'Pi',
+  oh_my_pi: 'omp',
+  hermes: 'Hermes',
+  dsh: 'dsh',
 };
 
 // Module tag colors
@@ -29,18 +42,35 @@ const MODULE_COLORS: Record<string, string> = {
   opencode: 'blue',
   claude: 'purple',
   codex: 'orange',
+  grok: 'gold',
+  kimi: 'lime',
   openclaw: 'green',
+  geminicli: 'cyan',
+  pi: 'magenta',
+  oh_my_pi: 'magenta',
+  hermes: 'volcano',
+  dsh: 'red',
 };
 
-// Map sync module keys to visibleTabs keys
+// Map sync module keys to visibleTabs keys. Every coding module must be mapped,
+// otherwise the visibleModuleKeys filter below hides that module's tab from the
+// modal (and an unmapped tab is force-skipped during sync). Keep in sync with
+// useWSLSync.ts / useSSHSync.ts / SSHSyncModal.tsx.
 const MODULE_TO_TAB: Record<string, string> = {
   opencode: 'opencode',
   claude: 'claudecode',
   codex: 'codex',
+  grok: 'grok',
+  kimi: 'kimi',
   openclaw: 'openclaw',
+  geminicli: 'geminicli',
+  pi: 'pi',
+  oh_my_pi: 'oh_my_pi',
+  hermes: 'hermes',
+  dsh: 'dsh',
 };
 
-const ALL_MODULE_KEYS = ['opencode', 'claude', 'codex', 'openclaw'];
+const ALL_MODULE_KEYS = ['opencode', 'claude', 'codex', 'grok', 'kimi', 'geminicli', 'openclaw', 'pi', 'oh_my_pi', 'hermes', 'dsh'];
 
 interface WSLSyncModalProps {
   open: boolean;
@@ -49,7 +79,23 @@ interface WSLSyncModalProps {
 
 export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => {
   const { t } = useTranslation();
-  const { config, status, loading, syncing, syncWarning, syncProgress, saveConfig, sync, detect, checkDistro, dismissSyncWarning } = useWSLSync();
+  const {
+    config,
+    status,
+    loading,
+    syncing,
+    loadError,
+    syncWarning,
+    syncProgress,
+    moduleStatuses,
+    loadConfig,
+    loadStatus,
+    saveConfig,
+    sync,
+    detect,
+    checkDistro,
+    dismissSyncWarning,
+  } = useWSLSync();
   const { visibleTabs } = useSettingsStore();
 
   // Filter module keys by visibleTabs
@@ -65,36 +111,120 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
   const [mappingModalOpen, setMappingModalOpen] = useState(false);
   const [activeModuleTab, setActiveModuleTab] = useState<string>(visibleModuleKeys[0] || 'all');
 
+  const getMappingDisplayName = useCallback((mapping: FileMapping) => {
+    if (isBuiltInDefaultMappingName(mapping.id, mapping.name)) {
+      return translateDefaultMappingName(mapping.id, t);
+    }
+    return mapping.name;
+  }, [t]);
+
+  const getProgressDisplayName = useCallback((currentItem: string) => {
+    const mapping = config?.fileMappings?.find((item) => item.name === currentItem);
+    return mapping ? getMappingDisplayName(mapping) : currentItem;
+  }, [config?.fileMappings, getMappingDisplayName]);
+
+  const moduleStatusMap = React.useMemo(() => {
+    return new Map(moduleStatuses.map((item) => [item.module, item] as const));
+  }, [moduleStatuses]);
+
+  const getModuleStatus = useCallback((module: string): WslDirectModuleStatus | undefined => {
+    return moduleStatusMap.get(module);
+  }, [moduleStatusMap]);
+
+  const isModuleDisabled = useCallback((module: string) => {
+    return Boolean(getModuleStatus(module)?.isWslDirect);
+  }, [getModuleStatus]);
+
+  const getDirectoryExcludes = useCallback((mapping: FileMapping): string[] => {
+    if (!mapping.isDirectory) {
+      return [];
+    }
+    return mapping.directoryExcludes ?? [...DEFAULT_SSH_DIRECTORY_EXCLUDES];
+  }, []);
+
+  const areAllVisibleModulesWslDirect = React.useMemo(() => {
+    return visibleModuleKeys.length > 0 && visibleModuleKeys.every((moduleKey) => isModuleDisabled(moduleKey));
+  }, [visibleModuleKeys, isModuleDisabled]);
+
+  const isSyncActionDisabled = syncing || (areAllVisibleModulesWslDirect && !config?.syncMcp && !config?.syncSkills);
+
+  const getModuleDisabledReason = useCallback((module: string) => {
+    const reason = getModuleStatus(module)?.reason;
+    if (!reason || reason === 'wsl_direct_config_path') {
+      return t('settings.wsl.wslDirectHint');
+    }
+    return reason;
+  }, [getModuleStatus, t]);
+
+  const getProgressMessage = useCallback(() => {
+    if (!syncProgress) {
+      return '';
+    }
+
+    if (syncProgress.phase === 'files') {
+      if (syncProgress.current === 0) {
+        return t('settings.wsl.progress.preparingFiles', { total: syncProgress.total });
+      }
+
+      return t('settings.wsl.progress.filesWithName', {
+        current: syncProgress.current,
+        total: syncProgress.total,
+        name: getProgressDisplayName(syncProgress.currentItem),
+      });
+    }
+
+    if (syncProgress.phase === 'skills') {
+      if (syncProgress.current === 0) {
+        return t('settings.wsl.progress.preparingSkills', { total: syncProgress.total });
+      }
+
+      return t('settings.wsl.progress.skillsWithName', {
+        current: syncProgress.current,
+        total: syncProgress.total,
+        name: syncProgress.currentItem,
+      });
+    }
+
+    return translateSyncMessage(syncProgress.message, 'wsl', t);
+  }, [getProgressDisplayName, syncProgress, t]);
+
   // Initialize form when config loads
   useEffect(() => {
-    if (config) {
-      setEnabled(config.enabled);
-      setDistro(config.distro);
+    if (!config) {
+      return;
+    }
+
+    setEnabled(config.enabled);
+    setDistro(config.distro);
+
+    if (open) {
       form.setFieldsValue({
         enabled: config.enabled,
         distro: config.distro,
       });
     }
-  }, [config, form]);
+  }, [config, form, open]);
 
   // Detect WSL when modal opens
   const detectWSL = useCallback(async () => {
     try {
       const result = await detect();
       setDistros(result.distros);
-      if (result.distros.length > 0 && !result.distros.includes(distro)) {
-        setDistro(result.distros[0]);
+      if (result.distros.length > 0) {
+        setDistro((current) => current || result.distros[0]);
       }
     } catch (error) {
       console.error('Failed to detect WSL:', error);
     }
-  }, [detect, distro]);
+  }, [detect]);
 
   useEffect(() => {
     if (open) {
+      loadConfig();
+      loadStatus();
       detectWSL();
     }
-  }, [open, detectWSL]);
+  }, [open, detectWSL, loadConfig, loadStatus]);
 
   // Check distro availability
   const checkDistroAvailability = useCallback(async () => {
@@ -186,6 +316,8 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
       enabled: true,
       isPattern: false,
       isDirectory: false,
+      directoryExcludes: [...DEFAULT_SSH_DIRECTORY_EXCLUDES],
+      cleanupPaths: [],
     };
     setEditingMapping(newMapping);
     setMappingModalOpen(true);
@@ -215,10 +347,10 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
 
   const handleResetMappings = () => {
     AntdModal.confirm({
-      title: '重置所有映射',
-      content: '确定要删除所有文件映射吗？此操作不可撤销。',
-      okText: '确定删除',
-      cancelText: '取消',
+      title: t('settings.wsl.resetMappingsTitle'),
+      content: t('settings.wsl.resetMappingsContent'),
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
       okButtonProps: { danger: true },
       onOk: async () => {
         try {
@@ -265,6 +397,7 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
 
   // Render mapping list for a specific module or all
   const renderMappingList = (mappings: FileMapping[], moduleFilter: string) => {
+    const moduleDisabled = moduleFilter !== 'all' && isModuleDisabled(moduleFilter);
     const filteredMappings = moduleFilter === 'all'
       ? mappings
       : mappings.filter(m => m.module === moduleFilter);
@@ -281,7 +414,7 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
               size="small"
               icon={<PlusOutlined />}
               onClick={() => handleAddMapping(moduleFilter)}
-              disabled={!enabled}
+              disabled={!enabled || moduleDisabled}
             >
               {t('settings.wsl.addMapping')}
             </Button>
@@ -291,41 +424,87 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
           size="small"
           dataSource={filteredMappings}
           renderItem={(item: FileMapping) => (
-            <List.Item
-              actions={[
-                <Tooltip title={t('common.edit')}>
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<EditOutlined />}
-                    onClick={() => handleEditMapping(item)}
-                    disabled={!enabled}
-                  />
-                </Tooltip>,
-                <Tooltip title={t('common.delete')}>
-                  <Button
-                    type="text"
-                    size="small"
-                    danger
-                    icon={<DeleteOutlined />}
-                    onClick={() => handleDeleteMapping(item)}
-                    disabled={!enabled}
-                  />
-                </Tooltip>,
-              ]}
-            >
+            <List.Item>
               <List.Item.Meta
                 title={
-                  <Space>
-                    <Text>{item.name}</Text>
-                    <Tag color={MODULE_COLORS[item.module] || 'default'}>{MODULE_NAMES[item.module] || item.module}</Tag>
-                    {!item.enabled && <Tag>{t('settings.wsl.disabled')}</Tag>}
-                  </Space>
+                  <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
+                    <Space>
+                      <Text>{getMappingDisplayName(item)}</Text>
+                      <Tag color={MODULE_COLORS[item.module] || 'default'}>{MODULE_NAMES[item.module] || item.module}</Tag>
+                      {!item.enabled && <Tag>{t('settings.wsl.disabled')}</Tag>}
+                      {isModuleDisabled(item.module) && <Tag color="default">{t('settings.wsl.inWsl')}</Tag>}
+                    </Space>
+                    <div
+                      style={{
+                        marginInlineStart: 'auto',
+                        flexShrink: 0,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 4,
+                      }}
+                    >
+                      <Tooltip title={t('common.edit')}>
+                        <Button
+                          type="text"
+                          size="small"
+                          icon={<EditOutlined />}
+                          onClick={() => handleEditMapping(item)}
+                          disabled={!enabled || isModuleDisabled(item.module)}
+                        />
+                      </Tooltip>
+                      <Tooltip title={t('common.delete')}>
+                        <Button
+                          type="text"
+                          size="small"
+                          danger
+                          icon={<DeleteOutlined />}
+                          onClick={() => handleDeleteMapping(item)}
+                          disabled={!enabled || isModuleDisabled(item.module)}
+                        />
+                      </Tooltip>
+                    </div>
+                  </div>
                 }
                 description={
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {item.windowsPath} → {item.wslPath}
-                  </Text>
+                  <Space orientation="vertical" size={2}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {item.windowsPath} → {item.wslPath}
+                    </Text>
+                    {item.isDirectory && getDirectoryExcludes(item).length > 0 && (
+                      <Space size={[4, 2]} wrap>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {t('settings.wsl.directoryExcludes')}:
+                        </Text>
+                        {getDirectoryExcludes(item).map((exclude) => (
+                          <Tag
+                            key={exclude}
+                            color="default"
+                            style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: '18px' }}
+                          >
+                            {exclude}
+                          </Tag>
+                        ))}
+                      </Space>
+                    )}
+                    {(item.cleanupPaths?.length ?? 0) > 0 && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>
+                          {t('settings.wsl.cleanupPaths')}:
+                        </Text>
+                        <Space size={[4, 2]} wrap>
+                          {item.cleanupPaths.map((cleanupPath) => (
+                            <Tag
+                              key={cleanupPath}
+                              color="default"
+                              style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: '18px' }}
+                            >
+                              {cleanupPath}
+                            </Tag>
+                          ))}
+                        </Space>
+                      </div>
+                    )}
+                  </Space>
                 }
               />
             </List.Item>
@@ -346,6 +525,14 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
         footer={null}
       >
         <Spin spinning={loading}>
+          {loadError && (
+            <Alert
+              type="error"
+              showIcon
+              message={loadError}
+              style={{ marginBottom: 16 }}
+            />
+          )}
           <Form form={form} layout="horizontal">
             {/* Enable WSL Sync - left-right layout */}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
@@ -454,18 +641,33 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
                     label: `${t('settings.wsl.allMappings')} (${config?.fileMappings?.filter(m => visibleModuleKeys.includes(m.module)).length || 0})`,
                     children: renderMappingList(config?.fileMappings?.filter(m => visibleModuleKeys.includes(m.module)) || [], 'all'),
                   },
-                  ...visibleModuleKeys.map((moduleKey) => ({
-                    key: moduleKey,
-                    label: (
+                  ...visibleModuleKeys.map((moduleKey) => {
+                    const disabled = isModuleDisabled(moduleKey);
+                    const labelContent = (
                       <Space>
                         <span>{MODULE_NAMES[moduleKey]}</span>
                         <Tag color={MODULE_COLORS[moduleKey]} style={{ marginRight: 0 }}>
                           {config?.fileMappings?.filter(m => m.module === moduleKey).length || 0}
                         </Tag>
                       </Space>
-                    ),
-                    children: renderMappingList(config?.fileMappings || [], moduleKey),
-                  })),
+                    );
+                    return {
+                      key: moduleKey,
+                      label: disabled ? (
+                        <Tooltip title={getModuleDisabledReason(moduleKey)}>
+                          <span style={{ color: 'var(--color-text-tertiary)' }}>{labelContent}</span>
+                        </Tooltip>
+                      ) : labelContent,
+                      disabled,
+                      children: disabled ? (
+                        <Alert
+                          type="info"
+                          showIcon
+                          message={getModuleDisabledReason(moduleKey)}
+                        />
+                      ) : renderMappingList(config?.fileMappings || [], moduleKey),
+                    };
+                  }),
                 ]}
               />
             </div>
@@ -486,7 +688,7 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
                   type="primary"
                   icon={<ReloadOutlined />}
                   onClick={handleSyncNow}
-                  disabled={syncing}
+                  disabled={isSyncActionDisabled}
                   loading={syncing}
                 >
                   {t('settings.wsl.syncNow')}
@@ -496,9 +698,9 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
               {syncing && syncProgress && (
                 <div style={{ marginTop: 12 }}>
                   <div style={{ marginBottom: 4 }}>
-                    <Text type="secondary">{syncProgress.message}</Text>
+                    <Text type="secondary">{getProgressMessage()}</Text>
                   </div>
-                  <Progress 
+                  <Progress
                     percent={syncProgress.total > 0 ? Math.round((syncProgress.current / syncProgress.total) * 100) : 0}
                     size="small"
                     status="active"
@@ -508,7 +710,7 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
               {status?.lastSyncError && (
                 <Alert
                   type="error"
-                  message={status.lastSyncError}
+                  message={translateSyncMessage(status.lastSyncError, 'wsl', t)}
                   showIcon
                   style={{ marginTop: 12 }}
                 />
@@ -516,7 +718,7 @@ export const WSLSyncModal: React.FC<WSLSyncModalProps> = ({ open, onClose }) => 
               {syncWarning && (
                 <Alert
                   type="warning"
-                  message={syncWarning}
+                  message={translateSyncMessage(syncWarning, 'wsl', t)}
                   showIcon
                   closable
                   onClose={dismissSyncWarning}

@@ -1,15 +1,29 @@
 use chrono::Local;
 use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
-use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
-use super::utils::{get_db_path, get_opencode_config_path, get_opencode_restore_dir, get_opencode_auth_path, get_codex_auth_path, get_codex_config_path, get_skills_dir, get_models_cache_file};
+use super::utils::{
+    clear_restored_cli_custom_roots, get_claude_desktop_settings_paths,
+    get_claude_mcp_restore_path, get_claude_restore_dir, get_codex_restore_dir, get_db_path,
+    get_dsh_restore_dir, get_gemini_cli_restore_dir, get_grok_restore_dir, get_hermes_restore_dir,
+    get_image_assets_dir, get_kimi_restore_dir, get_opencode_auth_restore_path,
+    get_opencode_restore_dir, get_skills_dir, harden_restored_sensitive_file, push_restore_warning,
+    read_backup_meta_from_archive, read_root_dir_override,
+    record_restored_external_config_wsl_module, resolve_external_config_restore_output_path,
+    resolve_restore_dir_override, resolve_skills_restore_output_path,
+    restore_claude_external_config_file, restore_custom_backup_entries,
+    restore_sqlite_database_snapshot_from_zip, sanitize_restored_claude_database_for_current_os,
+    should_filter_external_config_entry, should_reapply_applied_runtime,
+    should_skip_external_config_on_restore, should_use_root_override_for_tool,
+    write_backup_zip_contents, write_post_restore_flags, RestoreResult,
+};
+use crate::db::SqliteDbState;
+use crate::settings::store;
+use crate::settings::types::default_backup_file_filter_rules;
 
-/// Get the home directory
 fn get_home_dir() -> Result<PathBuf, String> {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -17,37 +31,18 @@ fn get_home_dir() -> Result<PathBuf, String> {
         .map_err(|_| "Failed to get home directory".to_string())
 }
 
-/// Get Claude settings.json path if it exists
-fn get_claude_settings_path() -> Result<Option<PathBuf>, String> {
-    let home_dir = get_home_dir()?;
-    let settings_path = home_dir.join(".claude").join("settings.json");
-
-    if settings_path.exists() {
-        Ok(Some(settings_path))
-    } else {
-        Ok(None)
+#[cfg(unix)]
+fn set_pi_auth_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let _ = fs::set_permissions(path, permissions);
     }
 }
 
-/// Add a file to the zip archive with a specific path prefix
-fn add_file_to_zip(
-    zip: &mut ZipWriter<File>,
-    file_path: &Path,
-    zip_path: &str,
-    options: SimpleFileOptions,
-) -> Result<(), String> {
-    let mut file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    zip.start_file(zip_path, options)
-        .map_err(|e| format!("Failed to start file in zip: {}", e))?;
-    zip.write_all(&buffer)
-        .map_err(|e| format!("Failed to write to zip: {}", e))?;
-
-    Ok(())
-}
+#[cfg(not(unix))]
+fn set_pi_auth_file_permissions(_path: &Path) {}
 
 /// Backup database to a zip file
 #[tauri::command]
@@ -56,6 +51,11 @@ pub async fn backup_database(
     backup_path: String,
 ) -> Result<String, String> {
     let db_path = get_db_path(&app_handle)?;
+    let sqlite_state = app_handle.state::<SqliteDbState>();
+    let settings = store::load_settings_from_sqlite_state(&sqlite_state)?;
+    let backup_image_assets_enabled = settings.backup_image_assets_enabled;
+    let backup_cli_config_files_enabled = settings.backup_cli_config_files_enabled;
+    let filter_rules = settings.backup_file_filter_rules.clone();
 
     // Ensure database directory exists
     if !db_path.exists() {
@@ -75,158 +75,20 @@ pub async fn backup_database(
     let backup_filename = format!("ai-toolbox-backup-{}.zip", timestamp);
     let backup_file_path = backup_dir.join(&backup_filename);
 
-    // Create zip file
     let file = File::create(&backup_file_path)
         .map_err(|e| format!("Failed to create backup file: {}", e))?;
     let mut zip = ZipWriter::new(file);
-    let options =
-        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-    // Walk through the database directory and add files to zip under "db/" prefix
-    let mut has_files = false;
-    for entry in WalkDir::new(&db_path) {
-        let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-        let path = entry.path();
-        let relative_path = path
-            .strip_prefix(&db_path)
-            .map_err(|e| format!("Failed to get relative path: {}", e))?;
-
-        if path.is_file() {
-            // Skip system files like .DS_Store
-            if let Some(file_name) = path.file_name() {
-                let name_str = file_name.to_string_lossy();
-                if name_str == ".DS_Store" || name_str.starts_with("._") {
-                    continue;
-                }
-            }
-
-            has_files = true;
-            // Use forward slashes for cross-platform compatibility in zip files
-            let relative_str = relative_path.to_string_lossy().replace('\\', "/");
-            let name = format!("db/{}", relative_str);
-            zip.start_file(name, options)
-                .map_err(|e| format!("Failed to start file in zip: {}", e))?;
-
-            let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)
-                .map_err(|e| format!("Failed to read file: {}", e))?;
-            zip.write_all(&buffer)
-                .map_err(|e| format!("Failed to write to zip: {}", e))?;
-        } else if path.is_dir() && !relative_path.as_os_str().is_empty() {
-            // Use forward slashes for cross-platform compatibility in zip files
-            let relative_str = relative_path.to_string_lossy().replace('\\', "/");
-            let name = format!("db/{}/", relative_str);
-            zip.add_directory(name, options)
-                .map_err(|e| format!("Failed to add directory to zip: {}", e))?;
-        }
-    }
-
-    // If no database files, add a placeholder to ensure valid zip
-    if !has_files {
-        zip.start_file("db/.backup_marker", options)
-            .map_err(|e| format!("Failed to create marker file: {}", e))?;
-        zip.write_all(b"AI Toolbox Backup")
-            .map_err(|e| format!("Failed to write marker: {}", e))?;
-    }
-
-    // Add external-configs directory
-    zip.add_directory("external-configs/", options)
-        .map_err(|e| format!("Failed to add external-configs directory: {}", e))?;
-
-    // Backup OpenCode config if exists
-    if let Some(opencode_path) = get_opencode_config_path()? {
-        let file_name = opencode_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("opencode.json");
-        let zip_path = format!("external-configs/opencode/{}", file_name);
-
-        zip.add_directory("external-configs/opencode/", options)
-            .map_err(|e| format!("Failed to add opencode directory: {}", e))?;
-
-        add_file_to_zip(&mut zip, &opencode_path, &zip_path, options)?;
-    }
-
-    // Backup OpenCode auth.json if exists
-    if let Some(opencode_auth_path) = get_opencode_auth_path()? {
-        let zip_path = "external-configs/opencode/auth.json";
-
-        // Directory may already exist from opencode config backup
-        let _ = zip.add_directory("external-configs/opencode/", options);
-
-        add_file_to_zip(&mut zip, &opencode_auth_path, zip_path, options)?;
-    }
-
-    // Backup Claude settings.json if exists
-    if let Some(claude_path) = get_claude_settings_path()? {
-        let zip_path = "external-configs/claude/settings.json";
-
-        zip.add_directory("external-configs/claude/", options)
-            .map_err(|e| format!("Failed to add claude directory: {}", e))?;
-
-        add_file_to_zip(&mut zip, &claude_path, zip_path, options)?;
-    }
-
-    // Backup Codex auth.json if exists
-    if let Some(codex_auth_path) = get_codex_auth_path()? {
-        let zip_path = "external-configs/codex/auth.json";
-
-        zip.add_directory("external-configs/codex/", options)
-            .map_err(|e| format!("Failed to add codex directory: {}", e))?;
-
-        add_file_to_zip(&mut zip, &codex_auth_path, zip_path, options)?;
-    }
-
-    // Backup Codex config.toml if exists
-    if let Some(codex_config_path) = get_codex_config_path()? {
-        let zip_path = "external-configs/codex/config.toml";
-
-        // Directory may already exist from auth.json backup
-        let _ = zip.add_directory("external-configs/codex/", options);
-
-        add_file_to_zip(&mut zip, &codex_config_path, zip_path, options)?;
-    }
-
-    // Backup models.dev.json cache if exists
-    if let Some(models_cache_path) = get_models_cache_file() {
-        add_file_to_zip(&mut zip, &models_cache_path, "models.dev.json", options)?;
-    }
-
-    // Backup skills directory if exists
-    let skills_dir = get_skills_dir(&app_handle)?;
-    if skills_dir.exists() {
-        zip.add_directory("skills/", options)
-            .map_err(|e| format!("Failed to add skills directory: {}", e))?;
-
-        for entry in WalkDir::new(&skills_dir) {
-            let entry = entry.map_err(|e| format!("Failed to read skills entry: {}", e))?;
-            let path = entry.path();
-            let relative_path = path
-                .strip_prefix(&skills_dir)
-                .map_err(|e| format!("Failed to get relative path: {}", e))?;
-
-            if path.is_file() {
-                // Skip system files
-                if let Some(file_name) = path.file_name() {
-                    let name_str = file_name.to_string_lossy();
-                    if name_str == ".DS_Store" || name_str.starts_with("._") {
-                        continue;
-                    }
-                }
-
-                let relative_str = relative_path.to_string_lossy().replace('\\', "/");
-                let name = format!("skills/{}", relative_str);
-                add_file_to_zip(&mut zip, path, &name, options)?;
-            } else if path.is_dir() && !relative_path.as_os_str().is_empty() {
-                let relative_str = relative_path.to_string_lossy().replace('\\', "/");
-                let name = format!("skills/{}/", relative_str);
-                zip.add_directory(name, options)
-                    .map_err(|e| format!("Failed to add skills subdirectory: {}", e))?;
-            }
-        }
-    }
-
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    write_backup_zip_contents(
+        &mut zip,
+        &app_handle,
+        &db_path,
+        backup_image_assets_enabled,
+        backup_cli_config_files_enabled,
+        &filter_rules,
+        options,
+    )
+    .await?;
     zip.finish()
         .map_err(|e| format!("Failed to finish zip: {}", e))?;
 
@@ -238,9 +100,11 @@ pub async fn backup_database(
 pub async fn restore_database(
     app_handle: tauri::AppHandle,
     zip_file_path: String,
-) -> Result<(), String> {
+    skip_cli_custom_roots: Option<bool>,
+) -> Result<RestoreResult, String> {
     let db_path = get_db_path(&app_handle)?;
     let zip_path = Path::new(&zip_file_path);
+    let skip_cli_custom_roots = skip_cli_custom_roots.unwrap_or(false);
 
     if !zip_path.exists() {
         return Err("Backup file does not exist".to_string());
@@ -259,6 +123,45 @@ pub async fn restore_database(
             .unwrap_or(false)
     });
 
+    // Read pre-restore settings BEFORE overwriting SQLite so skip/filter decisions
+    // are not taken from the restored machine's settings document.
+    let (filter_rules, include_cli_config_files) = {
+        let sqlite_state = app_handle.state::<SqliteDbState>();
+        match store::load_settings_from_sqlite_state(&sqlite_state) {
+            Ok(settings) => (
+                settings.backup_file_filter_rules,
+                settings.backup_cli_config_files_enabled,
+            ),
+            Err(_) => (default_backup_file_filter_rules(), true),
+        }
+    };
+    // When false, only optional (DB-backed) CLI runtime files are skipped on restore.
+    // OpenCode / OpenClaw / Pi remain always-restored when present in the zip.
+    let skipped_optional_cli_runtime = !include_cli_config_files;
+    let backup_meta = read_backup_meta_from_archive(&mut archive);
+
+    let restored_sqlite = restore_sqlite_database_snapshot_from_zip(&mut archive, &app_handle)?;
+    if restored_sqlite {
+        sanitize_restored_claude_database_for_current_os(&app_handle)?;
+        // Only clear roots on the restored snapshot — never mutate the live DB when
+        // the backup did not include/replace sqlite/.
+        if skip_cli_custom_roots {
+            let sqlite_state = app_handle.state::<SqliteDbState>();
+            clear_restored_cli_custom_roots(&sqlite_state)?;
+        }
+    }
+
+    // Legacy SurrealDB-only backups (db/ entries, no sqlite/ snapshot) cannot be
+    // restored: the app no longer ships the SurrealDB import path, so a restored
+    // legacy dir would be silently ignored on next startup. Fail loudly instead of
+    // pretending success.
+    if !restored_sqlite && is_new_format {
+        return Err(
+            "该备份是旧版 SurrealDB 格式，当前应用已不再支持，无法恢复此备份。请使用新版应用创建的备份文件。"
+                .to_string(),
+        );
+    }
+
     // Remove existing database directory
     if db_path.exists() {
         fs::remove_dir_all(&db_path)
@@ -269,8 +172,161 @@ pub async fn restore_database(
     fs::create_dir_all(&db_path)
         .map_err(|e| format!("Failed to create database directory: {}", e))?;
 
-    // Get home directory for external configs
     let home_dir = get_home_dir()?;
+    // Always-include tools may still read root-dir.txt when optional CLI files are skipped.
+    // Never read overrides when the user explicitly requested local/default roots.
+    let opencode_restore_dir_override = should_use_root_override_for_tool(
+        "opencode",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/opencode/root-dir.txt"))
+    .flatten();
+    let claude_restore_dir_override = should_use_root_override_for_tool(
+        "claude",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/claude/root-dir.txt"))
+    .flatten();
+    let codex_restore_dir_override =
+        should_use_root_override_for_tool("codex", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/codex/root-dir.txt"))
+            .flatten();
+    let grok_restore_dir_override =
+        should_use_root_override_for_tool("grok", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/grok/root-dir.txt"))
+            .flatten();
+    let kimi_restore_dir_override =
+        should_use_root_override_for_tool("kimi", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/kimi/root-dir.txt"))
+            .flatten();
+    let openclaw_restore_dir_override = should_use_root_override_for_tool(
+        "openclaw",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/openclaw/root-dir.txt"))
+    .flatten();
+    let gemini_cli_restore_dir_override = should_use_root_override_for_tool(
+        "geminicli",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/geminicli/root-dir.txt"))
+    .flatten();
+    let pi_restore_dir_override =
+        should_use_root_override_for_tool("pi", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/pi/root-dir.txt"))
+            .flatten();
+    let oh_my_pi_restore_dir_override = should_use_root_override_for_tool(
+        "oh_my_pi",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/oh_my_pi/root-dir.txt"))
+    .flatten();
+    let hermes_restore_dir_override = should_use_root_override_for_tool(
+        "hermes",
+        include_cli_config_files,
+        skip_cli_custom_roots,
+    )
+    .then(|| read_root_dir_override(&mut archive, "external-configs/hermes/root-dir.txt"))
+    .flatten();
+    let dsh_restore_dir_override =
+        should_use_root_override_for_tool("dsh", include_cli_config_files, skip_cli_custom_roots)
+            .then(|| read_root_dir_override(&mut archive, "external-configs/dsh/root-dir.txt"))
+            .flatten();
+    let mut restore_result = RestoreResult::default();
+    let mut restored_wsl_modules = Vec::new();
+
+    let (opencode_restore_dir, opencode_warning) = resolve_restore_dir_override(
+        "opencode",
+        opencode_restore_dir_override,
+        get_opencode_restore_dir()?,
+    );
+    if let Some(warning) = opencode_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (claude_restore_dir, claude_warning) = resolve_restore_dir_override(
+        "claude",
+        claude_restore_dir_override,
+        get_claude_restore_dir()?,
+    );
+    if let Some(warning) = claude_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (codex_restore_dir, codex_warning) = resolve_restore_dir_override(
+        "codex",
+        codex_restore_dir_override,
+        get_codex_restore_dir()?,
+    );
+    if let Some(warning) = codex_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+    let (grok_restore_dir, grok_warning) =
+        resolve_restore_dir_override("grok", grok_restore_dir_override, get_grok_restore_dir()?);
+    if let Some(warning) = grok_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+    let (kimi_restore_dir, kimi_warning) =
+        resolve_restore_dir_override("kimi", kimi_restore_dir_override, get_kimi_restore_dir()?);
+    if let Some(warning) = kimi_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (openclaw_restore_dir, openclaw_warning) = resolve_restore_dir_override(
+        "openclaw",
+        openclaw_restore_dir_override,
+        home_dir.join(".openclaw"),
+    );
+    if let Some(warning) = openclaw_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (gemini_cli_restore_dir, gemini_cli_warning) = resolve_restore_dir_override(
+        "geminicli",
+        gemini_cli_restore_dir_override,
+        get_gemini_cli_restore_dir()?,
+    );
+    if let Some(warning) = gemini_cli_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (pi_restore_dir, pi_warning) = resolve_restore_dir_override(
+        "pi",
+        pi_restore_dir_override,
+        home_dir.join(".pi").join("agent"),
+    );
+    if let Some(warning) = pi_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (oh_my_pi_restore_dir, oh_my_pi_warning) = resolve_restore_dir_override(
+        "oh_my_pi",
+        oh_my_pi_restore_dir_override,
+        home_dir.join(".omp").join("agent"),
+    );
+    if let Some(warning) = oh_my_pi_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (hermes_restore_dir, hermes_warning) = resolve_restore_dir_override(
+        "hermes",
+        hermes_restore_dir_override,
+        get_hermes_restore_dir()?,
+    );
+    if let Some(warning) = hermes_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
+
+    let (dsh_restore_dir, dsh_warning) =
+        resolve_restore_dir_override("dsh", dsh_restore_dir_override, get_dsh_restore_dir()?);
+    if let Some(warning) = dsh_warning {
+        push_restore_warning(&mut restore_result, warning);
+    }
 
     // Extract zip contents
     for i in 0..archive.len() {
@@ -284,6 +340,14 @@ pub async fn restore_database(
 
         // Skip the backup marker file
         if file_name == ".backup_marker" || file_name == "db/.backup_marker" {
+            continue;
+        }
+        if file_name == "backup_meta.json" {
+            continue;
+        }
+        // Skip optional (DB-backed) CLI runtime configs when the pre-restore setting disables them.
+        // OpenCode / OpenClaw / Pi always restore when present.
+        if should_skip_external_config_on_restore(include_cli_config_files, &file_name) {
             continue;
         }
 
@@ -315,74 +379,125 @@ pub async fn restore_database(
             } else if file_name.starts_with("external-configs/opencode/") {
                 // Restore OpenCode config to the appropriate directory based on env/shell/default
                 let relative_path = &file_name[26..]; // Remove "external-configs/opencode/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
                     continue;
                 }
 
-                // auth.json should be restored to ~/.local/share/opencode/
-                // config files (opencode.json, opencode.jsonc) should go to config dir
+                if should_filter_external_config_entry(&filter_rules, "opencode", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "opencode");
+
                 if relative_path == "auth.json" {
-                    let auth_dir = home_dir.join(".local").join("share").join("opencode");
+                    let outpath = get_opencode_auth_restore_path(Some(&opencode_restore_dir))?;
+                    let auth_dir = outpath.parent().ok_or_else(|| {
+                        "Failed to determine OpenCode auth parent directory".to_string()
+                    })?;
                     if !auth_dir.exists() {
-                        fs::create_dir_all(&auth_dir)
-                            .map_err(|e| format!("Failed to create opencode auth directory: {}", e))?;
+                        fs::create_dir_all(&auth_dir).map_err(|e| {
+                            format!("Failed to create opencode auth directory: {}", e)
+                        })?;
                     }
-                    let outpath = auth_dir.join("auth.json");
-                    let mut outfile =
-                        File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                    let mut outfile = File::create(&outpath)
+                        .map_err(|e| format!("Failed to create file: {}", e))?;
                     std::io::copy(&mut file, &mut outfile)
                         .map_err(|e| format!("Failed to extract file: {}", e))?;
                 } else {
-                    let opencode_dir = get_opencode_restore_dir()?;
-                    if !opencode_dir.exists() {
-                        fs::create_dir_all(&opencode_dir)
-                            .map_err(|e| format!("Failed to create opencode config directory: {}", e))?;
+                    if !opencode_restore_dir.exists() {
+                        fs::create_dir_all(&opencode_restore_dir).map_err(|e| {
+                            format!("Failed to create opencode config directory: {}", e)
+                        })?;
                     }
 
-                    let outpath = opencode_dir.join(relative_path);
+                    let outpath = opencode_restore_dir.join(relative_path);
 
                     // Just copy the file - MCP cmd /c normalization will be handled
                     // by mcp_sync_all during startup resync (triggered by .resync_required flag)
-                    let mut outfile =
-                        File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                    let mut outfile = File::create(&outpath)
+                        .map_err(|e| format!("Failed to create file: {}", e))?;
                     std::io::copy(&mut file, &mut outfile)
                         .map_err(|e| format!("Failed to extract file: {}", e))?;
                 }
             } else if file_name.starts_with("external-configs/claude/") {
                 // Restore Claude settings
                 let relative_path = &file_name[24..]; // Remove "external-configs/claude/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
                     continue;
                 }
 
-                let claude_dir = home_dir.join(".claude");
-                if !claude_dir.exists() {
-                    fs::create_dir_all(&claude_dir)
-                        .map_err(|e| format!("Failed to create claude config directory: {}", e))?;
+                if should_filter_external_config_entry(&filter_rules, "claude", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "claude");
+
+                let outpath = if relative_path == ".claude.json" {
+                    get_claude_mcp_restore_path(Some(&claude_restore_dir))?
+                } else {
+                    claude_restore_dir.join(relative_path)
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create claude config directory: {}", e)
+                        })?;
+                    }
+                }
+                restore_claude_external_config_file(&mut file, &outpath, relative_path)?;
+            } else if file_name.starts_with("external-configs/openclaw/") {
+                let relative_path = &file_name[26..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
                 }
 
-                let outpath = claude_dir.join(relative_path);
+                if should_filter_external_config_entry(&filter_rules, "openclaw", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "openclaw");
 
-                // Note: Claude's MCP config is in ~/.claude.json, not ~/.claude/settings.json
-                // settings.json contains other settings without MCP, so just copy it directly
+                if !openclaw_restore_dir.exists() {
+                    fs::create_dir_all(&openclaw_restore_dir).map_err(|e| {
+                        format!("Failed to create openclaw config directory: {}", e)
+                    })?;
+                }
+
+                let outpath = openclaw_restore_dir.join(relative_path);
                 let mut outfile =
                     File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile)
                     .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == "auth.json" {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
             } else if file_name.starts_with("external-configs/codex/") {
                 // Restore Codex settings
                 let relative_path = &file_name[23..]; // Remove "external-configs/codex/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
                     continue;
                 }
 
-                let codex_dir = home_dir.join(".codex");
-                if !codex_dir.exists() {
-                    fs::create_dir_all(&codex_dir)
+                if should_filter_external_config_entry(&filter_rules, "codex", relative_path) {
+                    continue;
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "codex");
+
+                if !codex_restore_dir.exists() {
+                    fs::create_dir_all(&codex_restore_dir)
                         .map_err(|e| format!("Failed to create codex config directory: {}", e))?;
                 }
 
-                let outpath = codex_dir.join(relative_path);
+                let outpath = codex_restore_dir.join(relative_path);
 
                 // Just copy the file - MCP cmd /c normalization will be handled
                 // by mcp_sync_all during startup resync (triggered by .resync_required flag)
@@ -390,9 +505,313 @@ pub async fn restore_database(
                     File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile)
                     .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == "auth.json" {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/grok/") {
+                let relative_path = &file_name["external-configs/grok/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+                if should_filter_external_config_entry(&filter_rules, "grok", relative_path) {
+                    continue;
+                }
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&grok_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "grok");
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create Grok restore directory: {}", e))?;
+                }
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if matches!(relative_path, "auth.json" | "config.toml") {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/kimi/") {
+                let relative_path = &file_name["external-configs/kimi/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+                if should_filter_external_config_entry(&filter_rules, "kimi", relative_path) {
+                    continue;
+                }
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&kimi_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "kimi");
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create Kimi restore directory: {}", e))?;
+                }
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if matches!(relative_path, "config.toml")
+                    || relative_path.starts_with("credentials/")
+                {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/geminicli/") {
+                let relative_path = &file_name["external-configs/geminicli/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "geminicli", relative_path) {
+                    continue;
+                }
+
+                if !gemini_cli_restore_dir.exists() {
+                    fs::create_dir_all(&gemini_cli_restore_dir).map_err(|e| {
+                        format!("Failed to create Gemini CLI config directory: {}", e)
+                    })?;
+                }
+
+                let Some(outpath) = resolve_external_config_restore_output_path(
+                    &gemini_cli_restore_dir,
+                    relative_path,
+                )?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "geminicli");
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Gemini CLI parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            } else if file_name.starts_with("external-configs/pi/") {
+                let relative_path = &file_name["external-configs/pi/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "pi", relative_path) {
+                    continue;
+                }
+
+                if !pi_restore_dir.exists() {
+                    fs::create_dir_all(&pi_restore_dir)
+                        .map_err(|e| format!("Failed to create Pi config directory: {}", e))?;
+                }
+
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&pi_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "pi");
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Pi config parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == "auth.json" {
+                    set_pi_auth_file_permissions(&outpath);
+                }
+            } else if file_name.starts_with("external-configs/oh_my_pi/") {
+                let relative_path = &file_name["external-configs/oh_my_pi/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "oh_my_pi", relative_path) {
+                    continue;
+                }
+
+                if !oh_my_pi_restore_dir.exists() {
+                    fs::create_dir_all(&oh_my_pi_restore_dir).map_err(|e| {
+                        format!("Failed to create Oh My Pi config directory: {}", e)
+                    })?;
+                }
+
+                let Some(outpath) = resolve_external_config_restore_output_path(
+                    &oh_my_pi_restore_dir,
+                    relative_path,
+                )?
+                else {
+                    continue;
+                };
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "oh_my_pi");
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Oh My Pi config parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            } else if file_name.starts_with("external-configs/hermes/") {
+                let relative_path = &file_name["external-configs/hermes/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "hermes", relative_path) {
+                    continue;
+                }
+
+                if !hermes_restore_dir.exists() {
+                    fs::create_dir_all(&hermes_restore_dir)
+                        .map_err(|e| format!("Failed to create Hermes config directory: {}", e))?;
+                }
+
+                let Some(outpath) = resolve_external_config_restore_output_path(
+                    &hermes_restore_dir,
+                    relative_path,
+                )?
+                else {
+                    continue;
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Hermes parent directory: {}", e)
+                        })?;
+                    }
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "hermes");
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+            } else if file_name.starts_with("external-configs/dsh/") {
+                let relative_path = &file_name["external-configs/dsh/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(&filter_rules, "dsh", relative_path) {
+                    continue;
+                }
+
+                if !dsh_restore_dir.exists() {
+                    fs::create_dir_all(&dsh_restore_dir)
+                        .map_err(|e| format!("Failed to create dsh config directory: {}", e))?;
+                }
+
+                let Some(outpath) =
+                    resolve_external_config_restore_output_path(&dsh_restore_dir, relative_path)?
+                else {
+                    continue;
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent)
+                            .map_err(|e| format!("Failed to create dsh parent directory: {}", e))?;
+                    }
+                }
+                record_restored_external_config_wsl_module(&mut restored_wsl_modules, "dsh");
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if relative_path == ".credentials.yaml" {
+                    harden_restored_sensitive_file(&outpath)?;
+                }
+            } else if file_name.starts_with("external-configs/claude_desktop/") {
+                let relative_path = &file_name["external-configs/claude_desktop/".len()..];
+                if relative_path.is_empty()
+                    || file_name.ends_with('/')
+                    || relative_path == "root-dir.txt"
+                {
+                    continue;
+                }
+
+                if should_filter_external_config_entry(
+                    &filter_rules,
+                    "claude_desktop",
+                    relative_path,
+                ) {
+                    continue;
+                }
+
+                let Some((normal_config_path, config_library_path)) =
+                    get_claude_desktop_settings_paths()
+                else {
+                    continue;
+                };
+                let outpath = if relative_path == "claude_desktop_config.json" {
+                    let parent = normal_config_path.parent().ok_or_else(|| {
+                        "Failed to resolve Claude Desktop config directory".to_string()
+                    })?;
+                    let Some(outpath) =
+                        resolve_external_config_restore_output_path(parent, relative_path)?
+                    else {
+                        continue;
+                    };
+                    outpath
+                } else if let Some(rest) = relative_path.strip_prefix("configLibrary/") {
+                    let Some(outpath) =
+                        resolve_external_config_restore_output_path(&config_library_path, rest)?
+                    else {
+                        continue;
+                    };
+                    outpath
+                } else {
+                    continue;
+                };
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create Claude Desktop parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile =
+                    File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
             } else if file_name == "models.dev.json" {
                 // Restore models.dev.json to app data directory
-                if let Some(cache_path) = crate::coding::open_code::free_models::get_models_cache_path() {
+                if let Some(cache_path) =
+                    crate::coding::open_code::free_models::get_models_cache_path()
+                {
                     if let Some(parent) = cache_path.parent() {
                         if !parent.exists() {
                             fs::create_dir_all(parent)
@@ -404,30 +823,110 @@ pub async fn restore_database(
                     std::io::copy(&mut file, &mut outfile)
                         .map_err(|e| format!("Failed to extract models cache file: {}", e))?;
                 }
+            } else if file_name == "preset_models.json" {
+                // Restore preset_models.json to app data directory
+                if let Some(cache_path) =
+                    crate::coding::preset_models::get_preset_models_cache_path()
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        if !parent.exists() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+                        }
+                    }
+                    let mut outfile = File::create(&cache_path)
+                        .map_err(|e| format!("Failed to create preset models cache file: {}", e))?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                        format!("Failed to extract preset models cache file: {}", e)
+                    })?;
+                }
+            } else if file_name == "model_pricing.json" {
+                // Restore model_pricing.json to app data directory
+                if let Some(cache_path) =
+                    crate::db::model_pricing_seed::get_model_pricing_cache_path()
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        if !parent.exists() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+                        }
+                    }
+                    let mut outfile = File::create(&cache_path)
+                        .map_err(|e| format!("Failed to create model pricing cache file: {}", e))?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                        format!("Failed to extract model pricing cache file: {}", e)
+                    })?;
+                }
+            } else if file_name == "gateway_provider_profiles.json" {
+                // Restore gateway_provider_profiles.json to app data directory
+                if let Some(cache_path) =
+                    crate::coding::proxy_gateway::provider_profiles::get_gateway_provider_profiles_cache_path()
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        if !parent.exists() {
+                            fs::create_dir_all(parent)
+                                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+                        }
+                    }
+                    let mut outfile = File::create(&cache_path).map_err(|e| {
+                        format!("Failed to create gateway provider profiles cache file: {}", e)
+                    })?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| {
+                        format!("Failed to extract gateway provider profiles cache file: {}", e)
+                    })?;
+                }
             } else if file_name.starts_with("skills/") {
                 // Restore skills directory
-                let relative_path = &file_name[7..]; // Remove "skills/" prefix
-                if relative_path.is_empty() || file_name.ends_with('/') {
-                    continue;
-                }
-
                 let skills_dir = get_skills_dir(&app_handle)?;
                 if !skills_dir.exists() {
                     fs::create_dir_all(&skills_dir)
                         .map_err(|e| format!("Failed to create skills directory: {}", e))?;
                 }
 
-                let outpath = skills_dir.join(relative_path);
+                let Some((outpath, warning)) =
+                    resolve_skills_restore_output_path(&skills_dir, &file_name)?
+                else {
+                    continue;
+                };
+                if let Some(warning) = warning {
+                    push_restore_warning(&mut restore_result, warning);
+                }
+
                 if let Some(parent) = outpath.parent() {
                     if !parent.exists() {
-                        fs::create_dir_all(parent)
-                            .map_err(|e| format!("Failed to create skills parent directory: {}", e))?;
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create skills parent directory: {}", e)
+                        })?;
                     }
                 }
                 let mut outfile = File::create(&outpath)
                     .map_err(|e| format!("Failed to create skills file: {}", e))?;
                 std::io::copy(&mut file, &mut outfile)
                     .map_err(|e| format!("Failed to extract skills file: {}", e))?;
+            } else if file_name.starts_with("image-studio/assets/") {
+                let relative_path = &file_name["image-studio/assets/".len()..];
+                if relative_path.is_empty() || file_name.ends_with('/') {
+                    continue;
+                }
+
+                let image_assets_dir = get_image_assets_dir(&app_handle)?;
+                if !image_assets_dir.exists() {
+                    fs::create_dir_all(&image_assets_dir)
+                        .map_err(|e| format!("Failed to create image assets directory: {}", e))?;
+                }
+
+                let outpath = image_assets_dir.join(relative_path);
+                if let Some(parent) = outpath.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            format!("Failed to create image asset parent directory: {}", e)
+                        })?;
+                    }
+                }
+                let mut outfile = File::create(&outpath)
+                    .map_err(|e| format!("Failed to create image asset file: {}", e))?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| format!("Failed to extract image asset file: {}", e))?;
             }
         } else {
             // Old format: all files are database files
@@ -451,15 +950,14 @@ pub async fn restore_database(
         }
     }
 
-    // Create resync flag file to trigger skills and MCP resync on next startup
-    let app_data_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    let resync_flag = app_data_dir.join(".resync_required");
-    let _ = fs::write(&resync_flag, "1");
+    restore_custom_backup_entries(&mut archive)?;
 
-    Ok(())
+    let need_reapply =
+        should_reapply_applied_runtime(skipped_optional_cli_runtime, backup_meta.as_ref());
+    restore_result.will_reapply_applied = need_reapply;
+    write_post_restore_flags(&app_handle, need_reapply, &restored_wsl_modules)?;
+
+    Ok(restore_result)
 }
 
 /// Get database directory path for frontend

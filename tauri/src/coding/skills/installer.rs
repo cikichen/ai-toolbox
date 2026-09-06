@@ -3,23 +3,35 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use uuid::Uuid;
 
 use super::cache_cleanup::get_git_cache_ttl_secs;
-use super::central_repo::{ensure_central_repo, resolve_central_repo_path, resolve_skill_central_path, to_relative_central_path};
+use super::central_repo::{
+    ensure_central_repo, resolve_central_repo_path, resolve_skill_central_path,
+    to_relative_central_path,
+};
 use super::content_hash::hash_dir;
-use super::git_fetcher::{clone_or_pull, set_proxy};
-use super::sync_engine::{copy_dir_recursive, copy_skill_dir, sync_dir_copy_with_overwrite};
-use super::tool_adapters::{adapter_by_key, is_tool_installed, RuntimeToolAdapter};
-use super::types::{GitSkillCandidate, InstallResult, UpdateResult, Skill, now_ms};
+use super::git_fetcher::{clone_or_pull, set_proxy, GitProxyMode};
+use super::path_executor::{
+    remove_skill_target_checked, sync_copy_target_path, sync_skill_to_target, target_path_changed,
+};
 use super::skill_store;
+use super::sync_engine::{
+    copy_dir_recursive, copy_skill_dir, ensure_source_target_not_overlapping,
+};
+use super::tool_adapters::{
+    adapter_by_key, is_tool_installed_with_state_async,
+    resolve_runtime_skills_path_with_state_async, runtime_adapter_by_key, RuntimeToolAdapter,
+};
+use super::types::{now_ms, GitSkillCandidate, InstallResult, Skill, UpdateResult};
 use crate::http_client;
-use crate::DbState;
+use crate::SqliteDbState;
 
 /// Install a skill from a local folder
 pub async fn install_local_skill(
     app: &tauri::AppHandle,
-    state: &DbState,
+    state: &SqliteDbState,
     source_path: &Path,
     overwrite: bool,
 ) -> Result<InstallResult> {
@@ -35,9 +47,10 @@ pub async fn install_local_skill(
     let central_dir = resolve_central_repo_path(app, state).await?;
     ensure_central_repo(&central_dir)?;
     let central_path = central_dir.join(&name);
+    ensure_source_target_not_overlapping(source_path, &central_path)?;
 
     // Check if skill already exists and get its ID for update
-    let existing_skill_id = if central_path.exists() {
+    let existing_skill = if central_path.exists() {
         if overwrite {
             // Get existing skill ID before deleting
             let existing = skill_store::get_skill_by_name(state, &name)
@@ -46,7 +59,7 @@ pub async fn install_local_skill(
                 .flatten();
             std::fs::remove_dir_all(&central_path)
                 .with_context(|| format!("failed to remove existing skill: {:?}", central_path))?;
-            existing.map(|s| s.id)
+            existing
         } else {
             anyhow::bail!("SKILL_EXISTS|{}", name);
         }
@@ -61,7 +74,11 @@ pub async fn install_local_skill(
     let content_hash = compute_content_hash(&central_path);
 
     let record = Skill {
-        id: existing_skill_id.unwrap_or_default(), // Use existing ID if overwriting
+        tags: Vec::new(),
+        id: existing_skill
+            .as_ref()
+            .map(|skill| skill.id.clone())
+            .unwrap_or_default(), // Use existing ID if overwriting
         name: name.clone(),
         source_type: "local".to_string(),
         source_ref: Some(source_path.to_string_lossy().to_string()),
@@ -73,11 +90,171 @@ pub async fn install_local_skill(
         last_sync_at: None,
         status: "ok".to_string(),
         sort_index: 0,
+        user_group: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_group.clone()),
+        group_id: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.group_id.clone()),
+        user_note: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_note.clone()),
+        management_enabled: existing_skill
+            .as_ref()
+            .map(|skill| skill.management_enabled)
+            .unwrap_or(true),
+        disabled_previous_tools: existing_skill
+            .as_ref()
+            .map(|skill| skill.disabled_previous_tools.clone())
+            .unwrap_or_default(),
         enabled_tools: Vec::new(),
         sync_details: None,
     };
 
-    let skill_id = skill_store::upsert_skill(state, &record).await.map_err(|e| anyhow::anyhow!(e))?;
+    let skill_id = skill_store::upsert_skill(state, &record)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    Ok(InstallResult {
+        skill_id,
+        name,
+        central_path,
+        content_hash,
+    })
+}
+
+/// List skills in a local folder by scanning for SKILL.md files
+pub fn list_local_skills(source_path: &Path) -> Result<Vec<GitSkillCandidate>> {
+    if !source_path.exists() {
+        anyhow::bail!("source path not found: {:?}", source_path);
+    }
+    if !source_path.is_dir() {
+        anyhow::bail!("source path is not a directory: {:?}", source_path);
+    }
+
+    let mut out: Vec<GitSkillCandidate> = Vec::new();
+
+    // Check root for SKILL.md
+    let root_skill = source_path.join("SKILL.md");
+    if root_skill.exists() {
+        let (name, desc) = parse_skill_md(&root_skill).unwrap_or(("root-skill".to_string(), None));
+        out.push(GitSkillCandidate {
+            name,
+            description: desc,
+            subpath: ".".to_string(),
+        });
+    } else {
+        // Recursively scan subdirectories for skills
+        scan_skills_recursive(source_path, source_path, &mut out);
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.subpath == b.subpath);
+
+    Ok(out)
+}
+
+/// Install a specific skill from a local folder selection (sub-folder)
+pub async fn install_local_skill_from_selection(
+    app: &tauri::AppHandle,
+    state: &SqliteDbState,
+    source_path: &Path,
+    subpath: &str,
+    overwrite: bool,
+) -> Result<InstallResult> {
+    let copy_src = if subpath == "." {
+        source_path.to_path_buf()
+    } else {
+        source_path.join(subpath)
+    };
+    if !copy_src.exists() {
+        anyhow::bail!("path not found: {:?}", copy_src);
+    }
+
+    // Try to read name from SKILL.md, fallback to folder name
+    let name = read_skill_name_from_dir(&copy_src).unwrap_or_else(|| {
+        copy_src
+            .file_name()
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed-skill".to_string())
+    });
+
+    let central_dir = resolve_central_repo_path(app, state).await?;
+    ensure_central_repo(&central_dir)?;
+    let central_path = central_dir.join(&name);
+    ensure_source_target_not_overlapping(&copy_src, &central_path)?;
+
+    // Check if skill already exists and get its ID for update
+    let existing_skill = if central_path.exists() {
+        if overwrite {
+            let existing = skill_store::get_skill_by_name(state, &name)
+                .await
+                .ok()
+                .flatten();
+            std::fs::remove_dir_all(&central_path)
+                .with_context(|| format!("failed to remove existing skill: {:?}", central_path))?;
+            existing
+        } else {
+            anyhow::bail!("SKILL_EXISTS|{}", name);
+        }
+    } else {
+        None
+    };
+
+    copy_skill_dir(&copy_src, &central_path)
+        .with_context(|| format!("copy {:?} -> {:?}", copy_src, central_path))?;
+
+    // Build source_ref: full path including subpath
+    let full_source_ref = if subpath == "." {
+        source_path.to_string_lossy().to_string()
+    } else {
+        copy_src.to_string_lossy().to_string()
+    };
+
+    let now = now_ms();
+    let content_hash = compute_content_hash(&central_path);
+
+    let record = Skill {
+        tags: Vec::new(),
+        id: existing_skill
+            .as_ref()
+            .map(|skill| skill.id.clone())
+            .unwrap_or_default(),
+        name: name.clone(),
+        source_type: "local".to_string(),
+        source_ref: Some(full_source_ref),
+        source_revision: None,
+        central_path: to_relative_central_path(&central_path, &central_dir),
+        content_hash: content_hash.clone(),
+        created_at: now,
+        updated_at: now,
+        last_sync_at: None,
+        status: "ok".to_string(),
+        sort_index: 0,
+        user_group: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_group.clone()),
+        group_id: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.group_id.clone()),
+        user_note: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_note.clone()),
+        management_enabled: existing_skill
+            .as_ref()
+            .map(|skill| skill.management_enabled)
+            .unwrap_or(true),
+        disabled_previous_tools: existing_skill
+            .as_ref()
+            .map(|skill| skill.disabled_previous_tools.clone())
+            .unwrap_or_default(),
+        enabled_tools: Vec::new(),
+        sync_details: None,
+    };
+
+    let skill_id = skill_store::upsert_skill(state, &record)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(InstallResult {
         skill_id,
@@ -90,7 +267,7 @@ pub async fn install_local_skill(
 /// Install a skill from a Git URL
 pub async fn install_git_skill(
     app: &tauri::AppHandle,
-    state: &DbState,
+    state: &SqliteDbState,
     repo_url: &str,
     branch: Option<&str>,
     overwrite: bool,
@@ -151,7 +328,7 @@ pub async fn install_git_skill(
     let central_path = central_dir.join(&name);
 
     // Check if skill already exists and get its ID for update
-    let existing_skill_id = if central_path.exists() {
+    let existing_skill = if central_path.exists() {
         if overwrite {
             // Get existing skill ID before deleting
             let existing = skill_store::get_skill_by_name(state, &name)
@@ -160,7 +337,7 @@ pub async fn install_git_skill(
                 .flatten();
             std::fs::remove_dir_all(&central_path)
                 .with_context(|| format!("failed to remove existing skill: {:?}", central_path))?;
-            existing.map(|s| s.id)
+            existing
         } else {
             anyhow::bail!("SKILL_EXISTS|{}", name);
         }
@@ -194,7 +371,11 @@ pub async fn install_git_skill(
     let content_hash = compute_content_hash(&central_path);
 
     let record = Skill {
-        id: existing_skill_id.unwrap_or_default(), // Use existing ID if overwriting
+        tags: Vec::new(),
+        id: existing_skill
+            .as_ref()
+            .map(|skill| skill.id.clone())
+            .unwrap_or_default(), // Use existing ID if overwriting
         name: name.clone(),
         source_type: "git".to_string(),
         source_ref: Some(full_source_ref),
@@ -206,11 +387,30 @@ pub async fn install_git_skill(
         last_sync_at: None,
         status: "ok".to_string(),
         sort_index: 0,
+        user_group: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_group.clone()),
+        group_id: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.group_id.clone()),
+        user_note: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_note.clone()),
+        management_enabled: existing_skill
+            .as_ref()
+            .map(|skill| skill.management_enabled)
+            .unwrap_or(true),
+        disabled_previous_tools: existing_skill
+            .as_ref()
+            .map(|skill| skill.disabled_previous_tools.clone())
+            .unwrap_or_default(),
         enabled_tools: Vec::new(),
         sync_details: None,
     };
 
-    let skill_id = skill_store::upsert_skill(state, &record).await.map_err(|e| anyhow::anyhow!(e))?;
+    let skill_id = skill_store::upsert_skill(state, &record)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(InstallResult {
         skill_id,
@@ -230,7 +430,8 @@ pub fn list_git_skills(
     let parsed = parse_github_url(repo_url);
     // Use provided branch, or fall back to parsed branch from URL
     let effective_branch = branch.or(parsed.branch.as_deref());
-    let (repo_dir, _rev) = clone_to_cache(app, cache_ttl_secs, &parsed.clone_url, effective_branch)?;
+    let (repo_dir, _rev) =
+        clone_to_cache(app, cache_ttl_secs, &parsed.clone_url, effective_branch)?;
 
     let mut out: Vec<GitSkillCandidate> = Vec::new();
 
@@ -277,7 +478,7 @@ pub fn list_git_skills(
 /// Install a specific skill from a Git repo selection
 pub async fn install_git_skill_from_selection(
     app: &tauri::AppHandle,
-    state: &DbState,
+    state: &SqliteDbState,
     repo_url: &str,
     subpath: &str,
     branch: Option<&str>,
@@ -292,8 +493,7 @@ pub async fn install_git_skill_from_selection(
 
     // Clone first, then read skill name from SKILL.md
     let ttl = get_git_cache_ttl_secs(state).await;
-    let (repo_dir, revision) =
-        clone_to_cache(app, ttl, &parsed.clone_url, effective_branch)?;
+    let (repo_dir, revision) = clone_to_cache(app, ttl, &parsed.clone_url, effective_branch)?;
 
     let copy_src = if subpath == "." {
         repo_dir.clone()
@@ -317,7 +517,7 @@ pub async fn install_git_skill_from_selection(
     let central_path = central_dir.join(&display_name);
 
     // Check if skill already exists and get its ID for update
-    let existing_skill_id = if central_path.exists() {
+    let existing_skill = if central_path.exists() {
         if overwrite {
             // Get existing skill ID before deleting
             let existing = skill_store::get_skill_by_name(state, &display_name)
@@ -326,7 +526,7 @@ pub async fn install_git_skill_from_selection(
                 .flatten();
             std::fs::remove_dir_all(&central_path)
                 .with_context(|| format!("failed to remove existing skill: {:?}", central_path))?;
-            existing.map(|s| s.id)
+            existing
         } else {
             anyhow::bail!("SKILL_EXISTS|{}", display_name);
         }
@@ -354,7 +554,11 @@ pub async fn install_git_skill_from_selection(
     let now = now_ms();
     let content_hash = compute_content_hash(&central_path);
     let record = Skill {
-        id: existing_skill_id.unwrap_or_default(), // Use existing ID if overwriting
+        tags: Vec::new(),
+        id: existing_skill
+            .as_ref()
+            .map(|skill| skill.id.clone())
+            .unwrap_or_default(), // Use existing ID if overwriting
         name: display_name.clone(),
         source_type: "git".to_string(),
         source_ref: Some(full_source_ref),
@@ -366,10 +570,29 @@ pub async fn install_git_skill_from_selection(
         last_sync_at: None,
         status: "ok".to_string(),
         sort_index: 0,
+        user_group: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_group.clone()),
+        group_id: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.group_id.clone()),
+        user_note: existing_skill
+            .as_ref()
+            .and_then(|skill| skill.user_note.clone()),
+        management_enabled: existing_skill
+            .as_ref()
+            .map(|skill| skill.management_enabled)
+            .unwrap_or(true),
+        disabled_previous_tools: existing_skill
+            .as_ref()
+            .map(|skill| skill.disabled_previous_tools.clone())
+            .unwrap_or_default(),
         enabled_tools: Vec::new(),
         sync_details: None,
     };
-    let skill_id = skill_store::upsert_skill(state, &record).await.map_err(|e| anyhow::anyhow!(e))?;
+    let skill_id = skill_store::upsert_skill(state, &record)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(InstallResult {
         skill_id,
@@ -382,7 +605,7 @@ pub async fn install_git_skill_from_selection(
 /// Update a managed skill from its source
 pub async fn update_managed_skill_from_source(
     app: &tauri::AppHandle,
-    state: &DbState,
+    state: &SqliteDbState,
     skill_id: &str,
 ) -> Result<UpdateResult> {
     // Initialize proxy from app settings (for git source types)
@@ -452,6 +675,69 @@ pub async fn update_managed_skill_from_source(
         anyhow::bail!("unsupported source_type for update: {}", record.source_type);
     }
 
+    // Skip the swap when the staged content is identical to what is already in
+    // the central repo: an update pass must not rewrite the directory (and
+    // clobber mtimes / tool copy targets) for no change, and a scheduled
+    // auto-update must not churn every skill on every tick. The DB row is still
+    // refreshed (updated_at / git revision / status="ok") so this path matches the
+    // other refresh entries: "success writes the timestamp; failure writes nothing".
+    let staged_hash = compute_content_hash(&staging_dir);
+    let current_hash = compute_content_hash(&central_path);
+    if staged_hash.is_some() && staged_hash == current_hash {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        log::debug!(
+            "[update] content unchanged, skipping swap for '{}'",
+            record.name
+        );
+        // The directory did not change, but this update pass still succeeded: refresh
+        // updated_at, normalize the git revision onto the row, and assert status="ok".
+        // This aligns the hash-identical path with the other three refresh entries
+        // ("success writes the timestamp; failure writes nothing"). The filesystem
+        // swap and tool re-sync stay skipped — only the DB row is touched.
+        let relative_central_path = to_relative_central_path(&central_path, &central_dir);
+        let updated = Skill {
+            tags: record.tags.clone(),
+            id: record.id.clone(),
+            name: record.name.clone(),
+            source_type: record.source_type.clone(),
+            source_ref: record.source_ref.clone(),
+            source_revision: new_revision.clone().or(record.source_revision.clone()),
+            central_path: relative_central_path,
+            content_hash: current_hash.clone(),
+            created_at: record.created_at,
+            updated_at: now,
+            last_sync_at: record.last_sync_at,
+            status: "ok".to_string(),
+            sort_index: record.sort_index,
+            user_group: record.user_group.clone(),
+            group_id: record.group_id.clone(),
+            user_note: record.user_note.clone(),
+            management_enabled: record.management_enabled,
+            disabled_previous_tools: record.disabled_previous_tools.clone(),
+            enabled_tools: record.enabled_tools.clone(),
+            sync_details: record.sync_details.clone(),
+        };
+        skill_store::upsert_skill(state, &updated)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        return Ok(UpdateResult {
+            skill_id: record.id.clone(),
+            name: record.name.clone(),
+            central_path: central_path.clone(),
+            content_hash: current_hash,
+            source_revision: new_revision
+                .clone()
+                .or_else(|| record.source_revision.clone()),
+            updated_targets: Vec::new(),
+        });
+    }
+
+    // Keep a recoverable copy of the previous central content before replacing
+    // it: the central dir may contain direct user edits (or edits made through
+    // a symlinked tool directory) that an update would otherwise lose. Copies
+    // are pruned to the newest 5 per skill.
+    backup_central_before_replace(app, &record, &central_path)?;
+
     // Swap: remove old dir and rename staging into place
     std::fs::remove_dir_all(&central_path)
         .with_context(|| format!("failed to remove old central dir {:?}", central_path))?;
@@ -467,6 +753,7 @@ pub async fn update_managed_skill_from_source(
     // Update DB skill row (store relative central_path)
     let relative_central_path = to_relative_central_path(&central_path, &central_dir);
     let updated = Skill {
+        tags: record.tags.clone(),
         id: record.id.clone(),
         name: record.name.clone(),
         source_type: record.source_type.clone(),
@@ -479,43 +766,104 @@ pub async fn update_managed_skill_from_source(
         last_sync_at: record.last_sync_at,
         status: "ok".to_string(),
         sort_index: record.sort_index,
+        user_group: record.user_group.clone(),
+        group_id: record.group_id.clone(),
+        user_note: record.user_note.clone(),
+        management_enabled: record.management_enabled,
+        disabled_previous_tools: record.disabled_previous_tools.clone(),
         enabled_tools: record.enabled_tools.clone(),
         sync_details: record.sync_details.clone(),
     };
-    skill_store::upsert_skill(state, &updated).await.map_err(|e| anyhow::anyhow!(e))?;
+    skill_store::upsert_skill(state, &updated)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    if !record.management_enabled {
+        return Ok(UpdateResult {
+            skill_id: record.id,
+            name: record.name,
+            central_path,
+            content_hash,
+            source_revision: new_revision,
+            updated_targets: Vec::new(),
+        });
+    }
 
     // Re-sync copy targets (symlinks update automatically)
     let targets = skill_store::get_skill_targets(state, skill_id)
         .await
         .unwrap_or_default();
-    let custom_tools = skill_store::get_custom_tools(state).await.unwrap_or_default();
+    let custom_tools = skill_store::get_custom_tools(state)
+        .await
+        .unwrap_or_default();
     let mut updated_targets: Vec<String> = Vec::new();
     for t in targets {
-        // Skip if tool not installed
-        if let Some(adapter) = adapter_by_key(&t.tool) {
-            if !is_tool_installed(&RuntimeToolAdapter::from(&adapter)).unwrap_or(false) {
-                continue;
-            }
-        }
         // Check if custom tool has force_copy enabled
         let custom_tool_force_copy = custom_tools
             .iter()
             .find(|ct| ct.key == t.tool)
             .map(|ct| ct.force_copy)
             .unwrap_or(false);
-        let force_copy = t.mode == "copy" || t.tool == "cursor" || custom_tool_force_copy;
-        if force_copy {
-            let target_path = PathBuf::from(&t.target_path);
-            let _sync_res = sync_dir_copy_with_overwrite(&central_path, &target_path, true)?;
-            let target_record = super::types::SkillTarget {
-                tool: t.tool.clone(),
-                target_path: t.target_path.clone(),
-                mode: "copy".to_string(),
-                status: "ok".to_string(),
-                synced_at: Some(now),
-                error_message: None,
+        let runtime_adapter = if let Some(adapter) = runtime_adapter_by_key(&t.tool, &custom_tools)
+        {
+            adapter
+        } else if let Some(adapter) = adapter_by_key(&t.tool) {
+            RuntimeToolAdapter::from(&adapter)
+        } else {
+            continue;
+        };
+
+        if !runtime_adapter.is_custom
+            && !is_tool_installed_with_state_async(state, &runtime_adapter)
+                .await
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let tool_root =
+            match resolve_runtime_skills_path_with_state_async(state, &runtime_adapter).await {
+                Ok(path) => path,
+                Err(_) => continue,
             };
-            let _ = skill_store::upsert_skill_target(state, skill_id, &target_record).await;
+        let current_target = tool_root.join(&record.name);
+        let target_path_moved = target_path_changed(&t.target_path, &current_target);
+        let force_copy = t.mode == "copy" || t.tool == "cursor" || custom_tool_force_copy;
+
+        let sync_result = if target_path_moved {
+            let sync_result = sync_skill_to_target(
+                &t.tool,
+                &central_path,
+                &current_target,
+                true,
+                runtime_adapter.force_copy,
+            )?;
+            if let Err(err) = remove_skill_target_checked(&central_path, &t.target_path) {
+                log::warn!(
+                    "Failed to remove outdated skill target for '{}' ({}): {}",
+                    record.name,
+                    t.tool,
+                    err
+                );
+            }
+            sync_result
+        } else if force_copy {
+            sync_copy_target_path(&central_path, &t.target_path)?
+        } else {
+            continue;
+        };
+
+        let target_record = super::types::SkillTarget {
+            tool: t.tool.clone(),
+            target_path: sync_result.target_path.to_string_lossy().to_string(),
+            mode: sync_result.mode_used.as_str().to_string(),
+            status: "ok".to_string(),
+            synced_at: Some(now),
+            error_message: None,
+        };
+        let _ = skill_store::upsert_skill_target(state, skill_id, &target_record).await;
+
+        if !updated_targets.iter().any(|tool| tool == &t.tool) {
             updated_targets.push(t.tool.clone());
         }
     }
@@ -528,6 +876,65 @@ pub async fn update_managed_skill_from_source(
         source_revision: new_revision,
         updated_targets,
     })
+}
+
+/// Copy the current central content to `{app_data}/skills-backup/{id}-{ts}`
+/// before an update replaces it, so direct user edits (or edits made through a
+/// symlinked tool directory) can be recovered. Keeps the newest 5 copies per
+/// skill; failures here are logged, not fatal — the swap still proceeds.
+fn backup_central_before_replace(
+    app: &tauri::AppHandle,
+    record: &Skill,
+    central_path: &Path,
+) -> Result<(), anyhow::Error> {
+    let backups_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| anyhow::anyhow!("failed to resolve app data dir: {error}"))?
+        .join("skills-backup");
+    if !backups_root.exists() {
+        std::fs::create_dir_all(&backups_root)
+            .with_context(|| format!("create backup root {:?}", backups_root))?;
+    }
+
+    // The skill id is filesystem-safe where the display name may not be.
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let backup_dir = backups_root.join(format!("{}-{}", record.id, stamp));
+    if let Err(error) = copy_dir_recursive(central_path, &backup_dir) {
+        log::warn!(
+            "Failed to back up central skill '{}' before update: {}",
+            record.name,
+            error
+        );
+        return Ok(());
+    }
+
+    // Prune old backups of the same skill, keeping the newest 5.
+    let prefix = format!("{}-", record.id);
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(&backups_root) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(&prefix))
+                .unwrap_or(false)
+            {
+                let modified = entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                entries.push((modified, path));
+            }
+        }
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, old_path) in entries.into_iter().skip(5) {
+        let _ = std::fs::remove_dir_all(&old_path);
+    }
+
+    Ok(())
 }
 
 // --- Git URL parsing ---
@@ -621,7 +1028,13 @@ fn looks_like_github_shorthand(input: &str) -> bool {
 
     let owner = parts[0];
     let repo = parts[1];
-    if owner.is_empty() || repo.is_empty() || owner == "." || owner == ".." || repo == "." || repo == ".." {
+    if owner.is_empty()
+        || repo.is_empty()
+        || owner == "."
+        || owner == ".."
+        || repo == "."
+        || repo == ".."
+    {
         return false;
     }
 
@@ -661,26 +1074,9 @@ fn compute_content_hash(path: &Path) -> Option<String> {
 }
 
 fn parse_skill_md(path: &Path) -> Option<(String, Option<String>)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut lines = text.lines();
-    if lines.next()?.trim() != "---" {
-        return None;
-    }
-    let mut name: Option<String> = None;
-    let mut desc: Option<String> = None;
-    for line in lines.by_ref() {
-        let l = line.trim();
-        if l == "---" {
-            break;
-        }
-        if let Some(v) = l.strip_prefix("name:") {
-            name = Some(v.trim().trim_matches('"').to_string());
-        } else if let Some(v) = l.strip_prefix("description:") {
-            desc = Some(v.trim().trim_matches('"').to_string());
-        }
-    }
+    let (name, description) = super::frontmatter::parse_skill_md_frontmatter(path);
     let name = name?;
-    Some((name, desc))
+    Some((name, description))
 }
 
 /// Recursively scan a directory for SKILL.md files and add matching candidates to the output vector.
@@ -847,7 +1243,12 @@ fn repo_cache_key(clone_url: &str, branch: Option<&str>) -> String {
 }
 
 /// Initialize proxy settings from app settings database
-async fn init_proxy_from_settings(state: &DbState) {
-    let proxy_url = http_client::get_proxy_from_settings(state).await.ok();
-    set_proxy(proxy_url);
+async fn init_proxy_from_settings(state: &SqliteDbState) {
+    let proxy_result = http_client::get_proxy_from_settings(state).await.ok();
+    let proxy_mode = match proxy_result {
+        Some((http_client::ProxyMode::Direct, _)) => GitProxyMode::Direct,
+        Some((http_client::ProxyMode::Custom, url)) if !url.is_empty() => GitProxyMode::Custom(url),
+        _ => GitProxyMode::System,
+    };
+    set_proxy(proxy_mode);
 }

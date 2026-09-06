@@ -3,15 +3,20 @@ use tauri::{Emitter, Listener, Manager};
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use surrealdb::engine::local::SurrealKv;
-use surrealdb::Surreal;
-use tokio::sync::Mutex;
+
+#[cfg(all(test, target_os = "windows"))]
+#[link(name = "resource", kind = "static")]
+extern "C" {}
 
 use log::{error, info, warn};
-use simplelog::{CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, ColorChoice, WriteLogger};
+use simplelog::{
+    ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode, WriteLogger,
+};
 
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex as StdMutex;
 
@@ -20,13 +25,51 @@ pub mod auto_launch;
 pub mod coding;
 pub mod db;
 pub mod http_client;
+pub mod lightweight;
 pub mod settings;
 pub mod single_instance;
+pub mod startup_recovery;
 pub mod tray;
 pub mod update;
 
-// Re-export DbState for use in other modules
-pub use db::DbState;
+// Re-export SqliteDbState for use in other modules
+pub use db::SqliteDbState;
+pub(crate) static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Create the main window. Shared by startup and lightweight-mode rebuild so
+/// both paths produce the same window. `geometry` (logical units) restores the
+/// pre-destroy window placement; `None` centers a default-sized window.
+pub(crate) fn build_main_window<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    geometry: Option<lightweight::WindowGeometry>,
+) -> tauri::Result<tauri::WebviewWindow<R>> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let (width, height) = geometry
+        .map(|g| (g.width, g.height))
+        .unwrap_or((1200.0, 800.0));
+
+    let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+        .title("AI Toolbox")
+        .inner_size(width, height)
+        .min_inner_size(800.0, 600.0)
+        .visible(false);
+
+    builder = match geometry {
+        Some(g) => builder.position(g.x, g.y).maximized(g.maximized),
+        None => builder.center(),
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::TitleBarStyle;
+        builder = builder
+            .title_bar_style(TitleBarStyle::Overlay)
+            .hidden_title(true);
+    }
+
+    builder.build()
+}
 
 /// Set window background color (affects macOS titlebar color)
 #[tauri::command]
@@ -54,11 +97,30 @@ fn open_folder(path: String) -> Result<(), String> {
 
     // Create directory if it doesn't exist
     if !folder.exists() {
-        fs::create_dir_all(folder)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
+        fs::create_dir_all(folder).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
-    // Open the folder using system default file manager
+    open_folder_in_file_manager(folder)
+}
+
+/// Open an existing folder in the system file manager.
+/// If the path is a file, opens the parent directory.
+#[tauri::command]
+fn open_existing_folder(path: String) -> Result<(), String> {
+    let path = Path::new(&path);
+    let folder = if path.is_file() {
+        path.parent()
+            .ok_or_else(|| "Cannot get parent directory".to_string())?
+    } else if path.is_dir() {
+        path
+    } else {
+        return Err(format!("Path does not exist: {}", path.display()));
+    };
+
+    open_folder_in_file_manager(folder)
+}
+
+fn open_folder_in_file_manager(folder: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
@@ -144,13 +206,7 @@ fn init_logging() -> Option<std::path::PathBuf> {
         .add_filter_allow_str("ai_toolbox")
         .build();
 
-    if CombinedLogger::init(vec![WriteLogger::new(
-        LevelFilter::Info,
-        file_config,
-        file,
-    )])
-    .is_err()
-    {
+    if CombinedLogger::init(vec![WriteLogger::new(LevelFilter::Info, file_config, file)]).is_err() {
         eprintln!("日志系统初始化失败");
         return None;
     }
@@ -237,6 +293,150 @@ fn is_appimage_runtime() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+const APPIMAGE_WAYLAND_PRELOAD_APPLIED_ENV: &str = "AI_TOOLBOX_APPIMAGE_WAYLAND_PRELOAD_APPLIED";
+
+#[cfg(target_os = "linux")]
+const SYSTEM_WAYLAND_CLIENT_LIBRARY_PATHS: &[&str] = &[
+    "/usr/lib64/libwayland-client.so.0",
+    "/usr/lib/libwayland-client.so.0",
+    "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+    "/usr/lib/aarch64-linux-gnu/libwayland-client.so.0",
+    "/lib64/libwayland-client.so.0",
+    "/lib/x86_64-linux-gnu/libwayland-client.so.0",
+    "/lib/aarch64-linux-gnu/libwayland-client.so.0",
+];
+
+#[cfg(target_os = "linux")]
+fn env_var_has_value(key: &str) -> bool {
+    std::env::var_os(key)
+        .map(|value| !value.as_os_str().is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn should_reexec_for_appimage_wayland_preload(
+    workaround_disabled: bool,
+    is_appimage: bool,
+    is_wayland: bool,
+    preload_already_applied: bool,
+    ld_preload_is_set: bool,
+    system_library_found: bool,
+) -> bool {
+    !workaround_disabled
+        && is_appimage
+        && is_wayland
+        && !preload_already_applied
+        && !ld_preload_is_set
+        && system_library_found
+}
+
+#[cfg(target_os = "linux")]
+fn find_system_wayland_client_library() -> Option<std::path::PathBuf> {
+    SYSTEM_WAYLAND_CLIENT_LIBRARY_PATHS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn appimage_reexec_target() -> Result<std::path::PathBuf, String> {
+    if let Some(appimage_path) = std::env::var_os("APPIMAGE") {
+        if !appimage_path.as_os_str().is_empty() {
+            let path = std::path::PathBuf::from(appimage_path);
+            if path.is_file() {
+                return Ok(path);
+            }
+            warn!(
+                "APPIMAGE points to a missing file ({}); falling back to current executable",
+                path.display()
+            );
+        }
+    }
+
+    std::env::current_exe()
+        .map_err(|error| format!("Failed to resolve current executable: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_reexec_appimage_with_system_wayland_client() {
+    let workaround_disabled =
+        std::env::var_os("AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND").is_some();
+    let is_appimage = is_appimage_runtime();
+    let is_wayland = is_wayland_session();
+    let preload_already_applied = std::env::var_os(APPIMAGE_WAYLAND_PRELOAD_APPLIED_ENV).is_some();
+    let ld_preload_is_set = env_var_has_value("LD_PRELOAD");
+    let system_library = if !workaround_disabled
+        && is_appimage
+        && is_wayland
+        && !preload_already_applied
+        && !ld_preload_is_set
+    {
+        find_system_wayland_client_library()
+    } else {
+        None
+    };
+
+    if !should_reexec_for_appimage_wayland_preload(
+        workaround_disabled,
+        is_appimage,
+        is_wayland,
+        preload_already_applied,
+        ld_preload_is_set,
+        system_library.is_some(),
+    ) {
+        if !workaround_disabled
+            && is_appimage
+            && is_wayland
+            && !preload_already_applied
+            && !ld_preload_is_set
+        {
+            warn!(
+                "Detected AppImage on Wayland but no system libwayland-client.so.0 was found; continuing with WebKitGTK fallback levels"
+            );
+        }
+        return;
+    }
+
+    let Some(system_library) = system_library else {
+        return;
+    };
+    let launch_target = match appimage_reexec_target() {
+        Ok(path) => path,
+        Err(error) => {
+            error!(
+                "Failed to prepare AppImage Wayland LD_PRELOAD re-exec: {}; continuing with WebKitGTK fallback levels",
+                error
+            );
+            return;
+        }
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    info!(
+        "Detected AppImage on Wayland; re-executing with system libwayland-client ({})",
+        system_library.display()
+    );
+
+    match std::process::Command::new(&launch_target)
+        .args(args)
+        .env("LD_PRELOAD", &system_library)
+        .env(APPIMAGE_WAYLAND_PRELOAD_APPLIED_ENV, "1")
+        .spawn()
+    {
+        Ok(_) => {
+            std::process::exit(0);
+        }
+        Err(error) => {
+            error!(
+                "Failed to re-exec AppImage with system libwayland-client ({}): {}; continuing with WebKitGTK fallback levels",
+                launch_target.display(),
+                error
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 const WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL: u8 = 4;
 
 #[cfg(target_os = "linux")]
@@ -251,6 +451,42 @@ fn wayland_webview_workaround_level_path() -> Option<std::path::PathBuf> {
     )
 }
 
+/// Persisted WebKitGTK workaround level, bound to the app version that wrote it.
+/// A record written by a different app version is ignored so each release starts
+/// from the default level: a downgrade forced by an old WebKitGTK regression must
+/// not permanently pin newer releases (and newer system WebKitGTK builds) to a
+/// slower rendering path (issue #301).
+#[cfg(any(target_os = "linux", test))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WaylandWorkaroundLevelRecord {
+    level: u8,
+    app_version: String,
+}
+
+// Pure helpers are compiled under `test` on every platform so the version-reset
+// semantics can be unit-tested on Windows dev machines; Linux-only callers use
+// them through the normal `target_os = "linux"` cfg.
+#[cfg(any(target_os = "linux", test))]
+fn parse_wayland_workaround_level_record(raw: &str, current_app_version: &str) -> u8 {
+    let Ok(record) = serde_json::from_str::<WaylandWorkaroundLevelRecord>(raw) else {
+        // Legacy plain-number format or corrupt content: reset to default.
+        return 0;
+    };
+    if record.app_version != current_app_version {
+        return 0;
+    }
+    record.level.min(WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn render_wayland_workaround_level_record(level: u8, app_version: &str) -> String {
+    serde_json::to_string(&WaylandWorkaroundLevelRecord {
+        level: level.min(WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL),
+        app_version: app_version.to_string(),
+    })
+    .unwrap_or_else(|_| level.min(WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL).to_string())
+}
+
 #[cfg(target_os = "linux")]
 fn read_wayland_webview_workaround_level() -> u8 {
     let Some(path) = wayland_webview_workaround_level_path() else {
@@ -259,11 +495,7 @@ fn read_wayland_webview_workaround_level() -> u8 {
     let Ok(raw) = fs::read_to_string(&path) else {
         return 0;
     };
-    raw.trim()
-        .parse::<u8>()
-        .ok()
-        .map(|v| v.min(WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL))
-        .unwrap_or(0)
+    parse_wayland_workaround_level_record(&raw, env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(target_os = "linux")]
@@ -274,11 +506,15 @@ fn write_wayland_webview_workaround_level(level: u8) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(&path, level.to_string());
+    let _ = fs::write(
+        &path,
+        render_wayland_workaround_level_record(level, env!("CARGO_PKG_VERSION")),
+    );
 }
 
 #[cfg(target_os = "linux")]
-fn try_acquire_single_instance_lock_with_optional_retry() -> Result<single_instance::SingleInstanceLock, String> {
+fn try_acquire_single_instance_lock_with_optional_retry(
+) -> Result<single_instance::SingleInstanceLock, String> {
     if std::env::var_os("AI_TOOLBOX_RESTART_WAIT_LOCK").is_none() {
         return single_instance::try_acquire_lock();
     }
@@ -309,58 +545,61 @@ fn setup_linux_wayland_egl_failure_monitor(
     }
 
     let egl_failure_flag_clone = egl_failure_flag.clone();
-    let Ok(thread_builder) = std::thread::Builder::new().name("egl-stderr-monitor".to_string()).spawn(move || unsafe {
-        let mut pipe_fds = [0; 2];
-        if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
-            return;
-        }
+    let Ok(thread_builder) = std::thread::Builder::new()
+        .name("egl-stderr-monitor".to_string())
+        .spawn(move || unsafe {
+            let mut pipe_fds = [0; 2];
+            if libc::pipe(pipe_fds.as_mut_ptr()) != 0 {
+                return;
+            }
 
-        let read_fd = pipe_fds[0];
-        let write_fd = pipe_fds[1];
+            let read_fd = pipe_fds[0];
+            let write_fd = pipe_fds[1];
 
-        let original_stderr_fd = libc::dup(libc::STDERR_FILENO);
-        if original_stderr_fd < 0 {
-            libc::close(read_fd);
+            let original_stderr_fd = libc::dup(libc::STDERR_FILENO);
+            if original_stderr_fd < 0 {
+                libc::close(read_fd);
+                libc::close(write_fd);
+                return;
+            }
+
+            if libc::dup2(write_fd, libc::STDERR_FILENO) < 0 {
+                libc::close(original_stderr_fd);
+                libc::close(read_fd);
+                libc::close(write_fd);
+                return;
+            }
             libc::close(write_fd);
-            return;
-        }
 
-        if libc::dup2(write_fd, libc::STDERR_FILENO) < 0 {
-            libc::close(original_stderr_fd);
-            libc::close(read_fd);
-            libc::close(write_fd);
-            return;
-        }
-        libc::close(write_fd);
+            let mut original_stderr = std::fs::File::from_raw_fd(original_stderr_fd);
+            let mut reader = std::fs::File::from_raw_fd(read_fd);
 
-        let mut original_stderr = std::fs::File::from_raw_fd(original_stderr_fd);
-        let mut reader = std::fs::File::from_raw_fd(read_fd);
+            let mut buf = [0u8; 4096];
+            let mut carry = String::new();
+            loop {
+                let Ok(n) = reader.read(&mut buf) else { break };
+                if n == 0 {
+                    break;
+                }
 
-        let mut buf = [0u8; 4096];
-        let mut carry = String::new();
-        loop {
-            let Ok(n) = reader.read(&mut buf) else { break };
-            if n == 0 {
-                break;
+                let chunk = &buf[..n];
+                let _ = original_stderr.write_all(chunk);
+                let text = String::from_utf8_lossy(chunk);
+
+                carry.push_str(&text);
+                if carry.contains("Could not create default EGL display")
+                    || carry.contains("EGL_BAD_PARAMETER")
+                {
+                    egl_failure_flag_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                if carry.len() > 4096 {
+                    let keep_from = carry.len().saturating_sub(2048);
+                    carry.drain(..keep_from);
+                }
             }
-
-            let chunk = &buf[..n];
-            let _ = original_stderr.write_all(chunk);
-            let text = String::from_utf8_lossy(chunk);
-
-            carry.push_str(&text);
-            if carry.contains("Could not create default EGL display")
-                || carry.contains("EGL_BAD_PARAMETER")
-            {
-                egl_failure_flag_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-
-            if carry.len() > 4096 {
-                let keep_from = carry.len().saturating_sub(2048);
-                carry.drain(..keep_from);
-            }
-        }
-    }) else {
+        })
+    else {
         return egl_failure_flag;
     };
 
@@ -378,8 +617,8 @@ fn start_linux_wayland_webview_auto_downgrade_watchdog(
     use std::sync::atomic::Ordering;
     use tokio::sync::watch;
 
-    let egl_failure_flag = egl_failure_flag
-        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let egl_failure_flag =
+        egl_failure_flag.unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
     info!(
         "Starting WebKitGTK webview auto-downgrade watchdog at level {}",
@@ -471,8 +710,8 @@ fn start_linux_wayland_webview_auto_downgrade_watchdog(
     });
 }
 
-/// Workaround: On some Linux environments (both Wayland and X11), WebKitGTK can fail to
-/// initialize GPU rendering and the webview shows a white screen.
+/// Workaround: On some Linux environments, especially AppImage builds running on modern Wayland
+/// stacks, WebKitGTK can fail to initialize GPU rendering and the webview shows a white screen.
 ///
 /// We apply WebKitGTK GPU/DMABuf workarounds based on a fallback level:
 /// - 0: Default (GPU/DMABuf enabled)
@@ -482,24 +721,54 @@ fn start_linux_wayland_webview_auto_downgrade_watchdog(
 /// - 4: Fallback to X11 backend (GDK_BACKEND=x11)
 ///
 /// Notes:
+/// - AppImage + Wayland first tries a one-time re-exec with system libwayland-client via
+///   LD_PRELOAD, before WebKitGTK loads its bundled Wayland/EGL stack.
 /// - Debug builds default to level 4 to avoid dev-time white screens.
-/// - Release builds default to level 0 and may auto-downgrade on failure.
-/// - Set `AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND=1` to opt out.
+/// - Release builds default to at least level 1 on Wayland sessions (any installation
+///   method) and for AppImage on any session type; the DMABUF/Skia rendering path is the
+///   main source of WebKitGTK 2.50+ scroll jank and input-field freezes (issue #301).
+///   Mitigation is GPU-driver-dependent: on AMD iGPUs (radeonsi) only level 2 (disable
+///   the GPU process, software compositing) clears the freeze — level 1 + single-thread
+///   Skia painting still freezes in a clean env; on Intel iGPUs (iris) level 0 + Skia
+///   single-thread painting (`WEBKIT_SKIA_GPU_PAINTING_THREADS=0`) is enough and keeps
+///   GPU acceleration. So `WEBKIT_SKIA_GPU_PAINTING_THREADS=0` is a valid lightweight
+///   workaround for Intel, while AMD still needs the level-2 fallback.
+/// - The persisted level is bound to the app version that wrote it; upgrading the app
+///   resets it so a downgrade forced by an old WebKitGTK regression does not pin newer
+///   releases (or newer system WebKitGTK builds) to a slower rendering path.
+/// - Set `AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND=1` to opt out of both mitigations.
 /// - Set `AI_TOOLBOX_WAYLAND_WEBVIEW_WORKAROUND_LEVEL=0..4` to override.
 #[cfg(target_os = "linux")]
 fn setup_linux_wayland_webview_workaround() -> u8 {
     if std::env::var_os("AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND").is_some() {
-        info!("WebKitGTK webview workaround disabled via AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND");
+        info!(
+            "WebKitGTK webview workaround disabled via AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND"
+        );
         return 0;
     }
 
-    let session_type = if is_wayland_session() { "Wayland" } else { "X11" };
+    let session_type = if is_wayland_session() {
+        "Wayland"
+    } else {
+        "X11"
+    };
 
+    // Release builds start at least at level 1 (disable the DMABUF renderer) for every
+    // installation method on Wayland sessions, and for AppImage regardless of session
+    // type because it bundles its own graphics stack. The DMABUF/Skia path is the main
+    // source of WebKitGTK 2.50+ scroll jank and input-field freezes on AMD/KDE Wayland
+    // (issue #301, verified against WebKitGTK rendering regressions in psysonic#342).
     let appimage_min_level = if !cfg!(debug_assertions) && is_appimage_runtime() {
         1
     } else {
         0
     };
+    let wayland_min_level = if !cfg!(debug_assertions) && is_wayland_session() {
+        1
+    } else {
+        0
+    };
+    let default_min_level = appimage_min_level.max(wayland_min_level);
 
     let level = std::env::var("AI_TOOLBOX_WAYLAND_WEBVIEW_WORKAROUND_LEVEL")
         .ok()
@@ -509,14 +778,14 @@ fn setup_linux_wayland_webview_workaround() -> u8 {
             if cfg!(debug_assertions) {
                 WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL
             } else {
-                read_wayland_webview_workaround_level().max(appimage_min_level)
+                read_wayland_webview_workaround_level().max(default_min_level)
             }
         });
 
-    if appimage_min_level > 0 && level == appimage_min_level {
+    if default_min_level > 0 && level == default_min_level {
         info!(
-            "Detected AppImage runtime on Wayland; using safer initial workaround level {}",
-            appimage_min_level
+            "Detected AppImage runtime and/or Wayland session; using safer initial workaround level {} (DMABUF renderer disabled)",
+            default_min_level
         );
     }
 
@@ -535,7 +804,10 @@ fn setup_linux_wayland_webview_workaround() -> u8 {
     }
 
     if level == 0 {
-        info!("Detected {} session; WebKitGTK GPU/DMABuf is enabled (workaround level 0)", session_type);
+        info!(
+            "Detected {} session; WebKitGTK GPU/DMABuf is enabled (workaround level 0)",
+            session_type
+        );
     } else if changed {
         info!(
             "Detected {} session; applied WebKitGTK workarounds (level {}) to avoid white screen",
@@ -574,10 +846,14 @@ pub fn run() {
     info!("========================================");
 
     #[cfg(target_os = "linux")]
+    maybe_reexec_appimage_with_system_wayland_client();
+
+    #[cfg(target_os = "linux")]
     let wayland_webview_workaround_level = setup_linux_wayland_webview_workaround();
 
     #[cfg(target_os = "linux")]
-    let auto_downgrade_enabled = std::env::var_os("AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND").is_none()
+    let auto_downgrade_enabled = std::env::var_os("AI_TOOLBOX_DISABLE_WAYLAND_WEBVIEW_WORKAROUND")
+        .is_none()
         && std::env::var_os("AI_TOOLBOX_WAYLAND_WEBVIEW_WORKAROUND_LEVEL").is_none()
         && wayland_webview_workaround_level < WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL
         && (!cfg!(debug_assertions)
@@ -595,8 +871,9 @@ pub fn run() {
     // Linux: Try to acquire file-based single instance lock as fallback
     // This is needed because D-Bus based detection may not work in all environments
     #[cfg(target_os = "linux")]
-    let single_instance_lock_holder: Arc<StdMutex<Option<single_instance::SingleInstanceLock>>> =
-        Arc::new(StdMutex::new(None));
+    let single_instance_lock_holder: Arc<
+        StdMutex<Option<single_instance::SingleInstanceLock>>,
+    > = Arc::new(StdMutex::new(None));
 
     #[cfg(target_os = "linux")]
     {
@@ -618,9 +895,15 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance is launched, show and focus the existing window
+            if lightweight::is_lightweight_mode() {
+                if let Err(e) = lightweight::exit_lightweight_mode(app) {
+                    warn!("Failed to exit lightweight mode on second instance: {e}");
+                }
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 // macOS: Switch back to Regular mode to show in Dock
                 #[cfg(target_os = "macos")]
@@ -634,11 +917,16 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_os::init());
+
+    #[cfg(not(test))]
+    let builder = builder.plugin(tauri_plugin_dialog::init());
+
+    builder
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_deep_link::init())
         .setup(move |app| {
             info!("开始执行 setup()...");
             let app_handle = app.handle().clone();
@@ -655,35 +943,7 @@ pub fn run() {
 
             // Create main window with platform-specific configuration
             info!("正在创建主窗口...");
-            #[cfg(target_os = "macos")]
-            {
-                use tauri::{TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
-                
-                let _window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                    .title("AI Toolbox")
-                    .inner_size(1200.0, 800.0)
-                    .min_inner_size(800.0, 600.0)
-                    .center()
-                    .title_bar_style(TitleBarStyle::Overlay)
-                    .hidden_title(true)
-                    .visible(false)
-                    .build()
-                    .expect("Failed to create main window");
-            }
-            
-            #[cfg(not(target_os = "macos"))]
-            {
-                use tauri::{WebviewUrl, WebviewWindowBuilder};
-                
-                let _window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                    .title("AI Toolbox")
-                    .inner_size(1200.0, 800.0)
-                    .min_inner_size(800.0, 600.0)
-                    .center()
-                    .visible(false)
-                    .build()
-                    .expect("Failed to create main window");
-            }
+            let _window = build_main_window(&app_handle, None).expect("Failed to create main window");
 
             // Create app data directory
             info!("正在获取应用数据目录...");
@@ -706,67 +966,156 @@ pub fn run() {
                 }
             }
 
-            let db_path = app_data_dir.join("database");
-            info!("数据库路径: {:?}", db_path);
-
             // Initialize models cache directory (file-based, replaces DB table)
             coding::open_code::free_models::set_cache_dir(app_data_dir.clone());
             coding::open_code::free_models::init_default_provider_models();
             info!("模型缓存已初始化 (models.dev.json)");
 
-            // Initialize SurrealDB
-            info!("正在初始化 SurrealDB...");
-            tauri::async_runtime::block_on(async {
-                let db = match Surreal::new::<SurrealKv>(db_path.clone()).await {
-                    Ok(db) => {
-                        info!("SurrealDB 初始化成功");
-                        db
-                    }
-                    Err(e) => {
-                        error!("SurrealDB 初始化失败: {}", e);
-                        panic!("Failed to initialize SurrealDB: {}", e);
-                    }
-                };
+            // Initialize preset models cache directory
+            coding::preset_models::set_cache_dir(app_data_dir.clone());
+            info!("预设模型缓存目录已初始化");
 
-                info!("正在选择命名空间和数据库...");
-                if let Err(e) = db.use_ns("ai_toolbox").use_db("main").await {
-                    error!("选择命名空间/数据库失败: {}", e);
-                    panic!("Failed to select namespace and database: {}", e);
+            // Initialize gateway provider profiles cache directory
+            coding::proxy_gateway::provider_profiles::set_cache_dir(app_data_dir.clone());
+            info!("Gateway 供应商 Profile 缓存目录已初始化");
+
+            // Initialize model pricing cache directory
+            db::model_pricing_seed::set_cache_dir(app_data_dir.clone());
+            info!("模型定价缓存目录已初始化");
+
+            let sqlite_db_path = app_data_dir.join(db::SQLITE_DATABASE_FILE);
+            info!("正在初始化 SQLite 主数据库: {:?}", sqlite_db_path);
+            app.manage(startup_recovery::StartupRecovery::new());
+            let db_state = match SqliteDbState::open(sqlite_db_path) {
+                Ok(state) => {
+                    info!("SQLite 主数据库初始化成功");
+                    state
                 }
-                info!("命名空间和数据库选择成功");
-
-                // Clean up legacy tables before compact to reduce export size
-                let _ = db.query("REMOVE TABLE IF EXISTS provider_models").await;
-
-                // Safe compact: export → delete → reimport (surrealkv native compact is broken)
-                let db = if db::needs_compact(&db_path) {
-                    match db::safe_compact(db, &db_path).await {
-                        Ok(new_db) => new_db,
-                        Err(e) => {
-                            error!("安全压缩失败: {}", e);
-                            let db = Surreal::new::<SurrealKv>(db_path.clone()).await
-                                .expect("Failed to reopen database after compact failure");
-                            db.use_ns("ai_toolbox").use_db("main").await
-                                .expect("Failed to select ns/db after compact failure");
-                            db
+                Err(e) => {
+                    error!("SQLite 主数据库初始化失败: {}", e);
+                    if db::migrations::is_future_schema_error(&e) {
+                        #[cfg(not(test))]
+                        {
+                            // DB schema is too new to open. Instead of a native
+                            // dialog + browser, record the recovery message and
+                            // show the main window so the frontend can render the
+                            // auto-upgrade recovery screen (no DB access).
+                            let message = db::migrations::future_schema_user_message(&e);
+                            if let Some(recovery) =
+                                app_handle.try_state::<startup_recovery::StartupRecovery>()
+                            {
+                                if let Ok(mut guard) = recovery.message.lock() {
+                                    *guard = Some(message);
+                                }
+                            }
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                            return Ok(());
                         }
                     }
-                } else {
-                    db
-                };
+                    panic!("Failed to initialize SQLite database: {}", e);
+                }
+            };
 
-                let db_state = DbState(Arc::new(Mutex::new(db.clone())));
-
-                // Skip auto-import of local settings into database on startup.
-                // Local configs are now loaded on-demand without writing to DB.
+            tauri::async_runtime::block_on(async {
+                if let Err(e) =
+                    coding::runtime_location::refresh_runtime_location_cache_async(&db_state).await
+                {
+                    warn!("运行时路径缓存初始化失败: {}", e);
+                }
+                if let Err(e) = coding::codex::init_codex_provider_from_settings(&db_state).await {
+                    warn!("Codex 默认配置初始化失败: {}", e);
+                }
+                if let Err(e) =
+                    coding::gemini_cli::init_gemini_cli_provider_from_settings(&db_state).await
+                {
+                    warn!("Gemini CLI 默认配置初始化失败: {}", e);
+                }
 
                 app.manage(db_state);
-                info!("数据库状态已注册到应用");
+                info!("SQLite 主数据库状态已注册到应用");
+
+                app.manage(coding::proxy_gateway::ProxyGatewayState::default());
+                info!("网关状态已注册到应用");
+
+                // Deep-link (`aitoolbox://`) provider import: register state and
+                // subscribe to the unified `deep-link://new-url` event. The
+                // frontend drains cold-start pending links with a command after
+                // its listener is attached.
+                app.manage(coding::deeplink::DeepLinkState::default());
+                coding::deeplink::install_deeplink_handlers(&app_handle);
+                info!("Deep-link handler 已注册");
+
+                // On Windows/Linux dev runs the scheme isn't installed, so
+                // register it at runtime. macOS registers via Info.plist on
+                // bundle, and `register_all` returns `UnsupportedPlatform`.
+                #[cfg(any(windows, target_os = "linux"))]
+                {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    // Cold-start fallback: the deep-link plugin's setup runs
+                    // BEFORE this user setup closure, so its
+                    // `handle_cli_arguments` already emitted
+                    // `deep-link://new-url` (carrying the Win/Linux argv URL)
+                    // before `on_open_url` was attached above — that early
+                    // event is lost. The plugin also stashed the URL in
+                    // `DeepLink::current`; drain it here to recover. No-op
+                    // when argv had no URL (normal launch) and on macOS (cold
+                    // launch there goes through `RunEvent::Opened`, which fires
+                    // after setup, so `on_open_url` already catches it).
+                    if let Ok(Some(urls)) = app_handle.deep_link().get_current() {
+                        for url in urls {
+                            if coding::deeplink::handle_deeplink_url(
+                                &app_handle,
+                                url.as_str(),
+                                true,
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                    if let Err(error) = app_handle.deep_link().register_all() {
+                        warn!("Deep-link scheme 运行时注册失败（dev 运行可能不影响已安装构建）: {error}");
+                    }
+                }
+
+                let gateway_start_app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let db_state = gateway_start_app.state::<SqliteDbState>();
+                    let gateway_state =
+                        gateway_start_app.state::<coding::proxy_gateway::ProxyGatewayState>();
+                    match coding::proxy_gateway::proxy_gateway_start_if_enabled_on_startup(
+                        &db_state,
+                        &db_state,
+                        &gateway_state,
+                        &gateway_start_app,
+                    )
+                    .await
+                    {
+                        Ok(Some(status)) => {
+                            info!(
+                                "代理网关已按上次运行态自动启动: {}",
+                                status.base_url.unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!("代理网关自动启动失败: {}", error);
+                        }
+                    }
+                });
+
+                // Shared official-account OAuth refresh: startup pass + per-tool intervals.
+                coding::auth_refresh::start(app_handle.clone());
+
+                // Scheduled skills auto-update: startup pass + configurable interval.
+                coding::skills::auto_update::start(app_handle.clone());
 
                 // 注册 SSH 会话状态
-                let ssh_session = coding::ssh::SshSessionState(
-                    std::sync::Arc::new(tokio::sync::Mutex::new(coding::ssh::SshSession::new()))
-                );
+                let ssh_session = coding::ssh::SshSessionState(std::sync::Arc::new(
+                    tokio::sync::Mutex::new(coding::ssh::SshSession::new()),
+                ));
                 app.manage(ssh_session);
                 info!("SSH 会话状态已注册到应用");
             });
@@ -786,56 +1135,50 @@ pub fn run() {
                 let value_for_closure = value.clone();
                 let _listener = value.listen("config-changed", move |_event| {
                     let app = value_for_closure.app_handle().clone();
+                    if let Some(gateway_state) =
+                        app.try_state::<coding::proxy_gateway::ProxyGatewayState>()
+                    {
+                        if let Err(error) = gateway_state.clear_provider_cache() {
+                            warn!("Failed to clear proxy gateway provider cache: {error}");
+                        }
+                    }
                     let _ = tauri::async_runtime::spawn(async move {
                         let _ = tray::refresh_tray_menus(&app).await;
                     });
                 });
-                
+
                 // Keep this async block alive forever to prevent listener from being dropped
                 std::future::pending::<()>().await;
             });
-            
-            
-            // Enable auto-launch if setting is true, and handle start_minimized
+
+            // Enable auto-launch if setting is true, and handle start_minimized /
+            // start_lightweight
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                let start_minimized = {
-                    let db_state = app_handle_clone.state::<DbState>();
-                    let db = db_state.0.lock().await;
-
-                    let mut result = db
-                        .query("SELECT * OMIT id FROM settings:`app` LIMIT 1")
-                        .await
-                        .ok();
-
-                    let mut start_minimized = false;
-
-                    if let Some(ref mut res) = result {
-                        let records: Result<Vec<serde_json::Value>, _> = res.take(0);
-                        if let Ok(records) = records {
-                            if let Some(record) = records.first() {
-                                let launch_on_startup = record
-                                    .get("launch_on_startup")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(true);
-
-                                if launch_on_startup {
-                                    let _ = auto_launch::enable_auto_launch();
-                                }
-
-                                start_minimized = record
-                                    .get("start_minimized")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
+                let (start_minimized, start_lightweight) = {
+                    let sqlite_state = app_handle_clone.state::<SqliteDbState>();
+                    match settings::store::load_settings_from_sqlite_state(&sqlite_state) {
+                        Ok(settings) => {
+                            if settings.launch_on_startup {
+                                let _ = auto_launch::enable_auto_launch();
                             }
+                            (settings.start_minimized, settings.start_lightweight)
+                        }
+                        Err(error) => {
+                            warn!("读取启动设置失败: {}", error);
+                            (false, false)
                         }
                     }
-
-                    start_minimized
                 }; // db lock released here
 
-                // Show window unless start_minimized is enabled
-                if !start_minimized {
+                if start_lightweight {
+                    // Enter lightweight mode at startup: destroy the window before
+                    // it is ever shown (no meaningful geometry to save).
+                    if let Err(e) = lightweight::enter_lightweight_mode(&app_handle_clone) {
+                        warn!("Failed to enter lightweight mode at startup: {e}");
+                    }
+                } else if !start_minimized {
+                    // Show window unless start_minimized is enabled
                     if let Some(window) = app_handle_clone.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
@@ -862,11 +1205,17 @@ pub fn run() {
                         // Spawn background task without awaiting
                         tauri::async_runtime::spawn(async move {
                             // Re-obtain state inside the spawned task
-                            let db_state = app.state::<crate::DbState>();
+                            let db_state = app.state::<crate::SqliteDbState>();
                             if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                                 return;
                             }
-                            let result = coding::wsl::wsl_sync(db_state, app.clone(), Some("opencode".to_string()), None).await;
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("opencode".to_string()),
+                                None,
+                            )
+                            .await;
                             // Ignore result - fire and forget
                             let _ = result;
                         });
@@ -885,11 +1234,17 @@ pub fn run() {
                         // Spawn background task without awaiting
                         tauri::async_runtime::spawn(async move {
                             // Re-obtain state inside the spawned task
-                            let db_state = app.state::<crate::DbState>();
+                            let db_state = app.state::<crate::SqliteDbState>();
                             if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                                 return;
                             }
-                            let result = coding::wsl::wsl_sync(db_state, app.clone(), Some("claude".to_string()), None).await;
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("claude".to_string()),
+                                None,
+                            )
+                            .await;
                             // Ignore result - fire and forget
                             let _ = result;
                         });
@@ -908,17 +1263,46 @@ pub fn run() {
                         // Spawn background task without awaiting
                         tauri::async_runtime::spawn(async move {
                             // Re-obtain state inside the spawned task
-                            let db_state = app.state::<crate::DbState>();
+                            let db_state = app.state::<crate::SqliteDbState>();
                             if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                                 return;
                             }
-                            let result = coding::wsl::wsl_sync(db_state, app.clone(), Some("codex".to_string()), None).await;
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("codex".to_string()),
+                                None,
+                            )
+                            .await;
                             // Ignore result - fire and forget
                             let _ = result;
                         });
                     });
 
                     // Keep this async block alive forever to prevent listener from being dropped
+                    std::future::pending::<()>().await;
+                });
+
+                // Grok sync listener
+                let grok_sync_app = app_handle.clone();
+                let grok_sync_listener_app = grok_sync_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = grok_sync_app.listen("wsl-sync-request-grok", move |_event| {
+                        let app = grok_sync_listener_app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let _ = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("grok".to_string()),
+                                None,
+                            )
+                            .await;
+                        });
+                    });
                     std::future::pending::<()>().await;
                 });
 
@@ -931,17 +1315,177 @@ pub fn run() {
                         // Spawn background task without awaiting
                         tauri::async_runtime::spawn(async move {
                             // Re-obtain state inside the spawned task
-                            let db_state = app.state::<crate::DbState>();
+                            let db_state = app.state::<crate::SqliteDbState>();
                             if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                                 return;
                             }
-                            let result = coding::wsl::wsl_sync(db_state, app.clone(), Some("openclaw".to_string()), None).await;
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("openclaw".to_string()),
+                                None,
+                            )
+                            .await;
                             // Ignore result - fire and forget
                             let _ = result;
                         });
                     });
 
                     // Keep this async block alive forever to prevent listener from being dropped
+                    std::future::pending::<()>().await;
+                });
+
+                // Gemini CLI sync listener
+                let app_gemini = app_handle.clone();
+                let app_gemini_clone = app_gemini.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_gemini.listen("wsl-sync-request-geminicli", move |_event| {
+                        let app = app_gemini_clone.clone();
+                        // Spawn background task without awaiting
+                        tauri::async_runtime::spawn(async move {
+                            // Re-obtain state inside the spawned task
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("geminicli".to_string()),
+                                None,
+                            )
+                            .await;
+                            // Ignore result - fire and forget
+                            let _ = result;
+                        });
+                    });
+
+                    // Keep this async block alive forever to prevent listener from being dropped
+                    std::future::pending::<()>().await;
+                });
+
+                // Pi sync listener
+                let app_pi = app_handle.clone();
+                let app_pi_clone = app_pi.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_pi.listen("wsl-sync-request-pi", move |_event| {
+                        let app = app_pi_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("pi".to_string()),
+                                None,
+                            )
+                            .await;
+                            let _ = result;
+                        });
+                    });
+
+                    std::future::pending::<()>().await;
+                });
+
+                // Oh My Pi sync listener
+                let app_omp = app_handle.clone();
+                let app_omp_clone = app_omp.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_omp.listen("wsl-sync-request-omp", move |_event| {
+                        let app = app_omp_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("oh_my_pi".to_string()),
+                                None,
+                            )
+                            .await;
+                            let _ = result;
+                        });
+                    });
+
+                    std::future::pending::<()>().await;
+                });
+
+                // Hermes sync listener
+                let app_hermes = app_handle.clone();
+                let app_hermes_clone = app_hermes.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_hermes.listen("wsl-sync-request-hermes", move |_event| {
+                        let app = app_hermes_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("hermes".to_string()),
+                                None,
+                            )
+                            .await;
+                            let _ = result;
+                        });
+                    });
+
+                    std::future::pending::<()>().await;
+                });
+
+                // dsh sync listener
+                let app_dsh = app_handle.clone();
+                let app_dsh_clone = app_dsh.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_dsh.listen("wsl-sync-request-dsh", move |_event| {
+                        let app = app_dsh_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("dsh".to_string()),
+                                None,
+                            )
+                            .await;
+                            let _ = result;
+                        });
+                    });
+
+                    std::future::pending::<()>().await;
+                });
+
+                // Kimi sync listener
+                let app_kimi = app_handle.clone();
+                let app_kimi_clone = app_kimi.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app_kimi.listen("wsl-sync-request-kimi", move |_event| {
+                        let app = app_kimi_clone.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let db_state = app.state::<crate::SqliteDbState>();
+                            if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
+                                return;
+                            }
+                            let result = coding::wsl::wsl_sync(
+                                db_state,
+                                app.clone(),
+                                Some("kimi".to_string()),
+                                None,
+                            )
+                            .await;
+                            let _ = result;
+                        });
+                    });
+
                     std::future::pending::<()>().await;
                 });
 
@@ -952,7 +1496,7 @@ pub fn run() {
                     let _ = app_mcp.listen("mcp-changed", move |_event| {
                         let app = app_mcp_clone.clone();
                         tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
+                            let db_state = app.state::<crate::SqliteDbState>();
                             if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                                 return;
                             }
@@ -970,11 +1514,15 @@ pub fn run() {
                     let _ = app_skills.listen("skills-changed", move |_event| {
                         let app = app_skills_clone.clone();
                         tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
+                            let db_state = app.state::<crate::SqliteDbState>();
                             if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                                 return;
                             }
-                            let _ = coding::wsl::sync_skills_to_wsl(&db_state, app.clone()).await;
+                            if let Err(error) =
+                                coding::wsl::sync_skills_to_wsl(&db_state, app.clone()).await
+                            {
+                                log::warn!("Event-driven Skills WSL sync failed: {}", error);
+                            }
                         });
                     });
 
@@ -989,7 +1537,22 @@ pub fn run() {
                 let app_clone = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    let db_state = app_clone.state::<crate::DbState>();
+
+                    // A restore-specific recovery task starts one second later and owns the
+                    // ordering of local re-apply -> Skills -> MCP -> WSL. Do not race it with the
+                    // normal startup full sync while either restore flag is still present.
+                    if let Ok(app_data_dir) = app_clone.path().app_data_dir() {
+                        let resync_flag = app_data_dir
+                            .join(settings::backup::utils::RESYNC_REQUIRED_FLAG_FILENAME);
+                        let reapply_flag =
+                            coding::reapply_applied_runtime::reapply_flag_path(&app_data_dir);
+                        if resync_flag.exists() || reapply_flag.exists() {
+                            info!("WSL startup sync deferred to post-restore recovery");
+                            return;
+                        }
+                    }
+
+                    let db_state = app_clone.state::<crate::SqliteDbState>();
                     if !coding::wsl::is_wsl_auto_sync_enabled(&db_state).await {
                         return;
                     }
@@ -999,170 +1562,35 @@ pub fn run() {
                 });
             }
 
+            // Restore SSH session from saved config on cold start without triggering full sync.
+            {
+                let app_ssh_restore = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+
+                    let db_state = app_ssh_restore.state::<SqliteDbState>();
+                    let session_state = app_ssh_restore.state::<coding::ssh::SshSessionState>();
+                    let db = db_state.db();
+
+                    match coding::ssh::restore_ssh_session_from_saved_config(
+                        &db,
+                        session_state.inner(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            log::info!("SSH startup session restore completed");
+                        }
+                        Err(error) => {
+                            log::warn!("SSH startup session restore failed: {}", error);
+                        }
+                    }
+                });
+            }
+
             // SSH sync listeners (all platforms)
             {
                 // SSH sync request listeners (module-specific)
-                let app_ssh1 = app_handle.clone();
-                let app_ssh1_clone = app_ssh1.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = app_ssh1.listen("ssh-sync-request-opencode", move |_event| {
-                        let app = app_ssh1_clone.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
-                            let session_state = app.state::<coding::ssh::SshSessionState>();
-                            let _ = coding::ssh::ssh_sync(
-                                db_state,
-                                session_state,
-                                app.clone(),
-                                Some("opencode".to_string()),
-                                None,
-                            )
-                            .await;
-                        });
-                    });
-                    std::future::pending::<()>().await;
-                });
-
-                let app_ssh2 = app_handle.clone();
-                let app_ssh2_clone = app_ssh2.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = app_ssh2.listen("ssh-sync-request-claude", move |_event| {
-                        let app = app_ssh2_clone.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
-                            let session_state = app.state::<coding::ssh::SshSessionState>();
-                            let _ = coding::ssh::ssh_sync(
-                                db_state,
-                                session_state,
-                                app.clone(),
-                                Some("claude".to_string()),
-                                None,
-                            )
-                            .await;
-                        });
-                    });
-                    std::future::pending::<()>().await;
-                });
-
-                let app_ssh3 = app_handle.clone();
-                let app_ssh3_clone = app_ssh3.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = app_ssh3.listen("ssh-sync-request-codex", move |_event| {
-                        let app = app_ssh3_clone.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
-                            let session_state = app.state::<coding::ssh::SshSessionState>();
-                            let _ = coding::ssh::ssh_sync(
-                                db_state,
-                                session_state,
-                                app.clone(),
-                                Some("codex".to_string()),
-                                None,
-                            )
-                            .await;
-                        });
-                    });
-                    std::future::pending::<()>().await;
-                });
-
-                // MCP-changed listener - triggers MCP SSH sync
-                let app_ssh_mcp = app_handle.clone();
-                let app_ssh_mcp_clone = app_ssh_mcp.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = app_ssh_mcp.listen("mcp-changed", move |_event| {
-                        let app = app_ssh_mcp_clone.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
-                            let session_state = app.state::<coding::ssh::SshSessionState>();
-                            let mut session = session_state.0.lock().await;
-                            // SSH 未配置连接时跳过
-                            if session.conn().is_none() {
-                                return;
-                            }
-                            if session.ensure_connected().await.is_err() {
-                                return;
-                            }
-                            let _ = coding::ssh::sync_mcp_to_ssh(&db_state, &session, app.clone()).await;
-                        });
-                    });
-                    std::future::pending::<()>().await;
-                });
-
-                // Skills-changed listener - triggers Skills SSH sync
-                let app_ssh_skills = app_handle.clone();
-                let app_ssh_skills_clone = app_ssh_skills.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = app_ssh_skills.listen("skills-changed", move |_event| {
-                        let app = app_ssh_skills_clone.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let db_state = app.state::<crate::DbState>();
-                            let session_state = app.state::<coding::ssh::SshSessionState>();
-                            let mut session = session_state.0.lock().await;
-                            // SSH 未配置连接时跳过
-                            if session.conn().is_none() {
-                                return;
-                            }
-                            if session.ensure_connected().await.is_err() {
-                                return;
-                            }
-                            let _ = coding::ssh::sync_skills_to_ssh(&db_state, &session, app.clone()).await;
-                        });
-                    });
-                    std::future::pending::<()>().await;
-                });
-
-                // SSH sync on app startup (delayed)
-                let app_ssh_startup = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-
-                    let db_state = app_ssh_startup.state::<crate::DbState>();
-                    let session_state = app_ssh_startup.state::<coding::ssh::SshSessionState>();
-
-                    // 先检查是否启用，避免不必要的数据库查询
-                    let config = {
-                        let db = db_state.0.lock().await;
-                        match coding::ssh::get_ssh_config_internal(&db, true).await {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        }
-                    };
-
-                    if !config.enabled || config.active_connection_id.is_empty() {
-                        return;
-                    }
-
-                    // 找到活动连接，建立主连接
-                    if let Some(conn) = config
-                        .connections
-                        .iter()
-                        .find(|c| c.id == config.active_connection_id)
-                    {
-                        let mut session = session_state.0.lock().await;
-                        if let Err(e) = session.connect(conn).await {
-                            log::warn!("SSH 启动主连接失败: {}", e);
-                            return;
-                        }
-
-                        // 主连接建立后，执行首次同步
-                        if session.try_acquire_sync_lock() {
-                            let result = coding::ssh::do_full_sync(
-                                &db_state,
-                                &app_ssh_startup,
-                                &session,
-                                &config,
-                                None,
-                                None,
-                            )
-                            .await;
-                            session.release_sync_lock();
-                            let _ =
-                                coding::ssh::update_sync_status(&db_state, &result).await;
-                            let _ = app_ssh_startup.emit("ssh-sync-completed", result);
-                        }
-                    }
-                });
-
                 // SSH: 定时健康检查（每60秒）
                 let app_ssh_health = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1184,7 +1612,8 @@ pub fn run() {
                             log::info!("SSH 健康检查：连接已断开，尝试重连...");
                             if let Err(e) = session.ensure_connected().await {
                                 log::warn!("SSH 重连失败: {}", e);
-                                let _ = app_ssh_health.emit("ssh-connection-status", "disconnected");
+                                let _ =
+                                    app_ssh_health.emit("ssh-connection-status", "disconnected");
                             } else {
                                 log::info!("SSH 重连成功");
                                 let _ = app_ssh_health.emit("ssh-connection-status", "connected");
@@ -1202,13 +1631,20 @@ pub fn run() {
                     tokio::time::sleep(Duration::from_secs(5)).await;
 
                     loop {
-                        let db_state = app_clone.state::<crate::DbState>();
-                        let days = coding::skills::cache_cleanup::get_git_cache_cleanup_days(&db_state).await;
+                        let db_state = app_clone.state::<crate::SqliteDbState>();
+                        let days =
+                            coding::skills::cache_cleanup::get_git_cache_cleanup_days(&db_state)
+                                .await;
                         if days > 0 {
                             let max_age = Duration::from_secs((days as u64) * 86400);
-                            match coding::skills::cache_cleanup::cleanup_git_cache_dirs(&app_clone, max_age) {
+                            match coding::skills::cache_cleanup::cleanup_git_cache_dirs(
+                                &app_clone, max_age,
+                            ) {
                                 Ok(count) if count > 0 => {
-                                    info!("Git cache auto-cleanup: removed {} expired cache(s)", count);
+                                    info!(
+                                        "Git cache auto-cleanup: removed {} expired cache(s)",
+                                        count
+                                    );
                                 }
                                 Err(e) => {
                                     warn!("Git cache auto-cleanup failed: {}", e);
@@ -1223,7 +1659,7 @@ pub fn run() {
                 });
             }
 
-            // Check for resync flag after restore (delayed to ensure DB is ready)
+            // Check for resync / re-apply flags after restore (delayed to ensure DB is ready)
             {
                 let app_clone = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1234,18 +1670,101 @@ pub fn run() {
                         Ok(dir) => dir,
                         Err(_) => return,
                     };
-                    let resync_flag = app_data_dir.join(".resync_required");
+                    let resync_flag =
+                        app_data_dir.join(settings::backup::utils::RESYNC_REQUIRED_FLAG_FILENAME);
+                    let reapply_flag =
+                        coding::reapply_applied_runtime::reapply_flag_path(&app_data_dir);
+                    let need_resync = resync_flag.exists();
+                    let need_reapply = reapply_flag.exists();
+                    let restored_wsl_modules = if need_resync {
+                        settings::backup::utils::read_post_restore_resync_wsl_modules(&resync_flag)
+                    } else {
+                        Vec::new()
+                    };
 
-                    if resync_flag.exists() {
-                        info!("Resync flag detected, starting skills and MCP resync...");
+                    if !need_resync && !need_reapply {
+                        return;
+                    }
 
-                        // Remove the flag file first to prevent repeated resync
+                    // Remove flags first to prevent repeated loops on failure.
+                    if need_reapply {
+                        let _ = fs::remove_file(&reapply_flag);
+                    }
+                    if need_resync {
                         let _ = fs::remove_file(&resync_flag);
+                    }
 
-                        let db_state = app_clone.state::<crate::DbState>();
+                    info!(
+                        "Post-restore flags detected (reapply={}, resync={}, restored_wsl_modules={:?}), starting serial recovery...",
+                        need_reapply, need_resync, restored_wsl_modules
+                    );
 
+                    let db_state = app_clone.state::<crate::SqliteDbState>();
+                    if let Err(e) =
+                        coding::runtime_location::refresh_runtime_location_cache_async(
+                            &db_state.db(),
+                        )
+                        .await
+                    {
+                        warn!("Post-restore runtime location cache refresh failed: {}", e);
+                    }
+
+                    // Re-apply applied providers/prompts before skills/MCP so MCP can write into
+                    // the freshly aligned CLI configs.
+                    let mut changed_wsl_modules = restored_wsl_modules;
+                    let reapply_mode =
+                        coding::reapply_applied_runtime::restore_reapply_mode(
+                            need_reapply,
+                            need_resync,
+                        );
+                    if reapply_mode
+                        != coding::reapply_applied_runtime::RestoreReapplyMode::None
+                    {
+                        let summary = match reapply_mode {
+                            coding::reapply_applied_runtime::RestoreReapplyMode::Full => {
+                                coding::reapply_applied_runtime::reapply_applied_runtime_after_restore(
+                                    &app_clone,
+                                )
+                                .await
+                            }
+                            coding::reapply_applied_runtime::RestoreReapplyMode::PluginsOnly => {
+                                coding::reapply_applied_runtime::reapply_applied_opencode_plugins_after_restore(
+                                    &app_clone,
+                                )
+                                .await
+                            }
+                            coding::reapply_applied_runtime::RestoreReapplyMode::None => {
+                                unreachable!("no re-apply mode was filtered above")
+                            }
+                        };
+                        for module in &summary.changed_modules {
+                            if !changed_wsl_modules
+                                .iter()
+                                .any(|existing| existing == module)
+                            {
+                                changed_wsl_modules.push(module.clone());
+                            }
+                        }
+                        info!(
+                            "Post-restore re-apply completed: mode={:?}, applied={}, warnings={}, changed_wsl_modules={:?}",
+                            reapply_mode,
+                            summary.applied.len(),
+                            summary.warnings.len(),
+                            changed_wsl_modules
+                        );
+                        for warning in summary.warnings {
+                            warn!("Post-restore re-apply warning: {}", warning);
+                        }
+                    }
+
+                    if need_resync {
                         // Resync skills
-                        match coding::skills::commands::skills_resync_all(app_clone.clone(), db_state.clone()).await {
+                        match coding::skills::commands::skills_resync_all(
+                            app_clone.clone(),
+                            db_state.clone(),
+                        )
+                        .await
+                        {
                             Ok(synced) => {
                                 info!("Skills resync completed: {} items synced", synced.len());
                             }
@@ -1255,18 +1774,64 @@ pub fn run() {
                         }
 
                         // Resync MCP servers
-                        match coding::mcp::commands::mcp_sync_all(app_clone.clone(), db_state).await {
+                        match coding::mcp::commands::mcp_sync_all_without_events(
+                            app_clone.clone(),
+                            db_state.inner(),
+                        )
+                        .await
+                        {
                             Ok(results) => {
                                 let success_count = results.iter().filter(|r| r.success).count();
-                                info!("MCP resync completed: {}/{} succeeded", success_count, results.len());
+                                info!(
+                                    "MCP resync completed: {}/{} succeeded",
+                                    success_count,
+                                    results.len()
+                                );
                             }
                             Err(e) => {
                                 warn!("MCP resync failed: {}", e);
                             }
                         }
-
-                        info!("Post-restore resync completed");
                     }
+
+                    // Keep restore recovery single-threaded through the final WSL projection.
+                    // A full-sync call is used so MCP/Skills are propagated once, while unchanged
+                    // CLI modules are excluded to preserve their local runtime files.
+                    if cfg!(target_os = "windows")
+                        && coding::wsl::is_wsl_auto_sync_enabled(&db_state).await
+                    {
+                        let skip_modules =
+                            coding::reapply_applied_runtime::unchanged_wsl_modules(
+                                &changed_wsl_modules,
+                            );
+                        match coding::wsl::wsl_sync(
+                            db_state,
+                            app_clone.clone(),
+                            None,
+                            Some(skip_modules),
+                        )
+                        .await
+                        {
+                            Ok(result) if result.success => {
+                                info!(
+                                    "Post-restore WSL sync completed: {} file(s) synced",
+                                    result.synced_files.len()
+                                );
+                            }
+                            Ok(result) => {
+                                warn!(
+                                    "Post-restore WSL sync completed with {} error(s): {:?}",
+                                    result.errors.len(),
+                                    result.errors
+                                );
+                            }
+                            Err(error) => {
+                                warn!("Post-restore WSL sync failed: {}", error);
+                            }
+                        }
+                    }
+
+                    info!("Post-restore recovery completed");
                 });
             }
 
@@ -1278,49 +1843,44 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if APP_EXIT_REQUESTED.load(Ordering::SeqCst) {
+                    return;
+                }
+
                 let app_handle = window.app_handle().clone();
-                
-                // Check minimize_to_tray_on_close setting with default value
-                let minimize_to_tray = {
-                    let db_state = app_handle.state::<DbState>();
-                    let db = db_state.0.blocking_lock();
-                    
-                    // Query settings synchronously using block_on
-                    let query_result = tauri::async_runtime::block_on(async {
-                        db.query("SELECT * OMIT id FROM settings:`app` LIMIT 1").await
-                    });
-                    
-                    match query_result {
-                        Ok(mut res) => {
-                            let records: Result<Vec<serde_json::Value>, surrealdb::Error> = res.take(0);
-                            match records {
-                                Ok(records) => {
-                                    if let Some(record) = records.first() {
-                                        record
-                                            .get("minimize_to_tray_on_close")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(true)
-                                    } else {
-                                        true
-                                    }
-                                }
-                                Err(_) => true,
-                            }
-                        }
-                        Err(_) => true,
-                    }
-                };
-                
+
+                // Check tray-on-close settings with default values.
+                let (minimize_to_tray, lightweight_on_close) = app_handle
+                    .try_state::<SqliteDbState>()
+                    .and_then(|sqlite_state| {
+                        settings::store::load_settings_from_sqlite_state(&sqlite_state).ok()
+                    })
+                    .map(|settings| {
+                        (
+                            settings.minimize_to_tray_on_close,
+                            settings.lightweight_on_close,
+                        )
+                    })
+                    .unwrap_or((true, false));
+
                 if minimize_to_tray {
-                    // Hide window instead of closing
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.hide();
-                        
-                        // macOS: Switch to Accessory mode to hide from Dock
-                        #[cfg(target_os = "macos")]
-                        {
-                            use tauri::ActivationPolicy;
-                            let _ = app_handle.set_activation_policy(ActivationPolicy::Accessory);
+                    if lightweight_on_close {
+                        // Destroy the window entirely to release WebView memory.
+                        if let Err(e) = lightweight::enter_lightweight_mode(&app_handle) {
+                            warn!("Failed to enter lightweight mode on close: {e}");
+                        }
+                    } else {
+                        // Hide window instead of closing
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+
+                            // macOS: Switch to Accessory mode to hide from Dock
+                            #[cfg(target_os = "macos")]
+                            {
+                                use tauri::ActivationPolicy;
+                                let _ =
+                                    app_handle.set_activation_policy(ActivationPolicy::Accessory);
+                            }
                         }
                     }
                     // Prevent default close behavior
@@ -1332,17 +1892,64 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Common
             open_folder,
+            open_existing_folder,
             set_window_background_color,
             // Update
             update::check_for_updates,
             update::install_update,
+            // Startup recovery (DB-free; usable when database is not opened)
+            startup_recovery::get_startup_recovery,
+            startup_recovery::exit_app,
             // Settings
             settings::get_settings,
             settings::save_settings,
+            settings::get_session_detail_filters,
+            settings::save_session_detail_filters,
+            settings::get_provider_list_state,
+            settings::save_provider_sort_mode,
+            settings::record_provider_last_used,
+            settings::probe_manual_cli_version,
+            settings::set_manual_cli_path,
+            settings::detect_manual_cli_path,
+            settings::normalize_backup_custom_entry_path,
+            settings::list_backup_file_filter_path_options,
             settings::set_auto_launch,
             settings::get_auto_launch_status,
             settings::restart_app,
             settings::test_proxy_connection,
+            // Proxy Gateway
+            coding::proxy_gateway::proxy_gateway_get_settings,
+            coding::proxy_gateway::proxy_gateway_update_settings,
+            coding::proxy_gateway::proxy_gateway_start,
+            coding::proxy_gateway::proxy_gateway_stop,
+            coding::proxy_gateway::proxy_gateway_restart,
+            coding::proxy_gateway::proxy_gateway_status,
+            coding::proxy_gateway::proxy_gateway_health_check,
+            coding::proxy_gateway::proxy_gateway_check_port_available,
+            coding::proxy_gateway::proxy_gateway_cli_statuses,
+            coding::proxy_gateway::proxy_gateway_cli_status,
+            coding::proxy_gateway::proxy_gateway_engage_single,
+            coding::proxy_gateway::proxy_gateway_engage_failover,
+            coding::proxy_gateway::proxy_gateway_disengage_failover,
+            coding::proxy_gateway::proxy_gateway_restore_cli_direct,
+            coding::proxy_gateway::proxy_gateway_switch_primary_provider,
+            coding::proxy_gateway::proxy_gateway_stop_preflight,
+            coding::proxy_gateway::proxy_gateway_request_logs,
+            coding::proxy_gateway::proxy_gateway_request_log_detail,
+            coding::proxy_gateway::proxy_gateway_export_request_log_detail,
+            coding::proxy_gateway::proxy_gateway_usage_summary,
+            coding::proxy_gateway::proxy_gateway_usage_summary_by_cli,
+            coding::proxy_gateway::proxy_gateway_usage_trends,
+            coding::proxy_gateway::proxy_gateway_provider_stats,
+            coding::proxy_gateway::proxy_gateway_model_stats,
+            coding::proxy_gateway::proxy_gateway_data_source_breakdown,
+            coding::proxy_gateway::proxy_gateway_import_session_usage,
+            coding::proxy_gateway::proxy_gateway_test_provider_model_connectivity,
+            coding::proxy_gateway::get_model_pricing_list,
+            coding::proxy_gateway::upsert_model_pricing,
+            coding::proxy_gateway::delete_model_pricing,
+            coding::proxy_gateway::fetch_remote_model_pricing,
+            coding::proxy_gateway::proxy_gateway_model_health_entries,
             // Backup - Local
             settings::backup::backup_database,
             settings::backup::restore_database,
@@ -1362,23 +1969,140 @@ pub fn run() {
             coding::claude_code::reorder_claude_providers,
             coding::claude_code::select_claude_provider,
             coding::claude_code::get_claude_config_path,
+            coding::claude_code::get_claude_root_path_info,
             coding::claude_code::reveal_claude_config_folder,
+            coding::claude_code::launch_claude_provider_cli,
             coding::claude_code::read_claude_settings,
             coding::claude_code::apply_claude_config,
             coding::claude_code::toggle_claude_code_provider_disabled,
             coding::claude_code::get_claude_common_config,
+            coding::claude_code::extract_claude_common_config_from_current_file,
             coding::claude_code::save_claude_common_config,
             coding::claude_code::save_claude_local_config,
+            coding::claude_code::list_claude_all_api_hub_providers,
+            coding::claude_code::resolve_claude_all_api_hub_providers,
+            coding::claude_code::list_claude_prompt_configs,
+            coding::claude_code::create_claude_prompt_config,
+            coding::claude_code::update_claude_prompt_config,
+            coding::claude_code::delete_claude_prompt_config,
+            coding::claude_code::disable_claude_prompt_config,
+            coding::claude_code::apply_claude_prompt_config,
+            coding::claude_code::reorder_claude_prompt_configs,
+            coding::claude_code::save_claude_local_prompt_config,
             coding::claude_code::get_claude_plugin_status,
             coding::claude_code::apply_claude_plugin_config,
+            coding::claude_code::get_claude_plugin_runtime_status,
+            coding::claude_code::list_claude_installed_plugins,
+            coding::claude_code::list_claude_known_marketplaces,
+            coding::claude_code::list_claude_marketplace_plugins,
+            coding::claude_code::add_claude_marketplace,
+            coding::claude_code::update_claude_marketplace,
+            coding::claude_code::set_claude_marketplace_auto_update,
+            coding::claude_code::remove_claude_marketplace,
+            coding::claude_code::install_claude_plugin_user_scope,
+            coding::claude_code::enable_claude_plugin_user_scope,
+            coding::claude_code::disable_claude_plugin_user_scope,
+            coding::claude_code::set_claude_plugins_user_scope_enabled,
+            coding::claude_code::update_claude_plugin_user_scope,
+            coding::claude_code::uninstall_claude_plugin_user_scope,
             coding::claude_code::get_claude_onboarding_status,
             coding::claude_code::apply_claude_onboarding_skip,
             coding::claude_code::clear_claude_onboarding_skip,
-// OpenCode
+            // Claude Desktop
+            coding::claude_desktop::get_claude_desktop_paths,
+            coding::claude_desktop::get_claude_desktop_status,
+            coding::claude_desktop::get_claude_desktop_preview,
+            coding::claude_desktop::list_claude_desktop_providers,
+            coding::claude_desktop::create_claude_desktop_provider,
+            coding::claude_desktop::update_claude_desktop_provider,
+            coding::claude_desktop::toggle_claude_desktop_provider_disabled,
+            coding::claude_desktop::delete_claude_desktop_provider,
+            coding::claude_desktop::reorder_claude_desktop_providers,
+            coding::claude_desktop::select_claude_desktop_provider,
+            coding::claude_desktop::apply_claude_desktop_provider,
+            coding::claude_desktop::get_claude_desktop_common_config,
+            coding::claude_desktop::save_claude_desktop_common_config,
+            coding::claude_desktop::import_claude_desktop_providers_from_claude,
+            coding::claude_desktop::ensure_claude_desktop_official_provider,
+            coding::claude_desktop::list_claude_desktop_prompt_configs,
+            coding::claude_desktop::create_claude_desktop_prompt_config,
+            coding::claude_desktop::update_claude_desktop_prompt_config,
+            coding::claude_desktop::delete_claude_desktop_prompt_config,
+            coding::claude_desktop::disable_claude_desktop_prompt_config,
+            coding::claude_desktop::apply_claude_desktop_prompt_config,
+            coding::claude_desktop::reorder_claude_desktop_prompt_configs,
+            coding::claude_desktop::save_claude_desktop_local_prompt_config,
+            coding::claude_desktop::list_claude_desktop_all_api_hub_providers,
+            coding::claude_desktop::resolve_claude_desktop_all_api_hub_providers,
+            // Hermes
+            coding::hermes::get_hermes_default_config_dir,
+            coding::hermes::get_hermes_config_dir_without_db,
+            coding::hermes::get_hermes_root_path_info,
+            coding::hermes::get_hermes_settings_config,
+            coding::hermes::save_hermes_settings_config,
+            coding::hermes::read_hermes_runtime_config,
+            coding::hermes::save_hermes_models_provider,
+            coding::hermes::delete_hermes_runtime_provider,
+            coding::hermes::save_hermes_model_settings,
+            coding::hermes::save_hermes_other_settings,
+            coding::hermes::get_hermes_memory,
+            coding::hermes::set_hermes_memory,
+            coding::hermes::get_hermes_memory_limits,
+            coding::hermes::set_hermes_memory_enabled,
+            coding::hermes::list_hermes_prompt_configs,
+            coding::hermes::create_hermes_prompt_config,
+            coding::hermes::update_hermes_prompt_config,
+            coding::hermes::delete_hermes_prompt_config,
+            coding::hermes::disable_hermes_prompt_config,
+            coding::hermes::apply_hermes_prompt_config,
+            coding::hermes::reorder_hermes_prompt_configs,
+            coding::hermes::save_hermes_local_prompt_config,
+            coding::hermes::open_hermes_web_ui,
+            coding::hermes::launch_hermes_dashboard,
+            coding::hermes::list_hermes_all_api_hub_providers,
+            coding::hermes::resolve_hermes_all_api_hub_providers,
+            coding::dsh::get_dsh_default_config_dir,
+            coding::dsh::get_dsh_config_dir_without_db,
+            coding::dsh::get_dsh_path_info,
+            coding::dsh::get_dsh_settings_config,
+            coding::dsh::save_dsh_settings_config,
+            coding::dsh::read_dsh_runtime_config,
+            coding::dsh::save_dsh_models_provider,
+            coding::dsh::delete_dsh_runtime_provider,
+            coding::dsh::save_dsh_model_settings,
+            coding::dsh::save_dsh_credential,
+            coding::dsh::delete_dsh_credential,
+            coding::dsh::get_dsh_credential_value,
+            coding::dsh::save_dsh_other_settings,
+            coding::dsh::list_dsh_prompt_configs,
+            coding::dsh::create_dsh_prompt_config,
+            coding::dsh::update_dsh_prompt_config,
+            coding::dsh::delete_dsh_prompt_config,
+            coding::dsh::disable_dsh_prompt_config,
+            coding::dsh::apply_dsh_prompt_config,
+            coding::dsh::reorder_dsh_prompt_configs,
+            coding::dsh::save_dsh_local_prompt_config,
+            coding::dsh::list_dsh_all_api_hub_providers,
+            coding::dsh::resolve_dsh_all_api_hub_providers,
+            coding::dsh::open_dsh_web_ui,
+            coding::dsh::launch_dsh_dashboard,
+            coding::dsh::check_dsh_agent_instructions,
+            coding::dsh::enable_dsh_agent_instructions,
+            // Preset Models
+            coding::preset_models::fetch_remote_preset_models,
+            coding::preset_models::load_cached_preset_models,
+            // Gateway Provider Profiles
+            coding::proxy_gateway::provider_profiles::fetch_remote_gateway_provider_profiles,
+            coding::proxy_gateway::provider_profiles::load_cached_gateway_provider_profiles,
+            // OpenCode
             coding::open_code::get_opencode_config_path,
             coding::open_code::get_opencode_config_path_info,
             coding::open_code::read_opencode_config,
+            coding::open_code::get_opencode_preview,
             coding::open_code::save_opencode_config,
+            coding::open_code::list_opencode_markdown_agents,
+            coding::open_code::save_opencode_markdown_agent,
+            coding::open_code::delete_opencode_markdown_agent,
             coding::open_code::get_opencode_common_config,
             coding::open_code::save_opencode_common_config,
             coding::open_code::fetch_provider_models,
@@ -1395,11 +2119,82 @@ pub fn run() {
             coding::open_code::list_opencode_favorite_providers,
             coding::open_code::upsert_opencode_favorite_provider,
             coding::open_code::delete_opencode_favorite_provider,
+            coding::open_code::list_opencode_all_api_hub_providers,
+            coding::open_code::resolve_opencode_all_api_hub_providers,
+            coding::open_code::list_opencode_prompt_configs,
+            coding::open_code::create_opencode_prompt_config,
+            coding::open_code::update_opencode_prompt_config,
+            coding::open_code::delete_opencode_prompt_config,
+            coding::open_code::disable_opencode_prompt_config,
+            coding::open_code::apply_opencode_prompt_config,
+            coding::open_code::reorder_opencode_prompt_configs,
+            coding::open_code::save_opencode_local_prompt_config,
+            coding::session_manager::list_tool_sessions,
+            coding::session_manager::list_tool_session_paths,
+            coding::session_manager::get_tool_session_detail,
+            coding::session_manager::list_tool_session_subagents,
+            coding::session_manager::get_tool_subagent_session_detail,
+            coding::session_manager::delete_tool_session,
+            coding::session_manager::delete_tool_sessions,
+            coding::session_manager::export_tool_session,
+            coding::session_manager::export_tool_sessions,
+            coding::session_manager::import_tool_session,
+            coding::session_manager::rename_tool_session,
+            coding::all_api_hub::has_all_api_hub_extension,
+            coding::all_api_hub::get_all_api_hub_provider_models,
+            coding::cc_switch::has_cc_switch_db,
+            coding::cc_switch::list_cc_switch_providers,
+            coding::deeplink::mark_deeplink_frontend_ready,
+            coding::deeplink::import_from_deeplink_unified,
+            // Magic Context
+            coding::magic_context::read_magic_context_config,
+            coding::magic_context::save_magic_context_config,
+            coding::magic_context::create_magic_context_config,
+            coding::magic_context::run_magic_context_doctor,
             // Codex
             coding::codex::get_codex_config_dir_path,
+            coding::codex::get_codex_root_path_info,
+            coding::codex::get_codex_history_sync_status,
+            coding::codex::backup_codex_history,
+            coding::codex::sync_codex_history,
+            coding::codex::restore_latest_codex_history_backup,
+            coding::codex::set_codex_unified_session_history,
+            coding::codex::set_codex_preserve_official_auth_on_switch,
+            coding::codex::has_codex_unified_history_backup,
+            coding::codex::restore_codex_unified_session_history,
             coding::codex::get_codex_config_file_path,
+            coding::codex::get_codex_plugin_runtime_status,
+            coding::codex::list_codex_installed_plugins,
+            coding::codex::list_codex_marketplaces,
+            coding::codex::list_codex_marketplace_plugins,
+            coding::codex::list_codex_plugin_workspace_roots,
+            coding::codex::add_codex_plugin_workspace_root,
+            coding::codex::remove_codex_plugin_workspace_root,
+            coding::codex::install_codex_plugin,
+            coding::codex::enable_codex_plugin,
+            coding::codex::disable_codex_plugin,
+            coding::codex::set_codex_installed_plugins_enabled,
+            coding::codex::uninstall_codex_plugin,
+            coding::codex::enable_codex_plugins_feature,
             coding::codex::reveal_codex_config_folder,
+            coding::codex::memories::list_codex_memories,
+            coding::codex::memories::read_codex_memory_file,
+            coding::codex::memories::write_codex_memory_file,
+            coding::codex::memories::rename_codex_memory_entry,
+            coding::codex::memories::delete_codex_memory_entries,
+            coding::codex::memories::clear_codex_memories,
+            coding::codex::memories::reveal_codex_memories_folder,
             coding::codex::list_codex_providers,
+            coding::codex::list_codex_official_accounts,
+            coding::codex::start_codex_official_account_oauth,
+            coding::codex::start_codex_official_account_device_auth,
+            coding::codex::cancel_codex_official_account_device_auth,
+            coding::codex::save_codex_official_local_account,
+            coding::codex::apply_codex_official_account,
+            coding::codex::delete_codex_official_account,
+            coding::codex::refresh_codex_official_account_limits,
+            coding::codex::copy_codex_official_account_token,
+            coding::codex::fetch_codex_official_models,
             coding::codex::create_codex_provider,
             coding::codex::update_codex_provider,
             coding::codex::delete_codex_provider,
@@ -1410,14 +2205,187 @@ pub fn run() {
             coding::codex::toggle_codex_provider_disabled,
             coding::codex::read_codex_settings,
             coding::codex::get_codex_common_config,
+            coding::codex::extract_codex_common_config_from_current_file,
             coding::codex::save_codex_common_config,
             coding::codex::save_codex_local_config,
+            coding::codex::list_codex_all_api_hub_providers,
+            coding::codex::resolve_codex_all_api_hub_providers,
+            coding::codex::list_codex_prompt_configs,
+            coding::codex::create_codex_prompt_config,
+            coding::codex::update_codex_prompt_config,
+            coding::codex::delete_codex_prompt_config,
+            coding::codex::disable_codex_prompt_config,
+            coding::codex::apply_codex_prompt_config,
+            coding::codex::reorder_codex_prompt_configs,
+            coding::codex::save_codex_local_prompt_config,
+            // Grok CLI
+            coding::grok::get_grok_config_dir_path,
+            coding::grok::get_grok_root_path_info,
+            coding::grok::get_grok_config_file_path,
+            coding::grok::reveal_grok_config_folder,
+            coding::grok::fetch_grok_official_models,
+            coding::grok::read_grok_settings,
+            coding::grok::list_grok_providers,
+            coding::grok::create_grok_provider,
+            coding::grok::update_grok_provider,
+            coding::grok::delete_grok_provider,
+            coding::grok::reorder_grok_providers,
+            coding::grok::select_grok_provider,
+            coding::grok::toggle_grok_provider_disabled,
+            coding::grok::save_grok_local_config,
+            coding::grok::list_grok_all_api_hub_providers,
+            coding::grok::resolve_grok_all_api_hub_providers,
+            coding::grok::get_grok_common_config,
+            coding::grok::extract_grok_common_config_from_current_file,
+            coding::grok::save_grok_common_config,
+            coding::grok::list_grok_prompt_configs,
+            coding::grok::create_grok_prompt_config,
+            coding::grok::update_grok_prompt_config,
+            coding::grok::delete_grok_prompt_config,
+            coding::grok::disable_grok_prompt_config,
+            coding::grok::apply_grok_prompt_config,
+            coding::grok::reorder_grok_prompt_configs,
+            coding::grok::save_grok_local_prompt_config,
+            coding::grok::start_grok_official_account_device_auth,
+            coding::grok::cancel_grok_official_account_device_auth,
+            coding::grok::get_grok_official_account_auth_status,
+            coding::grok::list_grok_official_accounts,
+            coding::grok::save_grok_official_local_account,
+            coding::grok::apply_grok_official_account,
+            coding::grok::refresh_grok_official_account,
+            coding::grok::refresh_grok_official_account_limits,
+            coding::grok::delete_grok_official_account,
+            coding::grok::logout_grok_official_runtime,
+            coding::grok::get_grok_plugin_runtime_status,
+            coding::grok::list_grok_installed_plugins,
+            coding::grok::list_grok_marketplaces,
+            coding::grok::list_grok_marketplace_plugins,
+            coding::grok::list_grok_plugin_workspace_roots,
+            coding::grok::add_grok_plugin_workspace_root,
+            coding::grok::remove_grok_plugin_workspace_root,
+            coding::grok::install_grok_plugin,
+            coding::grok::enable_grok_plugin,
+            coding::grok::disable_grok_plugin,
+            coding::grok::uninstall_grok_plugin,
+            coding::grok::update_grok_plugin,
+            coding::grok::get_grok_plugin_details,
+            coding::grok::validate_grok_plugin,
+            coding::grok::update_grok_plugin_marketplace,
+            coding::grok::set_grok_installed_plugins_enabled,
+            // Kimi Code CLI
+            coding::kimi::get_kimi_root_path_info,
+            coding::kimi::get_kimi_config_dir_path,
+            coding::kimi::get_kimi_config_file_path,
+            coding::kimi::reveal_kimi_config_folder,
+            coding::kimi::read_kimi_settings,
+            coding::kimi::list_kimi_providers,
+            coding::kimi::create_kimi_provider,
+            coding::kimi::update_kimi_provider,
+            coding::kimi::delete_kimi_provider,
+            coding::kimi::reorder_kimi_providers,
+            coding::kimi::toggle_kimi_provider_disabled,
+            coding::kimi::select_kimi_provider,
+            coding::kimi::get_kimi_common_config,
+            coding::kimi::extract_kimi_common_config_from_current_file,
+            coding::kimi::save_kimi_common_config,
+            coding::kimi::save_kimi_local_config,
+            coding::kimi::list_kimi_prompt_configs,
+            coding::kimi::create_kimi_prompt_config,
+            coding::kimi::update_kimi_prompt_config,
+            coding::kimi::delete_kimi_prompt_config,
+            coding::kimi::save_kimi_local_prompt_config,
+            coding::kimi::disable_kimi_prompt_config,
+            coding::kimi::apply_kimi_prompt_config,
+            coding::kimi::reorder_kimi_prompt_configs,
+            coding::kimi::start_kimi_official_account_device_auth,
+            coding::kimi::cancel_kimi_official_account_device_auth,
+            coding::kimi::get_kimi_official_account_auth_status,
+            coding::kimi::list_kimi_official_accounts,
+            coding::kimi::apply_kimi_official_account,
+            coding::kimi::delete_kimi_official_account,
+            coding::kimi::list_kimi_plugins,
+            // Gemini CLI
+            coding::gemini_cli::get_gemini_cli_config_path,
+            coding::gemini_cli::get_gemini_cli_root_path_info,
+            coding::gemini_cli::reveal_gemini_cli_config_folder,
+            coding::gemini_cli::read_gemini_cli_settings,
+            coding::gemini_cli::list_gemini_cli_providers,
+            coding::gemini_cli::create_gemini_cli_provider,
+            coding::gemini_cli::update_gemini_cli_provider,
+            coding::gemini_cli::delete_gemini_cli_provider,
+            coding::gemini_cli::reorder_gemini_cli_providers,
+            coding::gemini_cli::select_gemini_cli_provider,
+            coding::gemini_cli::toggle_gemini_cli_provider_disabled,
+            coding::gemini_cli::get_gemini_cli_common_config,
+            coding::gemini_cli::extract_gemini_cli_common_config_from_current_file,
+            coding::gemini_cli::save_gemini_cli_common_config,
+            coding::gemini_cli::save_gemini_cli_local_config,
+            coding::gemini_cli::fetch_gemini_cli_official_models,
+            coding::gemini_cli::list_gemini_cli_prompt_configs,
+            coding::gemini_cli::create_gemini_cli_prompt_config,
+            coding::gemini_cli::update_gemini_cli_prompt_config,
+            coding::gemini_cli::delete_gemini_cli_prompt_config,
+            coding::gemini_cli::disable_gemini_cli_prompt_config,
+            coding::gemini_cli::apply_gemini_cli_prompt_config,
+            coding::gemini_cli::reorder_gemini_cli_prompt_configs,
+            coding::gemini_cli::save_gemini_cli_local_prompt_config,
+            coding::gemini_cli::list_gemini_cli_official_accounts,
+            coding::gemini_cli::start_gemini_cli_official_account_oauth,
+            coding::gemini_cli::save_gemini_cli_official_local_account,
+            coding::gemini_cli::apply_gemini_cli_official_account,
+            coding::gemini_cli::delete_gemini_cli_official_account,
+            coding::gemini_cli::refresh_gemini_cli_official_account_limits,
+            coding::gemini_cli::copy_gemini_cli_official_account_token,
+            // Pi
+            coding::pi::get_pi_root_path_info,
+            coding::pi::get_pi_settings_config,
+            coding::pi::save_pi_settings_config,
+            coding::pi::read_pi_runtime_config,
+            coding::pi::save_pi_model_settings,
+            coding::pi::save_pi_other_settings,
+            coding::pi::save_pi_auth_provider,
+            coding::pi::save_pi_models_provider,
+            coding::pi::delete_pi_runtime_provider,
+            coding::pi::list_pi_extensions,
+            coding::pi::install_pi_extension,
+            coding::pi::uninstall_pi_extension,
+            coding::pi::update_pi_extensions,
+            coding::pi::list_pi_prompt_configs,
+            coding::pi::create_pi_prompt_config,
+            coding::pi::update_pi_prompt_config,
+            coding::pi::delete_pi_prompt_config,
+            coding::pi::disable_pi_prompt_config,
+            coding::pi::apply_pi_prompt_config,
+            coding::pi::reorder_pi_prompt_configs,
+            coding::pi::save_pi_local_prompt_config,
+            // Oh My Pi
+            coding::oh_my_pi::get_omp_root_path_info,
+            coding::oh_my_pi::get_omp_settings_config,
+            coding::oh_my_pi::save_omp_settings_config,
+            coding::oh_my_pi::read_omp_runtime_config,
+            coding::oh_my_pi::save_omp_model_settings,
+            coding::oh_my_pi::save_omp_other_settings,
+            coding::oh_my_pi::save_omp_models_provider,
+            coding::oh_my_pi::delete_omp_runtime_provider,
+            coding::oh_my_pi::list_omp_extensions,
+            coding::oh_my_pi::install_omp_extension,
+            coding::oh_my_pi::uninstall_omp_extension,
+            coding::oh_my_pi::update_omp_extensions,
+            coding::oh_my_pi::list_omp_prompt_configs,
+            coding::oh_my_pi::create_omp_prompt_config,
+            coding::oh_my_pi::update_omp_prompt_config,
+            coding::oh_my_pi::delete_omp_prompt_config,
+            coding::oh_my_pi::disable_omp_prompt_config,
+            coding::oh_my_pi::apply_omp_prompt_config,
+            coding::oh_my_pi::reorder_omp_prompt_configs,
+            coding::oh_my_pi::save_omp_local_prompt_config,
             // OpenClaw
             coding::open_claw::get_openclaw_config_path,
             coding::open_claw::get_openclaw_config_path_info,
             coding::open_claw::read_openclaw_config,
             coding::open_claw::save_openclaw_config,
             coding::open_claw::backup_openclaw_config,
+            coding::open_claw::scan_openclaw_config_health,
             coding::open_claw::get_openclaw_common_config,
             coding::open_claw::save_openclaw_common_config,
             coding::open_claw::get_openclaw_agents_defaults,
@@ -1426,26 +2394,34 @@ pub fn run() {
             coding::open_claw::set_openclaw_env,
             coding::open_claw::get_openclaw_tools,
             coding::open_claw::set_openclaw_tools,
+            coding::open_claw::list_openclaw_all_api_hub_providers,
+            coding::open_claw::resolve_openclaw_all_api_hub_providers,
+            coding::open_claw::open_openclaw_web_ui,
+            coding::open_claw::launch_openclaw_gateway,
             // Tray
             tray::refresh_tray_menu,
-            // Oh My OpenCode
-            coding::oh_my_opencode::list_oh_my_opencode_configs,
-            coding::oh_my_opencode::create_oh_my_opencode_config,
-            coding::oh_my_opencode::update_oh_my_opencode_config,
-            coding::oh_my_opencode::delete_oh_my_opencode_config,
-            coding::oh_my_opencode::apply_oh_my_opencode_config,
-            coding::oh_my_opencode::reorder_oh_my_opencode_configs,
-            coding::oh_my_opencode::toggle_oh_my_opencode_config_disabled,
-            coding::oh_my_opencode::get_oh_my_opencode_config_path_info,
-            coding::oh_my_opencode::get_oh_my_opencode_global_config,
-            coding::oh_my_opencode::save_oh_my_opencode_global_config,
-            coding::oh_my_opencode::check_oh_my_opencode_config_exists,
-            coding::oh_my_opencode::save_oh_my_opencode_local_config,
+            // Oh My OpenAgent
+            coding::oh_my_openagent::list_oh_my_openagent_configs,
+            coding::oh_my_openagent::create_oh_my_openagent_config,
+            coding::oh_my_openagent::update_oh_my_openagent_config,
+            coding::oh_my_openagent::delete_oh_my_openagent_config,
+            coding::oh_my_openagent::clear_oh_my_openagent_applied_config,
+            coding::oh_my_openagent::apply_oh_my_openagent_config,
+            coding::oh_my_openagent::reorder_oh_my_openagent_configs,
+            coding::oh_my_openagent::toggle_oh_my_openagent_config_disabled,
+            coding::oh_my_openagent::get_oh_my_openagent_config_path_info,
+            coding::oh_my_openagent::get_oh_my_openagent_global_config,
+            coding::oh_my_openagent::save_oh_my_openagent_global_config,
+            coding::oh_my_openagent::check_oh_my_openagent_config_exists,
+            coding::oh_my_openagent::save_oh_my_openagent_local_config,
+            coding::oh_my_openagent::get_oh_my_openagent_upgrade_status,
+            coding::oh_my_openagent::upgrade_oh_my_openagent_legacy_setup,
             // Oh My OpenCode Slim
             coding::oh_my_opencode_slim::list_oh_my_opencode_slim_configs,
             coding::oh_my_opencode_slim::create_oh_my_opencode_slim_config,
             coding::oh_my_opencode_slim::update_oh_my_opencode_slim_config,
             coding::oh_my_opencode_slim::delete_oh_my_opencode_slim_config,
+            coding::oh_my_opencode_slim::clear_oh_my_opencode_slim_applied_config,
             coding::oh_my_opencode_slim::apply_oh_my_opencode_slim_config,
             coding::oh_my_opencode_slim::reorder_oh_my_opencode_slim_configs,
             coding::oh_my_opencode_slim::toggle_oh_my_opencode_slim_config_disabled,
@@ -1491,14 +2467,27 @@ pub fn run() {
             coding::skills::skills_get_tool_status,
             coding::skills::skills_get_central_repo_path,
             coding::skills::skills_set_central_repo_path,
+            coding::skills::skills_get_default_central_repo_path,
+            coding::skills::skills_get_central_repo_path_status,
+            coding::skills::skills_preview_central_repo_path,
+            coding::skills::skills_apply_central_repo_path_change,
+            coding::skills::skills_scan_central_repo,
+            coding::skills::skills_adopt_central_repo_skills,
+            coding::skills::skills_repair_central_repo_skill,
             coding::skills::skills_get_managed_skills,
             coding::skills::skills_install_local,
+            coding::skills::skills_list_local_skills,
+            coding::skills::skills_install_local_selection,
             coding::skills::skills_install_git,
             coding::skills::skills_list_git_skills,
             coding::skills::skills_install_git_selection,
             coding::skills::skills_sync_to_tool,
             coding::skills::skills_unsync_from_tool,
             coding::skills::skills_update_managed,
+            coding::skills::skills_update_all,
+            coding::skills::skills_get_auto_update,
+            coding::skills::skills_set_auto_update,
+            coding::skills::skills_preview_auto_update_schedule,
             coding::skills::skills_delete_managed,
             coding::skills::skills_get_onboarding_plan,
             coding::skills::skills_import_existing,
@@ -1509,8 +2498,12 @@ pub fn run() {
             coding::skills::skills_get_git_cache_path,
             coding::skills::skills_get_preferred_tools,
             coding::skills::skills_set_preferred_tools,
+            coding::skills::skills_get_limit_add_more_to_preferred_tools,
+            coding::skills::skills_set_limit_add_more_to_preferred_tools,
             coding::skills::skills_get_show_in_tray,
             coding::skills::skills_set_show_in_tray,
+            coding::skills::skills_get_default_view_mode,
+            coding::skills::skills_set_default_view_mode,
             // Skills Hub - Custom Tools
             coding::skills::skills_get_custom_tools,
             coding::skills::skills_add_custom_tool,
@@ -1524,15 +2517,31 @@ pub fn run() {
             coding::skills::skills_init_default_repos,
             // Skills Hub - Reorder
             coding::skills::skills_reorder,
+            coding::skills::skills_get_groups,
+            coding::skills::skills_save_group,
+            coding::skills::skills_delete_group,
+            coding::skills::skills_update_metadata,
+            coding::skills::skills_batch_update_group,
+            coding::skills::skills_set_management_enabled,
+            coding::skills::skills_export_inventory,
+            coding::skills::skills_export_inventory_file,
+            coding::skills::skills_preview_inventory_import,
+            coding::skills::skills_preview_inventory_import_file,
+            coding::skills::skills_apply_inventory_import,
+            coding::skills::skills_apply_inventory_import_file,
             // Skills Hub - Resync
             coding::skills::skills_resync_all,
+            // Skills Hub - Documents
+            coding::skills::skills_get_skill_documents,
             // MCP Servers
             coding::mcp::mcp_list_servers,
+            coding::mcp::mcp_resolve_package_versions,
             coding::mcp::mcp_create_server,
             coding::mcp::mcp_update_server,
             coding::mcp::mcp_delete_server,
             coding::mcp::mcp_toggle_tool,
             coding::mcp::mcp_reorder_servers,
+            coding::mcp::mcp_update_metadata,
             coding::mcp::mcp_sync_to_tool,
             coding::mcp::mcp_sync_all,
             coding::mcp::mcp_import_from_tool,
@@ -1542,15 +2551,36 @@ pub fn run() {
             coding::mcp::mcp_set_show_in_tray,
             coding::mcp::mcp_get_preferred_tools,
             coding::mcp::mcp_set_preferred_tools,
+            coding::mcp::mcp_get_limit_add_more_to_preferred_tools,
+            coding::mcp::mcp_set_limit_add_more_to_preferred_tools,
             coding::mcp::mcp_get_sync_disabled_to_opencode,
             coding::mcp::mcp_set_sync_disabled_to_opencode,
             coding::mcp::mcp_add_custom_tool,
             coding::mcp::mcp_remove_custom_tool,
+            coding::mcp::mcp_set_management_enabled,
+            coding::mcp::mcp_restore_tools,
+            coding::mcp::mcp_export_group_inventory,
+            coding::mcp::mcp_preview_group_inventory_import,
+            coding::mcp::mcp_apply_group_inventory_import,
+            coding::mcp::mcp_list_groups,
+            coding::mcp::mcp_save_group,
+            coding::mcp::mcp_delete_group,
             // MCP Favorites
             coding::mcp::mcp_list_favorites,
             coding::mcp::mcp_upsert_favorite,
             coding::mcp::mcp_delete_favorite,
             coding::mcp::mcp_init_default_favorites,
+            // Image
+            coding::image::image_get_workspace,
+            coding::image::image_list_channels,
+            coding::image::image_update_channel,
+            coding::image::image_delete_channel,
+            coding::image::image_delete_job,
+            coding::image::image_export_asset,
+            coding::image::image_reorder_channels,
+            coding::image::image_list_jobs,
+            coding::image::image_create_job,
+            coding::image::image_reveal_assets_dir,
         ])
         .build(tauri::generate_context!())
         .map_err(|e| {
@@ -1569,6 +2599,21 @@ pub fn run() {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
+                    } else if lightweight::is_lightweight_mode() {
+                        // Dock click while in lightweight mode: rebuild the window.
+                        if let Err(e) = lightweight::exit_lightweight_mode(app_handle) {
+                            warn!("Failed to exit lightweight mode on Reopen: {e}");
+                        }
+                    }
+                }
+                // Destroying the main window in lightweight mode leaves no alive
+                // window, which Tauri reports as an automatic ExitRequested with no
+                // code. Keep the process (tray, gateway, schedulers) running. All
+                // other exit paths (user close with minimize_to_tray disabled,
+                // app.exit, restart) keep their current semantics.
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    if code.is_none() && lightweight::is_lightweight_mode() {
+                        api.prevent_exit();
                     }
                 }
 
@@ -1578,4 +2623,73 @@ pub fn run() {
             // Avoid unused warnings on platforms where the match arms above are empty.
             let _ = app_handle;
         });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_startup_tests {
+    use super::*;
+
+    #[test]
+    fn appimage_wayland_preload_requires_all_conditions() {
+        assert!(should_reexec_for_appimage_wayland_preload(
+            false, true, true, false, false, true,
+        ));
+
+        assert!(!should_reexec_for_appimage_wayland_preload(
+            true, true, true, false, false, true,
+        ));
+        assert!(!should_reexec_for_appimage_wayland_preload(
+            false, false, true, false, false, true,
+        ));
+        assert!(!should_reexec_for_appimage_wayland_preload(
+            false, true, false, false, false, true,
+        ));
+        assert!(!should_reexec_for_appimage_wayland_preload(
+            false, true, true, true, false, true,
+        ));
+        assert!(!should_reexec_for_appimage_wayland_preload(
+            false, true, true, false, true, true,
+        ));
+        assert!(!should_reexec_for_appimage_wayland_preload(
+            false, true, true, false, false, false,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod wayland_workaround_level_record_tests {
+    use super::*;
+
+    #[test]
+    fn parses_record_with_matching_version() {
+        let raw = render_wayland_workaround_level_record(2, "1.1.4");
+        assert_eq!(parse_wayland_workaround_level_record(&raw, "1.1.4"), 2);
+    }
+
+    #[test]
+    fn resets_when_app_version_differs() {
+        let raw = render_wayland_workaround_level_record(3, "1.1.3");
+        assert_eq!(parse_wayland_workaround_level_record(&raw, "1.1.4"), 0);
+    }
+
+    #[test]
+    fn resets_legacy_plain_number_record() {
+        assert_eq!(parse_wayland_workaround_level_record("2", "1.1.4"), 0);
+        assert_eq!(parse_wayland_workaround_level_record("", "1.1.4"), 0);
+    }
+
+    #[test]
+    fn clamps_level_above_max() {
+        let raw = render_wayland_workaround_level_record(9, "1.1.4");
+        assert_eq!(
+            parse_wayland_workaround_level_record(&raw, "1.1.4"),
+            WAYLAND_WEBVIEW_WORKAROUND_MAX_LEVEL
+        );
+    }
+
+    #[test]
+    fn round_trips_level_zero() {
+        let raw = render_wayland_workaround_level_record(0, "1.1.4");
+        assert_eq!(parse_wayland_workaround_level_record(&raw, "1.1.4"), 0);
+    }
 }

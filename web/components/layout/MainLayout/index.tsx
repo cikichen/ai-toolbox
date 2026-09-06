@@ -1,6 +1,6 @@
 import React from 'react';
 import { Tabs } from 'antd';
-import { useNavigate, useLocation, Outlet } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { CodeOutlined, SettingOutlined } from '@ant-design/icons';
 import { platform } from '@tauri-apps/plugin-os';
@@ -15,17 +15,27 @@ import { SSHSyncModal } from '@/features/settings/components/SSHSyncModal';
 import { useSSHSync } from '@/features/settings/hooks/useSSHSync';
 import { SkillsButton } from '@/features/coding/skills';
 import { McpButton } from '@/features/coding/mcp';
+import { ImageButton } from '@/features/coding/image';
+import { GatewayButton } from '@/features/coding/gateway';
+import KeepAliveOutlet from '@/components/layout/KeepAliveOutlet';
+import { PAGE_ROUTES } from '@/app/routeConfig';
+import { getRouteChrome, matchRouteEntry, resolveInitialTabPath, shouldShowRouteAppHeader } from '@/app/routeMatching';
 import styles from './styles.module.less';
 
 import OpencodeIcon from '@/assets/opencode.svg';
 import ClaudeIcon from '@/assets/claude.svg';
 import ChatgptIcon from '@/assets/chatgpt.svg';
-import { OpenClaw as OpenClawIcon } from '@lobehub/icons';
+import PiIcon from '@/assets/pi.svg';
+import OmpIcon from '@/assets/omp.svg';
+import { Gemini, Grok, HermesAgent, Kimi, OpenClaw as OpenClawIcon, DeepSeek } from '@lobehub/icons';
 
 const TAB_ICONS: Record<string, string> = {
   opencode: OpencodeIcon,
   claudecode: ClaudeIcon,
+  claudedesktop: ClaudeIcon,
   codex: ChatgptIcon,
+  pi: PiIcon,
+  oh_my_pi: OmpIcon,
 };
 
 // macOS Overlay 模式需要为交通灯按钮预留空间，Windows/Linux 使用原生标题栏
@@ -37,11 +47,12 @@ const MainLayout: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
-  const { setCurrentModule, setCurrentSubTab } = useAppStore();
+  const { setCurrentModule, setCurrentSubTab, currentSubTab } = useAppStore();
   const { visibleTabs } = useSettingsStore();
   const { resolvedTheme } = useThemeStore();
-  const { config, status } = useWSLSync();
+  const { config, status, loadError } = useWSLSync();
   const { config: sshConfig, status: sshStatus } = useSSHSync();
+  const mainRef = React.useRef<HTMLElement | null>(null);
 
   // Check if current platform is Windows (only show WSL on Windows)
   const isWindows = React.useMemo(() => platform() === 'windows', []);
@@ -66,7 +77,20 @@ const MainLayout: React.FC = () => {
   const isSettingsPage = location.pathname.startsWith('/settings');
   const isSkillsPage = location.pathname.startsWith('/skills');
   const isMcpPage = location.pathname.startsWith('/mcp');
-  const isNonTabPage = isSettingsPage || isSkillsPage || isMcpPage;
+  const isGatewayPage = location.pathname.startsWith('/gateway');
+  const isImagePage = location.pathname.startsWith('/images');
+  const currentRoute = React.useMemo(
+    () => matchRouteEntry(PAGE_ROUTES, location.pathname),
+    [location.pathname],
+  );
+  const routeChrome = React.useMemo(() => getRouteChrome(currentRoute), [currentRoute]);
+  const showAppHeader = shouldShowRouteAppHeader(routeChrome);
+  const contentTopOffset = showAppHeader ? CONTENT_TOP_OFFSET : DRAG_BAR_HEIGHT;
+  const isGatewayVisible = visibleTabs.includes('gateway');
+  const isImageVisible = visibleTabs.includes('image');
+  const isStandalonePage = isSettingsPage || isSkillsPage || isMcpPage || isGatewayPage || isImagePage;
+  const isNonTabPage = isStandalonePage || routeChrome.mode !== 'default';
+  const showCodingTabs = showAppHeader && routeChrome.mode === 'default';
 
   // Get coding module's subTabs, filtered and ordered by visibility settings
   const codingModule = MODULES.find((m) => m.key === 'coding');
@@ -87,6 +111,44 @@ const MainLayout: React.FC = () => {
     return subTabs[0]?.key || '';
   }, [location.pathname, subTabs]);
 
+  // Redirect to first visible tab when current path is a hidden coding tab
+  React.useEffect(() => {
+    if (subTabs.length === 0) {
+      return;
+    }
+
+    if (routeChrome.mode === 'secondary') {
+      if (routeChrome.ownerTabKey && !visibleTabs.includes(routeChrome.ownerTabKey)) {
+        navigate(routeChrome.parentPath || subTabs[0].path, { replace: true });
+      }
+      return;
+    }
+
+    if (isStandalonePage) return;
+    const isOnVisibleTab = subTabs.some((tab) => location.pathname.startsWith(tab.path));
+    if (!isOnVisibleTab) {
+      // Cold boot (window rebuild or app restart): prefer the last active
+      // coding tab persisted by appStore over the first visible tab.
+      const restoredPath = resolveInitialTabPath(location.pathname, PAGE_ROUTES, subTabs, currentSubTab);
+      navigate(restoredPath ?? subTabs[0].path, { replace: true });
+    }
+  }, [currentSubTab, isStandalonePage, location.pathname, navigate, routeChrome, subTabs, visibleTabs]);
+
+  React.useEffect(() => {
+    if (!isImagePage || isImageVisible) {
+      return;
+    }
+
+    navigate(subTabs[0]?.path ?? '/settings', { replace: true });
+  }, [isImagePage, isImageVisible, navigate, subTabs]);
+
+  React.useEffect(() => {
+    if (!isGatewayPage || isGatewayVisible) {
+      return;
+    }
+
+    navigate(subTabs[0]?.path ?? '/settings', { replace: true });
+  }, [isGatewayPage, isGatewayVisible, navigate, subTabs]);
 
   const handleTabChange = (key: string) => {
     const tab = subTabs.find((t) => t.key === key);
@@ -109,7 +171,7 @@ const MainLayout: React.FC = () => {
   return (
     <div
       className={styles.layout}
-      style={{ ['--content-top-offset' as any]: `${CONTENT_TOP_OFFSET}px` }}
+      style={{ ['--content-top-offset' as any]: `${contentTopOffset}px` }}
     >
       {/* 全局拖拽区域（顶部 28px on macOS），避免上边框无法拖动 */}
       {DRAG_BAR_HEIGHT > 0 && (
@@ -127,114 +189,145 @@ const MainLayout: React.FC = () => {
         </div>
       )}
 
-      {/* Header - 固定在顶部，带毛玻璃效果，包含拖拽区域高度 */}
-      <header
-        className={styles.header}
-        data-tauri-drag-region
-        style={{ top: 0, height: CONTENT_TOP_OFFSET, paddingTop: DRAG_BAR_HEIGHT }}
-      >
-        <div className={styles.headerContent} data-tauri-drag-region>
-          {/* Left - Logo area */}
-          <div className={styles.logoArea} style={{ WebkitAppRegion: 'no-drag' } as any}>
-            <CodeOutlined className={styles.logoIcon} />
-            <div className={styles.divider} />
-          </div>
+      {showAppHeader ? (
+        <header
+          className={styles.header}
+          data-tauri-drag-region
+          style={{ top: 0, height: CONTENT_TOP_OFFSET, paddingTop: DRAG_BAR_HEIGHT }}
+        >
+          <div className={styles.headerContent} data-tauri-drag-region>
+            {/* Left - Logo area */}
+            <div className={styles.logoArea} style={{ WebkitAppRegion: 'no-drag' } as any}>
+              <CodeOutlined className={styles.logoIcon} />
+              <div className={styles.divider} />
+            </div>
 
-          {/* Center - Tabs */}
-          <div className={styles.tabsArea} style={{ WebkitAppRegion: 'no-drag' } as any}>
-            <div className={`${styles.tabsWrapper} ${isNonTabPage ? styles.noActiveTab : ''}`}>
-              <Tabs
-                activeKey={currentTabKey}
-                onChange={handleTabChange}
-                onTabClick={handleTabClick}
-                indicator={{
-                  size: (origin) => origin - 14,
-                  align: 'center',
-                }}
-                items={subTabs.map((tab) => ({
-                  key: tab.key,
-                  label: (
-                    <span className={styles.tabLabel}>
-                      {tab.key === 'openclaw' ? (
-                        resolvedTheme === 'dark' ? (
-                          <OpenClawIcon size={16} className={styles.tabIconColor} />
-                        ) : (
-                          <OpenClawIcon.Color size={16} className={styles.tabIconColor} />
-                        )
-                      ) : TAB_ICONS[tab.key] ? (
-                        <img src={TAB_ICONS[tab.key]} className={styles.tabIcon} alt="" />
-                      ) : null}
-                      <span>{t(tab.labelKey)}</span>
-                    </span>
-                  ),
-                }))}
-              />
+            {showCodingTabs ? (
+              <div className={styles.tabsArea} style={{ WebkitAppRegion: 'no-drag' } as any}>
+                <div className={`${styles.tabsWrapper} ${isNonTabPage ? styles.noActiveTab : ''}`}>
+                  <Tabs
+                    activeKey={currentTabKey}
+                    onChange={handleTabChange}
+                    onTabClick={handleTabClick}
+                    indicator={{
+                      size: (origin) => origin - 14,
+                      align: 'center',
+                    }}
+                    items={subTabs.map((tab) => ({
+                      key: tab.key,
+                      label: (
+                        <span className={styles.tabLabel}>
+                          {tab.key === 'openclaw' ? (
+                            resolvedTheme === 'dark' ? (
+                              <OpenClawIcon size={16} className={styles.tabIconColor} />
+                            ) : (
+                              <OpenClawIcon.Color size={16} className={styles.tabIconColor} />
+                            )
+                          ) : tab.key === 'grok' ? (
+                            <Grok size={16} className={styles.tabIconColor} />
+                          ) : tab.key === 'kimi' ? (
+                            <Kimi size={16} className={styles.tabIconColor} />
+                          ) : tab.key === 'geminicli' ? (
+                            <Gemini.Color size={16} className={styles.tabIconColor} />
+                          ) : tab.key === 'hermes' ? (
+                            <HermesAgent size={16} className={styles.tabIconFixed} />
+                          ) : tab.key === 'dsh' ? (
+                            <DeepSeek.Color size={16} className={styles.tabIconColor} />
+                          ) : TAB_ICONS[tab.key] ? (
+                            <img src={TAB_ICONS[tab.key]} className={styles.tabIcon} alt="" />
+                          ) : null}
+                          <span>{t(tab.labelKey)}</span>
+                        </span>
+                      ),
+                    }))}
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            {/* Right - Actions */}
+            <div className={styles.actionsArea} style={{ WebkitAppRegion: 'no-drag' } as any}>
+              {/* SSH status indicator (all platforms) */}
+              {visibleTabs.includes('ssh') && sshConfig && sshStatus && (
+                <>
+                  <SSHStatusIndicator
+                    enabled={sshConfig.enabled}
+                    status={
+                      sshStatus.lastSyncStatus === 'success'
+                        ? 'success'
+                        : sshStatus.lastSyncStatus === 'error'
+                          ? 'error'
+                          : 'idle'
+                    }
+                    onClick={() => window.dispatchEvent(new CustomEvent('open-ssh-settings'))}
+                  />
+                  <div className={styles.actionsDivider} />
+                </>
+              )}
+
+              {/* WSL status indicator (Windows only) */}
+              {visibleTabs.includes('wsl') && isWindows && (
+                <>
+                  <WSLStatusIndicator
+                    enabled={config?.enabled ?? false}
+                    status={
+                      loadError || status?.lastSyncStatus === 'error'
+                        ? 'error'
+                        : status?.lastSyncStatus === 'success'
+                        ? 'success'
+                        : 'idle'
+                    }
+                    wslAvailable={status?.wslAvailable ?? false}
+                    onClick={() => window.dispatchEvent(new CustomEvent('open-wsl-settings'))}
+                  />
+                  <div className={styles.actionsDivider} />
+                </>
+              )}
+
+              {/* Skills button */}
+              <SkillsButton />
+              <div className={styles.actionsDivider} />
+
+              {/* MCP button */}
+              <McpButton />
+              <div className={styles.actionsDivider} />
+
+              {isGatewayVisible && (
+                <>
+                  <GatewayButton />
+                  <div className={styles.actionsDivider} />
+                </>
+              )}
+
+              {isImageVisible && (
+                <>
+                  <ImageButton />
+                  <div className={styles.actionsDivider} />
+                </>
+              )}
+
+              {/* Settings button */}
+              <div
+                className={`${styles.settingsBtn} ${isSettingsPage ? styles.active : ''}`}
+                onClick={() => navigate('/settings')}
+              >
+                <SettingOutlined className={styles.settingsIcon} />
+                <span className={styles.settingsText}>{t('modules.settings')}</span>
+              </div>
             </div>
           </div>
-
-          {/* Right - Actions */}
-          <div className={styles.actionsArea} style={{ WebkitAppRegion: 'no-drag' } as any}>
-            {/* SSH status indicator (all platforms) */}
-            {visibleTabs.includes('ssh') && sshConfig && sshStatus && (
-              <>
-                <SSHStatusIndicator
-                  enabled={sshConfig.enabled}
-                  status={
-                    sshStatus.lastSyncStatus === 'success'
-                      ? 'success'
-                      : sshStatus.lastSyncStatus === 'error'
-                        ? 'error'
-                        : 'idle'
-                  }
-                  onClick={() => window.dispatchEvent(new CustomEvent('open-ssh-settings'))}
-                />
-                <div className={styles.actionsDivider} />
-              </>
-            )}
-
-            {/* WSL status indicator (Windows only) */}
-            {visibleTabs.includes('wsl') && isWindows && config && status && (
-              <>
-                <WSLStatusIndicator
-                  enabled={config.enabled}
-                  status={
-                    status.lastSyncStatus === 'success'
-                      ? 'success'
-                      : status.lastSyncStatus === 'error'
-                        ? 'error'
-                        : 'idle'
-                  }
-                  wslAvailable={status.wslAvailable}
-                  onClick={() => window.dispatchEvent(new CustomEvent('open-wsl-settings'))}
-                />
-                <div className={styles.actionsDivider} />
-              </>
-            )}
-
-            {/* Skills button */}
-            <SkillsButton />
-            <div className={styles.actionsDivider} />
-
-            {/* MCP button */}
-            <McpButton />
-            <div className={styles.actionsDivider} />
-
-            {/* Settings button */}
-            <div
-              className={`${styles.settingsBtn} ${isSettingsPage ? styles.active : ''}`}
-              onClick={() => navigate('/settings')}
-            >
-              <SettingOutlined className={styles.settingsIcon} />
-              <span className={styles.settingsText}>{t('modules.settings')}</span>
-            </div>
-          </div>
-        </div>
-      </header>
+        </header>
+      ) : null}
 
       {/* Main content */}
-      <main className={styles.main}>
-        <div className={styles.contentArea}>
-          <Outlet />
+      <main ref={mainRef} className={styles.main}>
+        <div className={[
+          styles.contentArea,
+          routeChrome.contentPadding === 'compact' ? styles.contentAreaCompact : '',
+          routeChrome.contentPadding === 'none' ? styles.contentAreaNone : '',
+        ].filter(Boolean).join(' ')}
+        >
+          <KeepAliveOutlet routes={PAGE_ROUTES} max={12} scrollContainerRef={mainRef} />
         </div>
       </main>
 

@@ -25,23 +25,321 @@
   flex: 1;
 }
 
+.selectControl {
+  width: min(220px, 100%);
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+
+  &:focus {
+    border-color: var(--color-border-secondary);
+  }
+}
+
 .hint {
   font-size: 12px;
   color: var(--color-text-tertiary);
   margin-top: 6px;
 }
 
+.scheduleControlRow {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 12px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.cronInput {
+  width: 150px;
+  min-width: 0;
+  flex-shrink: 1;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+
+  &:focus {
+    border-color: var(--color-border-secondary);
+  }
+
+  &:disabled {
+    background: var(--color-bg-layout);
+    color: var(--color-text-tertiary);
+    cursor: not-allowed;
+  }
+}
+
+.previewButton {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.timeSelect {
+  width: 56px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+
+  &:focus {
+    border-color: var(--color-border-secondary);
+  }
+
+  &:disabled {
+    background: var(--color-bg-layout);
+    color: var(--color-text-tertiary);
+    cursor: not-allowed;
+  }
+}
+
+.timeColon {
+  color: var(--color-text-tertiary);
+  font-size: 13px;
+}
+
+.previewList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.previewItem {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.previewHint {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.previewError {
+  font-size: 12px;
+  color: var(--color-text-error);
+  word-break: break-all;
+}
+
 .pathRow {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
 }
 
 .pathText {
-  font-size: 13px;
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
   color: var(--color-text-secondary);
   word-break: break-all;
+  line-height: 1.45;
+}
+
+.pathTag {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.pathIconButton {
+  flex-shrink: 0;
+  width: 28px !important;
+  height: 28px;
+  padding: 0 !important;
+  border-radius: 7px;
+  color: var(--color-text-secondary);
+
+  :global(.anticon) {
+    font-size: 14px;
+    line-height: 1;
+  }
+}
+
+.pathActions {
+  margin-top: 8px;
+
+  :global(.ant-space-item) {
+    display: inline-flex;
+  }
+}
+
+.pathActionButton {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  line-height: 28px;
+
+  :global(.anticon) {
+    font-size: 13px;
+    line-height: 1;
+  }
+}
+
+.inlineAlert {
+  margin-top: 8px;
+}
+
+.previewBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pathCompare {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+}
+
+.previewLabel {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+}
+
+.previewPath {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: 13px;
   line-height: 1.5;
+  word-break: break-all;
+}
+
+.summaryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+
+  > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 10px;
+    min-width: 0;
+    min-height: 38px;
+    padding: 7px 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: var(--color-bg-container);
+  }
+
+  strong {
+    justify-self: end;
+    color: var(--color-text-primary);
+    font-size: 20px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--color-text-secondary);
+    font-size: 13px;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.listPanel {
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-container);
+}
+
+.listTitle {
+  margin-bottom: 8px;
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.listItem {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 0;
+  border-top: 1px solid var(--color-border);
+
+  &:first-of-type {
+    border-top: none;
+    padding-top: 0;
+  }
+}
+
+.checkList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.checkLabel {
+  display: inline-flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pathSmall {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+@media (max-width: 720px) {
+  .section {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .labelArea {
+    width: 100%;
+    padding-right: 0;
+  }
+
+  .summaryGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .toolList {
@@ -54,6 +352,25 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+// Checkbox label with the tool's brand icon in front of its name.
+.toolItemLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inlineOption {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.optionLabel {
+  color: var(--color-text-primary);
+  font-size: 13px;
 }
 
 .customToolList {

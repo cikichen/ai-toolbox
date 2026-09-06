@@ -4,40 +4,195 @@
 //! Supports JSON/JSONC (unified with json5) and TOML formats.
 //! Also handles format conversion for tools like OpenCode that use different schemas.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use super::command_normalize;
 use super::format_configs::get_format_config;
-use super::types::{McpServer, McpSyncDetail, now_ms};
-use crate::coding::tools::{resolve_mcp_config_path, McpFormatConfig, RuntimeTool};
+use super::types::{now_ms, McpServer, McpSyncDetail};
+use crate::coding::{
+    expand_local_path, runtime_location,
+    tools::{
+        resolve_mcp_config_path_with_db, resolve_mcp_config_path_with_db_async, McpFormatConfig,
+        RuntimeTool,
+    },
+};
+
+const OMP_MCP_SCHEMA_URL: &str = "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json";
 
 /// Sync an MCP server to a specific tool's config file
 pub fn sync_server_to_tool(
+    db: &crate::db::SqliteDbState,
     server: &McpServer,
     tool: &RuntimeTool,
 ) -> Result<McpSyncDetail, String> {
-    sync_server_to_tool_with_enabled(server, tool, true)
+    sync_server_to_tool_with_enabled(db, server, tool, true)
+}
+
+pub async fn sync_server_to_tool_async(
+    db: &crate::db::SqliteDbState,
+    server: &McpServer,
+    tool: &RuntimeTool,
+) -> Result<McpSyncDetail, String> {
+    sync_server_to_tool_with_enabled_async(db, server, tool, true).await
 }
 
 /// Sync an MCP server to a specific tool's config file with explicit enabled state
 pub fn sync_server_to_tool_with_enabled(
+    db: &crate::db::SqliteDbState,
     server: &McpServer,
     tool: &RuntimeTool,
     enabled: bool,
 ) -> Result<McpSyncDetail, String> {
-    let config_path = resolve_mcp_config_path(tool)
+    let config_path = resolve_mcp_config_path_with_db(db, tool)
         .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+    sync_server_to_path(tool, &config_path, server, enabled)
+}
 
+pub async fn sync_server_to_tool_with_enabled_async(
+    db: &crate::db::SqliteDbState,
+    server: &McpServer,
+    tool: &RuntimeTool,
+    enabled: bool,
+) -> Result<McpSyncDetail, String> {
+    let config_path = resolve_mcp_config_path_with_db_async(db, tool)
+        .await
+        .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+    sync_server_to_path(tool, &config_path, server, enabled)
+}
+
+/// Remove an MCP server from a specific tool's config file
+pub fn remove_server_from_tool(
+    db: &crate::db::SqliteDbState,
+    server_name: &str,
+    tool: &RuntimeTool,
+) -> Result<(), String> {
+    let config_path = resolve_mcp_config_path_with_db(db, tool)
+        .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+    remove_server_from_path(tool, &config_path, server_name)
+}
+
+pub async fn remove_server_from_tool_async(
+    db: &crate::db::SqliteDbState,
+    server_name: &str,
+    tool: &RuntimeTool,
+) -> Result<(), String> {
+    let config_path = resolve_mcp_config_path_with_db_async(db, tool)
+        .await
+        .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+    remove_server_from_path(tool, &config_path, server_name)
+}
+
+/// Clone the server and apply `cmd /c` wrapping to its `server_config` when
+/// `should_wrap` is true and the server is stdio. Non-stdio servers are returned
+/// unchanged. Used by the yaml/cordis arms which don't thread `should_wrap_cmd`
+/// through their adapter signatures.
+fn wrap_server_for_target(server: &McpServer, should_wrap: bool) -> McpServer {
+    if !should_wrap || server.server_type != "stdio" {
+        return server.clone();
+    }
+    let mut wrapped = server.clone();
+    wrapped.server_config = command_normalize::wrap_cmd_c_for_target(&wrapped.server_config, true);
+    wrapped
+}
+
+/// Clone the server and expand `~/`, `$HOME`, `%APPDATA%`, etc. in its stdio
+/// `command` and each `args` entry to absolute host paths via `expand_local_path`.
+///
+/// Non-stdio servers are returned unchanged. Pure-flag args (e.g. `-y`, `npx`)
+/// are untouched — `expand_local_path` only substitutes when the value starts
+/// with `~/` or contains a known env-var pattern.
+fn expand_stdio_paths(server: &McpServer) -> McpServer {
+    if server.server_type != "stdio" {
+        return server.clone();
+    }
+
+    let mut expanded = server.clone();
+    let Some(config) = expanded.server_config.as_object_mut() else {
+        return expanded;
+    };
+
+    if let Some(cmd) = config.get("command").and_then(Value::as_str) {
+        if let Ok(resolved) = expand_local_path(cmd) {
+            config.insert("command".to_string(), Value::String(resolved));
+        }
+    }
+
+    if let Some(args) = config.get("args").and_then(Value::as_array) {
+        let new_args: Vec<Value> = args
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .and_then(|s| expand_local_path(s).ok())
+                    .map(Value::String)
+                    .unwrap_or_else(|| v.clone())
+            })
+            .collect();
+        config.insert("args".to_string(), Value::Array(new_args));
+    }
+
+    expanded
+}
+
+fn sync_server_to_path(
+    tool: &RuntimeTool,
+    config_path: &PathBuf,
+    server: &McpServer,
+    enabled: bool,
+) -> Result<McpSyncDetail, String> {
     let format = tool.mcp_config_format.as_deref().unwrap_or("json");
     let field = tool.mcp_field.as_deref().unwrap_or("mcpServers");
     let format_config = get_format_config(&tool.key);
+    let should_wrap_cmd = should_wrap_cmd_for_config_path(config_path);
+
+    // Expand `~/`, `$HOME`, `%APPDATA%`, etc. in stdio command/args to absolute
+    // paths before writing to the local tool config file. CLI runners (Claude Code,
+    // Codex, ...) generally do not expand these themselves, so we resolve them on
+    // the host at write time. DB keeps the raw portable form. WSL sync is handled
+    // separately and does not go through this path.
+    let expanded = expand_stdio_paths(server);
+    let server = &expanded;
 
     match format {
         // json5 handles both standard JSON and JSONC (with comments, trailing commas)
-        "json" | "jsonc" => sync_server_to_json(&config_path, server, field, format_config, enabled),
-        "toml" => sync_server_to_toml(&config_path, server, field),
+        "json" | "jsonc" => sync_server_to_json(
+            config_path,
+            server,
+            field,
+            format_config,
+            enabled,
+            &tool.key,
+            should_wrap_cmd,
+        ),
+        "toml" => sync_server_to_toml(
+            config_path,
+            server,
+            field,
+            enabled,
+            &tool.key,
+            should_wrap_cmd,
+        ),
+        "yaml" => match tool.key.as_str() {
+            "hermes" => {
+                let wrapped = wrap_server_for_target(server, should_wrap_cmd);
+                super::hermes_mcp::sync_server_to_hermes(config_path, &wrapped, enabled)
+            }
+            _ => Err(format!(
+                "yaml format only supported for hermes, got tool {}",
+                tool.key
+            )),
+        },
+        "cordis" => match tool.key.as_str() {
+            "dsh" => {
+                let wrapped = wrap_server_for_target(server, should_wrap_cmd);
+                super::cordis_patch::sync_server_to_cordis(config_path, &wrapped)
+            }
+            _ => Err(format!(
+                "cordis format only supported for dsh, got tool {}",
+                tool.key
+            )),
+        },
         _ => Err(format!("Unsupported config format: {}", format)),
     }
     .map(|_| McpSyncDetail {
@@ -49,23 +204,53 @@ pub fn sync_server_to_tool_with_enabled(
     .map_err(|e| e.to_string())
 }
 
-/// Remove an MCP server from a specific tool's config file
-pub fn remove_server_from_tool(
-    server_name: &str,
-    tool: &RuntimeTool,
-) -> Result<(), String> {
-    let config_path = resolve_mcp_config_path(tool)
-        .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+fn should_wrap_cmd_for_config_path(config_path: &Path) -> bool {
+    cfg!(windows) && should_wrap_cmd_for_windows_config_path(config_path)
+}
 
+fn should_wrap_cmd_for_windows_config_path(config_path: &Path) -> bool {
+    config_path
+        .to_str()
+        .map(|path| !runtime_location::is_wsl_unc_path(path))
+        .unwrap_or(true)
+}
+
+fn remove_server_from_path(
+    tool: &RuntimeTool,
+    config_path: &PathBuf,
+    server_name: &str,
+) -> Result<(), String> {
     let format = tool.mcp_config_format.as_deref().unwrap_or("json");
     let field = tool.mcp_field.as_deref().unwrap_or("mcpServers");
 
     match format {
         // json5 handles both standard JSON and JSONC (with comments, trailing commas)
-        "json" | "jsonc" => remove_server_from_json(&config_path, server_name, field),
-        "toml" => remove_server_from_toml(&config_path, server_name, field),
+        "json" | "jsonc" => remove_server_from_json(config_path, server_name, field),
+        "toml" => remove_server_from_toml(config_path, server_name, field),
+        "yaml" => match tool.key.as_str() {
+            "hermes" => super::hermes_mcp::remove_server_from_hermes(config_path, server_name),
+            _ => Ok(()),
+        },
+        "cordis" => match tool.key.as_str() {
+            "dsh" => super::cordis_patch::remove_server_from_cordis(config_path, server_name),
+            _ => Ok(()),
+        },
         _ => Err(format!("Unsupported config format: {}", format)),
     }
+}
+
+/// Oh My Pi 的 mcp.json 顶层允许 `$schema`/`mcpServers`/`disabledServers`/`enabledServers`。
+/// AI Toolbox 首次创建文件时写入官方 `$schema`,不覆盖已有顶层字段。
+fn ensure_omp_mcp_schema(config: &mut Value, tool_key: &str) -> Result<(), String> {
+    if tool_key != "oh_my_pi" {
+        return Ok(());
+    }
+    config
+        .as_object_mut()
+        .ok_or_else(|| "OMP MCP config root must be a JSON object".to_string())?
+        .entry("$schema".to_string())
+        .or_insert_with(|| Value::String(OMP_MCP_SCHEMA_URL.to_string()));
+    Ok(())
 }
 
 /// Sync server to JSON/JSONC config file (using json5 for parsing)
@@ -76,6 +261,8 @@ fn sync_server_to_json(
     field: &str,
     format_config: Option<&McpFormatConfig>,
     enabled: bool,
+    tool_key: &str,
+    should_wrap_cmd: bool,
 ) -> Result<(), String> {
     // Read existing config or create new (json5 handles both JSON and JSONC)
     let mut config: Value = if config_path.exists() {
@@ -85,8 +272,7 @@ fn sync_server_to_json(
         if content.is_empty() {
             serde_json::json!({})
         } else {
-            json5::from_str(content)
-                .map_err(|e| format!("Failed to parse config file: {}", e))?
+            json5::from_str(content).map_err(|e| format!("Failed to parse config file: {}", e))?
         }
     } else {
         serde_json::json!({})
@@ -98,21 +284,20 @@ fn sync_server_to_json(
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
     }
 
-    // Get or create the MCP servers field
-    let mcp_servers = config
-        .as_object_mut()
-        .ok_or("Config is not a JSON object")?
-        .entry(field)
-        .or_insert(serde_json::json!({}));
+    // Get or create the MCP servers field, supporting nested paths like `mcp.servers`.
+    let mcp_servers = ensure_json_object_path(&mut config, field)?;
 
     // Build server config based on type and format config
-    let server_config = build_json_server_config(server, format_config, enabled)?;
+    let server_config =
+        build_json_server_config(server, format_config, enabled, tool_key, should_wrap_cmd)?;
 
     // Add/update server
     mcp_servers
         .as_object_mut()
         .ok_or(format!("{} is not a JSON object", field))?
         .insert(server.name.clone(), server_config);
+
+    ensure_omp_mcp_schema(&mut config, tool_key)?;
 
     // Write back to file with pretty formatting
     // Note: json5 crate doesn't have serialization, so we write standard JSON
@@ -141,11 +326,11 @@ fn remove_server_from_json(
     if content.is_empty() {
         return Ok(()); // Empty file, nothing to remove
     }
-    let mut config: Value = json5::from_str(content)
-        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+    let mut config: Value =
+        json5::from_str(content).map_err(|e| format!("Failed to parse config file: {}", e))?;
 
-    // Get the MCP servers field
-    if let Some(mcp_servers) = config.get_mut(field) {
+    // Get the MCP servers field, supporting nested paths like `mcp.servers`.
+    if let Some(mcp_servers) = get_json_value_by_path_mut(&mut config, field) {
         if let Some(servers_obj) = mcp_servers.as_object_mut() {
             servers_obj.remove(server_name);
         }
@@ -165,8 +350,18 @@ fn sync_server_to_toml(
     config_path: &PathBuf,
     server: &McpServer,
     field: &str,
+    enabled: bool,
+    tool_key: &str,
+    should_wrap_cmd: bool,
 ) -> Result<(), String> {
     use toml_edit::Item;
+
+    if field.contains('.') {
+        return Err(format!(
+            "Nested TOML MCP field paths are not supported: {}",
+            field
+        ));
+    }
 
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
@@ -181,7 +376,8 @@ fn sync_server_to_toml(
         if content.trim().is_empty() {
             toml_edit::DocumentMut::new()
         } else {
-            content.parse::<toml_edit::DocumentMut>()
+            content
+                .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| format!("Failed to parse TOML config: {}", e))?
         }
     } else {
@@ -194,7 +390,11 @@ fn sync_server_to_toml(
     }
 
     // Build server config using toml_edit
-    let server_table = build_toml_edit_server_config(server)?;
+    let server_table = if tool_key == "grok" {
+        build_grok_toml_server_config(server, enabled)?
+    } else {
+        build_toml_edit_server_config(server, should_wrap_cmd)?
+    };
 
     // Add/update server
     doc[field][&server.name] = Item::Table(server_table);
@@ -213,6 +413,13 @@ fn remove_server_from_toml(
     server_name: &str,
     field: &str,
 ) -> Result<(), String> {
+    if field.contains('.') {
+        return Err(format!(
+            "Nested TOML MCP field paths are not supported: {}",
+            field
+        ));
+    }
+
     if !config_path.exists() {
         return Ok(()); // Nothing to remove
     }
@@ -238,45 +445,61 @@ fn remove_server_from_toml(
     Ok(())
 }
 
-/// Build TOML server configuration using toml_edit (matches cc-switch format)
-fn build_toml_edit_server_config(server: &McpServer) -> Result<toml_edit::Table, String> {
+/// Build TOML server configuration using toml_edit
+fn build_toml_edit_server_config(
+    server: &McpServer,
+    should_wrap_cmd: bool,
+) -> Result<toml_edit::Table, String> {
     use toml_edit::{Array, Item, Table};
 
     let mut t = Table::new();
 
     match server.server_type.as_str() {
         "stdio" => {
-            let command = server.server_config
+            let command = server
+                .server_config
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or("stdio server requires 'command' field")?;
 
-            let args: Vec<String> = server.server_config
+            let args: Vec<String> = server
+                .server_config
                 .get("args")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
 
-            // Windows: wrap cmd /c if needed
-            #[cfg(windows)]
-            let (final_command, final_args) = {
+            let (final_command, final_args) = if should_wrap_cmd {
                 use super::command_normalize;
                 let temp_config = serde_json::json!({
                     "type": "stdio",
                     "command": command,
                     "args": args
                 });
-                let wrapped = command_normalize::wrap_cmd_c(&temp_config);
-                let cmd = wrapped.get("command").and_then(|v| v.as_str()).unwrap_or(command).to_string();
-                let a: Vec<String> = wrapped.get("args")
+                let wrapped =
+                    command_normalize::wrap_cmd_c_for_target(&temp_config, should_wrap_cmd);
+                let cmd = wrapped
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(command)
+                    .to_string();
+                let a: Vec<String> = wrapped
+                    .get("args")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or(args.clone());
                 (cmd, a)
+            } else {
+                (command.to_string(), args)
             };
-
-            #[cfg(not(windows))]
-            let (final_command, final_args) = (command.to_string(), args);
 
             // Insert in order: type -> command -> args -> env
             t["type"] = toml_edit::value("stdio");
@@ -305,17 +528,25 @@ fn build_toml_edit_server_config(server: &McpServer) -> Result<toml_edit::Table,
             }
         }
         "http" | "sse" => {
-            let url = server.server_config
+            let url = server
+                .server_config
                 .get("url")
                 .and_then(|v| v.as_str())
-                .ok_or(format!("{} server requires 'url' field", server.server_type))?;
+                .ok_or(format!(
+                    "{} server requires 'url' field",
+                    server.server_type
+                ))?;
 
             // Insert in order: type -> url -> http_headers
             t["type"] = toml_edit::value(&server.server_type);
             t["url"] = toml_edit::value(url);
 
             // Build http_headers as sub-table (Codex uses http_headers, not headers)
-            if let Some(headers) = server.server_config.get("headers").and_then(|v| v.as_object()) {
+            if let Some(headers) = server
+                .server_config
+                .get("headers")
+                .and_then(|v| v.as_object())
+            {
                 let mut h_tbl = Table::new();
                 for (k, v) in headers.iter() {
                     if let Some(s) = v.as_str() {
@@ -330,33 +561,240 @@ fn build_toml_edit_server_config(server: &McpServer) -> Result<toml_edit::Table,
         _ => return Err(format!("Unknown server type: {}", server.server_type)),
     }
 
+    // Codex supports the same second-based timeout keys as Grok.
+    // Leave unset so Codex keeps its own defaults (startup 10s / tool 60s).
+    copy_optional_toml_fields(
+        &mut t,
+        &server.server_config,
+        &["startup_timeout_sec", "tool_timeout_sec"],
+    )?;
+
     Ok(t)
+}
+
+/// Build the official Grok MCP schema. Grok does not use Codex's `type` or
+/// `http_headers` fields and must keep npm commands unwrapped on every target.
+fn build_grok_toml_server_config(
+    server: &McpServer,
+    enabled: bool,
+) -> Result<toml_edit::Table, String> {
+    use toml_edit::{Array, Item, Table};
+
+    let mut table = Table::new();
+    match server.server_type.as_str() {
+        "stdio" => {
+            let command = server
+                .server_config
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or("stdio server requires 'command' field")?;
+            table["command"] = toml_edit::value(command);
+
+            if let Some(args) = server.server_config.get("args").and_then(Value::as_array) {
+                let mut array = Array::new();
+                for argument in args.iter().filter_map(Value::as_str) {
+                    array.push(argument);
+                }
+                table["args"] = Item::Value(toml_edit::Value::Array(array));
+            }
+            if let Some(env) = server.server_config.get("env").and_then(Value::as_object) {
+                let mut env_table = Table::new();
+                for (key, value) in env {
+                    if let Some(value) = value.as_str() {
+                        env_table[key] = toml_edit::value(value);
+                    }
+                }
+                table["env"] = Item::Table(env_table);
+            }
+            copy_optional_toml_fields(
+                &mut table,
+                &server.server_config,
+                &[
+                    "cwd",
+                    "startup_timeout_sec",
+                    "tool_timeout_sec",
+                    "tool_timeouts",
+                ],
+            )?;
+        }
+        "http" | "sse" => {
+            let url = server
+                .server_config
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{} server requires 'url' field", server.server_type))?;
+            table["url"] = toml_edit::value(url);
+            if let Some(headers) = server
+                .server_config
+                .get("headers")
+                .and_then(Value::as_object)
+            {
+                let mut headers_table = Table::new();
+                for (key, value) in headers {
+                    if let Some(value) = value.as_str() {
+                        headers_table[key] = toml_edit::value(value);
+                    }
+                }
+                table["headers"] = Item::Table(headers_table);
+            }
+            copy_optional_toml_fields(
+                &mut table,
+                &server.server_config,
+                &["bearer_token_env_var"],
+            )?;
+        }
+        _ => return Err(format!("Unknown server type: {}", server.server_type)),
+    }
+    table["enabled"] = toml_edit::value(enabled);
+    Ok(table)
+}
+
+fn copy_optional_toml_fields(
+    table: &mut toml_edit::Table,
+    config: &Value,
+    field_names: &[&str],
+) -> Result<(), String> {
+    for field_name in field_names {
+        if let Some(value) = config.get(*field_name).filter(|value| !value.is_null()) {
+            table[field_name] = json_to_toml_item(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item, String> {
+    let serialized = toml::to_string(&serde_json::json!({ "holder": value }))
+        .map_err(|error| format!("Failed to serialize MCP TOML field: {error}"))?;
+    let mut document = serialized
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("Failed to build MCP TOML field: {error}"))?;
+    document
+        .remove("holder")
+        .ok_or_else(|| "Failed to build MCP TOML field".to_string())
 }
 
 /// Build JSON server configuration from McpServer
 /// Applies format conversion if format_config is provided
-fn build_json_server_config(server: &McpServer, format_config: Option<&McpFormatConfig>, enabled: bool) -> Result<Value, String> {
+fn build_json_server_config(
+    server: &McpServer,
+    format_config: Option<&McpFormatConfig>,
+    enabled: bool,
+    tool_key: &str,
+    should_wrap_cmd: bool,
+) -> Result<Value, String> {
     match server.server_type.as_str() {
-        "stdio" => build_stdio_config(server, format_config, enabled),
-        "http" | "sse" => build_http_config(server, format_config, enabled),
+        "stdio" => build_stdio_config(server, format_config, enabled, tool_key, should_wrap_cmd),
+        "http" | "sse" => build_http_config(server, format_config, enabled, tool_key),
         _ => Err(format!("Unknown server type: {}", server.server_type)),
     }
 }
 
+fn detect_server_type_with_format_config(
+    server_config: &Value,
+    format_config: &McpFormatConfig,
+) -> String {
+    if let Some(tool_type) = server_config.get("type").and_then(|v| v.as_str()) {
+        return format_config.map_type_from_tool(tool_type);
+    }
+
+    if server_config.get("command").is_some() {
+        return "stdio".to_string();
+    }
+
+    if format_config.infer_remote_type_from_url_fields_when_type_missing {
+        if let Some(server_type) = format_config.infer_remote_type_from_url_fields(server_config) {
+            if server_type == "sse" {
+                // When the tool omits `type`, treat a plain `url` as the generic HTTP fallback.
+                return "http".to_string();
+            }
+            return server_type;
+        }
+        if server_config.get("httpUrl").is_some() || server_config.get("serverUrl").is_some() {
+            return "http".to_string();
+        }
+    }
+
+    format_config.map_type_from_tool(format_config.default_tool_type)
+}
+
+fn extract_remote_url_with_format_config<'a>(
+    server_config: &'a Value,
+    format_config: &McpFormatConfig,
+    server_type: &str,
+) -> Option<&'a str> {
+    let preferred_field = format_config.remote_url_field_for_type(server_type);
+
+    if let Some(url) = server_config.get(preferred_field).and_then(|v| v.as_str()) {
+        return Some(url);
+    }
+
+    if server_type == "http" && preferred_field != "url" {
+        for fallback_field in ["httpUrl", "serverUrl", "url"] {
+            if fallback_field == preferred_field {
+                continue;
+            }
+            if let Some(url) = server_config.get(fallback_field).and_then(|v| v.as_str()) {
+                return Some(url);
+            }
+        }
+    }
+
+    None
+}
+
 /// Build stdio server configuration
-fn build_stdio_config(server: &McpServer, format_config: Option<&McpFormatConfig>, enabled: bool) -> Result<Value, String> {
-    let command = server.server_config
+fn build_stdio_config(
+    server: &McpServer,
+    format_config: Option<&McpFormatConfig>,
+    enabled: bool,
+    tool_key: &str,
+    should_wrap_cmd: bool,
+) -> Result<Value, String> {
+    let command = server
+        .server_config
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or("stdio server requires 'command' field")?;
 
-    let args: Vec<String> = server.server_config
+    let args: Vec<String> = server
+        .server_config
         .get("args")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let env = server.server_config.get("env").cloned();
+
+    if tool_key == "openclaw" {
+        let mut result = server
+            .server_config
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+        result.insert("type".to_string(), Value::String("stdio".to_string()));
+        result.insert("command".to_string(), Value::String(command.to_string()));
+        result.insert(
+            "args".to_string(),
+            Value::Array(args.into_iter().map(Value::String).collect()),
+        );
+
+        if let Some(env_val) = env {
+            if env_val.is_object() && !env_val.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                result.insert("env".to_string(), env_val);
+            } else {
+                result.remove("env");
+            }
+        } else {
+            result.remove("env");
+        }
+
+        return Ok(Value::Object(result));
+    }
 
     // Apply format conversion if config is provided
     if let Some(config) = format_config {
@@ -371,8 +809,10 @@ fn build_stdio_config(server: &McpServer, format_config: Option<&McpFormatConfig
             let mut command_array = vec![Value::String(command.to_string())];
             command_array.extend(args.into_iter().map(Value::String));
 
-            // Windows: wrap cmd /c for OpenCode array format
-            let command_array = command_normalize::wrap_cmd_c_opencode_array(&command_array);
+            let command_array = command_normalize::wrap_cmd_c_opencode_array_for_target(
+                &command_array,
+                should_wrap_cmd,
+            );
             result.insert("command".to_string(), Value::Array(command_array));
         } else {
             // Standard command + args format with format_config
@@ -382,13 +822,23 @@ fn build_stdio_config(server: &McpServer, format_config: Option<&McpFormatConfig
                 "command": command,
                 "args": args,
             });
-            let temp_result = command_normalize::wrap_cmd_c(&temp_result);
+            let temp_result =
+                command_normalize::wrap_cmd_c_for_target(&temp_result, should_wrap_cmd);
 
             // Extract wrapped command and args
-            let final_command = temp_result.get("command").and_then(|v| v.as_str()).unwrap_or(command);
-            let final_args = temp_result.get("args").cloned().unwrap_or(Value::Array(vec![]));
+            let final_command = temp_result
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or(command);
+            let final_args = temp_result
+                .get("args")
+                .cloned()
+                .unwrap_or(Value::Array(vec![]));
 
-            result.insert("command".to_string(), Value::String(final_command.to_string()));
+            result.insert(
+                "command".to_string(),
+                Value::String(final_command.to_string()),
+            );
             result.insert("args".to_string(), final_args);
         }
 
@@ -426,21 +876,60 @@ fn build_stdio_config(server: &McpServer, format_config: Option<&McpFormatConfig
             }
         }
 
-        // Windows: wrap cmd /c for standard format
-        let result = command_normalize::wrap_cmd_c(&result);
+        let result = command_normalize::wrap_cmd_c_for_target(&result, should_wrap_cmd);
 
         Ok(result)
     }
 }
 
 /// Build HTTP/SSE server configuration
-fn build_http_config(server: &McpServer, format_config: Option<&McpFormatConfig>, enabled: bool) -> Result<Value, String> {
-    let url = server.server_config
+fn build_http_config(
+    server: &McpServer,
+    format_config: Option<&McpFormatConfig>,
+    enabled: bool,
+    tool_key: &str,
+) -> Result<Value, String> {
+    let url = server
+        .server_config
         .get("url")
         .and_then(|v| v.as_str())
-        .ok_or(format!("{} server requires 'url' field", server.server_type))?;
+        .ok_or(format!(
+            "{} server requires 'url' field",
+            server.server_type
+        ))?;
 
     let headers = server.server_config.get("headers").cloned();
+
+    if tool_key == "openclaw" {
+        let mut result = server
+            .server_config
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+        result.insert(
+            "type".to_string(),
+            Value::String(server.server_type.clone()),
+        );
+        result.insert("url".to_string(), Value::String(url.to_string()));
+
+        if let Some(headers_val) = headers {
+            if headers_val.is_object()
+                && !headers_val
+                    .as_object()
+                    .map(|o| o.is_empty())
+                    .unwrap_or(true)
+            {
+                result.insert("headers".to_string(), headers_val);
+            } else {
+                result.remove("headers");
+            }
+        } else {
+            result.remove("headers");
+        }
+
+        return Ok(Value::Object(result));
+    }
 
     // Apply format conversion if config is provided
     if let Some(config) = format_config {
@@ -449,10 +938,16 @@ fn build_http_config(server: &McpServer, format_config: Option<&McpFormatConfig>
         // Map server type
         let mapped_type = config.map_type_to_tool(&server.server_type);
         result.insert("type".to_string(), Value::String(mapped_type.to_string()));
-        result.insert("url".to_string(), Value::String(url.to_string()));
+        let url_field = config.remote_url_field_for_type(&server.server_type);
+        result.insert(url_field.to_string(), Value::String(url.to_string()));
 
         if let Some(headers_val) = headers {
-            if headers_val.is_object() && !headers_val.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            if headers_val.is_object()
+                && !headers_val
+                    .as_object()
+                    .map(|o| o.is_empty())
+                    .unwrap_or(true)
+            {
                 result.insert("headers".to_string(), headers_val);
             }
         }
@@ -478,7 +973,12 @@ fn build_http_config(server: &McpServer, format_config: Option<&McpFormatConfig>
         });
 
         if let Some(headers_val) = headers {
-            if headers_val.is_object() && !headers_val.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            if headers_val.is_object()
+                && !headers_val
+                    .as_object()
+                    .map(|o| o.is_empty())
+                    .unwrap_or(true)
+            {
                 result["headers"] = headers_val;
             }
         }
@@ -488,10 +988,29 @@ fn build_http_config(server: &McpServer, format_config: Option<&McpFormatConfig>
 }
 
 /// Import MCP servers from a tool's config file
-pub fn import_servers_from_tool(tool: &RuntimeTool) -> Result<Vec<McpServer>, String> {
-    let config_path = resolve_mcp_config_path(tool)
+pub fn import_servers_from_tool(
+    db: &crate::db::SqliteDbState,
+    tool: &RuntimeTool,
+) -> Result<Vec<McpServer>, String> {
+    let config_path = resolve_mcp_config_path_with_db(db, tool)
         .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+    import_servers_from_path(tool, &config_path)
+}
 
+pub async fn import_servers_from_tool_async(
+    db: &crate::db::SqliteDbState,
+    tool: &RuntimeTool,
+) -> Result<Vec<McpServer>, String> {
+    let config_path = resolve_mcp_config_path_with_db_async(db, tool)
+        .await
+        .ok_or_else(|| format!("Tool {} does not support MCP", tool.key))?;
+    import_servers_from_path(tool, &config_path)
+}
+
+pub(crate) fn import_servers_from_path(
+    tool: &RuntimeTool,
+    config_path: &PathBuf,
+) -> Result<Vec<McpServer>, String> {
     if !config_path.exists() {
         return Ok(vec![]);
     }
@@ -502,8 +1021,16 @@ pub fn import_servers_from_tool(tool: &RuntimeTool) -> Result<Vec<McpServer>, St
 
     match format {
         // json5 handles both standard JSON and JSONC (with comments, trailing commas)
-        "json" | "jsonc" => import_servers_from_json(&config_path, field, format_config),
-        "toml" => import_servers_from_toml(&config_path, field),
+        "json" | "jsonc" => import_servers_from_json(config_path, field, format_config),
+        "toml" => import_servers_from_toml(config_path, field, &tool.key),
+        "yaml" => match tool.key.as_str() {
+            "hermes" => super::hermes_mcp::import_servers_from_hermes(config_path),
+            _ => Ok(vec![]),
+        },
+        "cordis" => match tool.key.as_str() {
+            "dsh" => super::cordis_patch::import_servers_from_cordis(config_path),
+            _ => Ok(vec![]),
+        },
         _ => Err(format!("Unsupported config format: {}", format)),
     }
 }
@@ -520,8 +1047,8 @@ fn import_servers_from_json(
     if content.is_empty() {
         return Ok(vec![]);
     }
-    let config: Value = json5::from_str(content)
-        .map_err(|e| format!("Failed to parse config file: {}", e))?;
+    let config: Value =
+        json5::from_str(content).map_err(|e| format!("Failed to parse config file: {}", e))?;
 
     parse_mcp_servers_from_value(&config, field, format_config)
 }
@@ -532,7 +1059,7 @@ fn parse_mcp_servers_from_value(
     field: &str,
     format_config: Option<&McpFormatConfig>,
 ) -> Result<Vec<McpServer>, String> {
-    let Some(mcp_servers) = config.get(field) else {
+    let Some(mcp_servers) = get_json_value_by_path(config, field) else {
         return Ok(vec![]);
     };
 
@@ -577,12 +1104,7 @@ fn parse_server_with_format_config(
     now: i64,
 ) -> Option<McpServer> {
     // Get the tool-specific type and convert to unified type
-    // Default to the format config's default type when type field is missing
-    let tool_type = server_config
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or(format_config.default_tool_type);
-    let server_type = format_config.map_type_from_tool(tool_type);
+    let server_type = detect_server_type_with_format_config(server_config, format_config);
 
     // Build unified server_config
     let unified_config = if server_type == "stdio" {
@@ -609,7 +1131,8 @@ fn parse_server_with_format_config(
         } else {
             // Standard format: command is string, args is separate
             let cmd = command_val.as_str()?.to_string();
-            let args = server_config.get("args")
+            let args = server_config
+                .get("args")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.clone())
                 .unwrap_or_default();
@@ -633,7 +1156,8 @@ fn parse_server_with_format_config(
         command_normalize::unwrap_cmd_c(&result)
     } else {
         // HTTP/SSE type
-        let url = server_config.get("url").and_then(|v| v.as_str())?;
+        let url =
+            extract_remote_url_with_format_config(server_config, format_config, &server_type)?;
         let headers = server_config.get("headers").cloned();
 
         let mut result = serde_json::json!({
@@ -655,9 +1179,13 @@ fn parse_server_with_format_config(
         enabled_tools: vec![],
         sync_details: None,
         description: None,
+        user_group: None,
+        user_note: None,
         tags: vec![],
         timeout: None,
         sort_index: 0,
+        management_enabled: true,
+        disabled_previous_tools: Vec::new(),
         created_at: now,
         updated_at: now,
     })
@@ -665,11 +1193,7 @@ fn parse_server_with_format_config(
 
 /// Parse standard server config (no format conversion needed)
 /// Used by Claude Code, Gemini CLI, etc.
-fn parse_standard_server_config(
-    name: &str,
-    server_config: &Value,
-    now: i64,
-) -> Option<McpServer> {
+fn parse_standard_server_config(name: &str, server_config: &Value, now: i64) -> Option<McpServer> {
     // Detect server type: check explicit "type" field first, fall back to field presence
     let server_type = server_config
         .get("type")
@@ -680,7 +1204,7 @@ fn parse_standard_server_config(
             } else if server_config.get("url").is_some() {
                 "http"
             } else {
-                "stdio" // Default to stdio (matching cc-switch)
+                "stdio" // Default to stdio
             }
         });
 
@@ -699,9 +1223,13 @@ fn parse_standard_server_config(
         enabled_tools: vec![],
         sync_details: None,
         description: None,
+        user_group: None,
+        user_note: None,
         tags: vec![],
         timeout: None,
         sort_index: 0,
+        management_enabled: true,
+        disabled_previous_tools: Vec::new(),
         created_at: now,
         updated_at: now,
     })
@@ -711,7 +1239,9 @@ fn parse_standard_server_config(
 ///
 /// Plugin `.mcp.json` uses a flat format: `{ "server-name": { "type": "http", "url": "..." } }`
 /// i.e. the root object IS the mcpServers map (no wrapper field).
-pub fn import_servers_from_plugin_mcp_json(path: &std::path::Path) -> Result<Vec<McpServer>, String> {
+pub fn import_servers_from_plugin_mcp_json(
+    path: &std::path::Path,
+) -> Result<Vec<McpServer>, String> {
     if !path.exists() {
         return Ok(vec![]);
     }
@@ -723,8 +1253,8 @@ pub fn import_servers_from_plugin_mcp_json(path: &std::path::Path) -> Result<Vec
         return Ok(vec![]);
     }
 
-    let root: serde_json::Value = json5::from_str(content)
-        .map_err(|e| format!("Failed to parse plugin .mcp.json: {}", e))?;
+    let root: serde_json::Value =
+        json5::from_str(content).map_err(|e| format!("Failed to parse plugin .mcp.json: {}", e))?;
 
     let Some(obj) = root.as_object() else {
         return Ok(vec![]);
@@ -744,14 +1274,26 @@ pub fn import_servers_from_plugin_mcp_json(path: &std::path::Path) -> Result<Vec
 }
 
 /// Import servers from TOML config file
-fn import_servers_from_toml(config_path: &PathBuf, field: &str) -> Result<Vec<McpServer>, String> {
+fn import_servers_from_toml(
+    config_path: &PathBuf,
+    field: &str,
+    tool_key: &str,
+) -> Result<Vec<McpServer>, String> {
+    if field.contains('.') {
+        return Err(format!(
+            "Nested TOML MCP field paths are not supported: {}",
+            field
+        ));
+    }
+
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config file: {}", e))?;
     let content_trimmed = content.trim();
     if content_trimmed.is_empty() {
         return Ok(vec![]);
     }
-    let config: toml::Table = content_trimmed.parse()
+    let config: toml::Table = content_trimmed
+        .parse()
         .map_err(|e| format!("Failed to parse TOML config: {}", e))?;
 
     let Some(toml::Value::Table(servers_table)) = config.get(field) else {
@@ -766,7 +1308,7 @@ fn import_servers_from_toml(config_path: &PathBuf, field: &str) -> Result<Vec<Mc
             continue;
         };
 
-        // Detect server type: use "type" field, default to "stdio" (matching cc-switch)
+        // Grok intentionally omits `type`; command/url is the authoritative discriminator.
         let server_type = config_table
             .get("type")
             .and_then(|v| v.as_str())
@@ -789,7 +1331,8 @@ fn import_servers_from_toml(config_path: &PathBuf, field: &str) -> Result<Vec<Mc
                     json_config.insert("command".into(), Value::String(cmd.to_string()));
                 }
                 if let Some(args) = config_table.get("args").and_then(|v| v.as_array()) {
-                    let arr: Vec<Value> = args.iter()
+                    let arr: Vec<Value> = args
+                        .iter()
                         .filter_map(|x| x.as_str().map(|s| Value::String(s.to_string())))
                         .collect();
                     if !arr.is_empty() {
@@ -807,15 +1350,32 @@ fn import_servers_from_toml(config_path: &PathBuf, field: &str) -> Result<Vec<Mc
                         json_config.insert("env".into(), Value::Object(env_json));
                     }
                 }
+                if tool_key == "grok" {
+                    copy_optional_import_fields(
+                        config_table,
+                        &mut json_config,
+                        &[
+                            "cwd",
+                            "enabled",
+                            "startup_timeout_sec",
+                            "tool_timeout_sec",
+                            "tool_timeouts",
+                        ],
+                    );
+                }
             }
             "http" | "sse" => {
                 if let Some(url) = config_table.get("url").and_then(|v| v.as_str()) {
                     json_config.insert("url".into(), Value::String(url.to_string()));
                 }
-                // Read from http_headers (Codex format) or headers (legacy), prefer http_headers
-                let headers_tbl = config_table.get("http_headers")
-                    .and_then(|v| v.as_table())
-                    .or_else(|| config_table.get("headers").and_then(|v| v.as_table()));
+                let headers_tbl = if tool_key == "grok" {
+                    config_table.get("headers").and_then(|v| v.as_table())
+                } else {
+                    config_table
+                        .get("http_headers")
+                        .and_then(|v| v.as_table())
+                        .or_else(|| config_table.get("headers").and_then(|v| v.as_table()))
+                };
                 if let Some(h_tbl) = headers_tbl {
                     let mut headers_json = serde_json::Map::new();
                     for (k, v) in h_tbl {
@@ -827,8 +1387,24 @@ fn import_servers_from_toml(config_path: &PathBuf, field: &str) -> Result<Vec<Mc
                         json_config.insert("headers".into(), Value::Object(headers_json));
                     }
                 }
+                if tool_key == "grok" {
+                    copy_optional_import_fields(
+                        config_table,
+                        &mut json_config,
+                        &["bearer_token_env_var", "enabled"],
+                    );
+                }
             }
             _ => continue,
+        }
+
+        // Codex keeps second-based timeouts in server_config so re-sync does not drop them.
+        if tool_key == "codex" {
+            copy_optional_import_fields(
+                config_table,
+                &mut json_config,
+                &["startup_timeout_sec", "tool_timeout_sec"],
+            );
         }
 
         // Unwrap cmd /c for import (normalize for database storage)
@@ -846,13 +1422,756 @@ fn import_servers_from_toml(config_path: &PathBuf, field: &str) -> Result<Vec<Mc
             enabled_tools: vec![],
             sync_details: None,
             description: None,
+            user_group: None,
+            user_note: None,
             tags: vec![],
             timeout: None,
             sort_index: 0,
+            management_enabled: true,
+            disabled_previous_tools: Vec::new(),
             created_at: now,
             updated_at: now,
         });
     }
 
     Ok(servers)
+}
+
+fn copy_optional_import_fields(
+    source: &toml::Table,
+    target: &mut serde_json::Map<String, Value>,
+    field_names: &[&str],
+) {
+    for field_name in field_names {
+        if let Some(value) = source.get(*field_name) {
+            if let Ok(value) = serde_json::to_value(value) {
+                target.insert((*field_name).to_string(), value);
+            }
+        }
+    }
+}
+
+fn split_field_path(field: &str) -> Vec<&str> {
+    field
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn get_json_value_by_path<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    let path = split_field_path(field);
+    if path.is_empty() {
+        return Some(value);
+    }
+
+    let mut current = value;
+    for segment in path {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+fn get_json_value_by_path_mut<'a>(value: &'a mut Value, field: &str) -> Option<&'a mut Value> {
+    let path = split_field_path(field);
+    if path.is_empty() {
+        return Some(value);
+    }
+
+    let mut current = value;
+    for segment in path {
+        current = current.get_mut(segment)?;
+    }
+    Some(current)
+}
+
+fn ensure_json_object_path<'a>(value: &'a mut Value, field: &str) -> Result<&'a mut Value, String> {
+    let path = split_field_path(field);
+    if path.is_empty() {
+        return Ok(value);
+    }
+
+    let mut current = value;
+    for segment in path {
+        let object = current
+            .as_object_mut()
+            .ok_or_else(|| format!("{} is not a JSON object", segment))?;
+        current = object
+            .entry(segment.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+
+    if !current.is_object() {
+        return Err(format!("{} is not a JSON object", field));
+    }
+
+    Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coding::mcp::format_configs::get_format_config;
+    use serde_json::json;
+
+    fn build_openclaw_stdio_server() -> McpServer {
+        McpServer {
+            id: String::new(),
+            name: "gemini".to_string(),
+            server_type: "stdio".to_string(),
+            server_config: json!({
+                "command": "node",
+                "args": ["server.js"],
+            }),
+            enabled_tools: vec![],
+            sync_details: None,
+            description: None,
+            user_group: None,
+            user_note: None,
+            tags: vec![],
+            timeout: None,
+            sort_index: 0,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn build_http_server() -> McpServer {
+        McpServer {
+            id: String::new(),
+            name: "remote".to_string(),
+            server_type: "http".to_string(),
+            server_config: json!({
+                "url": "https://example.com/mcp",
+                "headers": {
+                    "Authorization": "Bearer token"
+                }
+            }),
+            enabled_tools: vec![],
+            sync_details: None,
+            description: None,
+            user_group: None,
+            user_note: None,
+            tags: vec![],
+            timeout: None,
+            sort_index: 0,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn build_npx_stdio_server() -> McpServer {
+        McpServer {
+            id: String::new(),
+            name: "fast-context".to_string(),
+            server_type: "stdio".to_string(),
+            server_config: json!({
+                "command": "npx",
+                "args": ["-y", "--prefer-online", "@sammysnake/fast-context-mcp"],
+            }),
+            enabled_tools: vec![],
+            sync_details: None,
+            description: None,
+            user_group: None,
+            user_note: None,
+            tags: vec![],
+            timeout: None,
+            sort_index: 0,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn build_openclaw_stdio_config_keeps_type_field() {
+        let server = build_openclaw_stdio_server();
+
+        let config = build_json_server_config(&server, None, true, "openclaw", false).unwrap();
+
+        assert_eq!(config["type"], "stdio");
+        assert_eq!(config["command"], "node");
+        assert_eq!(config["args"], json!(["server.js"]));
+    }
+
+    #[test]
+    fn windows_config_path_wrap_check_excludes_wsl_unc_paths() {
+        assert!(!should_wrap_cmd_for_windows_config_path(Path::new(
+            r"\\wsl.localhost\Arch\home\tester\.codex\config.toml"
+        )));
+        assert!(!should_wrap_cmd_for_windows_config_path(Path::new(
+            r"\\wsl$\Ubuntu\home\tester\.claude.json"
+        )));
+        assert!(should_wrap_cmd_for_windows_config_path(Path::new(
+            r"C:\Users\tester\.codex\config.toml"
+        )));
+    }
+
+    #[test]
+    fn codex_toml_config_skips_cmd_wrapper_for_wsl_target() {
+        let server = build_npx_stdio_server();
+
+        let table = build_toml_edit_server_config(&server, false).unwrap();
+
+        assert_eq!(table["command"].as_str(), Some("npx"));
+        assert_eq!(
+            table["args"].as_array().map(|args| args
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec![
+                "-y",
+                "--prefer-online",
+                "@sammysnake/fast-context-mcp",
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_toml_config_wraps_cmd_for_windows_target() {
+        let server = build_npx_stdio_server();
+
+        let table = build_toml_edit_server_config(&server, true).unwrap();
+
+        assert_eq!(table["command"].as_str(), Some("cmd"));
+        assert_eq!(
+            table["args"].as_array().map(|args| args
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec![
+                "/c",
+                "npx",
+                "-y",
+                "--prefer-online",
+                "@sammysnake/fast-context-mcp",
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_toml_config_writes_timeout_fields() {
+        let mut server = build_npx_stdio_server();
+        server.server_config["startup_timeout_sec"] = json!(120);
+        server.server_config["tool_timeout_sec"] = json!(300);
+
+        let table = build_toml_edit_server_config(&server, false).expect("build Codex MCP");
+
+        assert_eq!(table["type"].as_str(), Some("stdio"));
+        assert_eq!(table["command"].as_str(), Some("npx"));
+        assert_eq!(table["startup_timeout_sec"].as_integer(), Some(120));
+        assert_eq!(table["tool_timeout_sec"].as_integer(), Some(300));
+    }
+
+    #[test]
+    fn codex_toml_config_omits_timeout_fields_when_unset() {
+        let server = build_npx_stdio_server();
+
+        let table = build_toml_edit_server_config(&server, false).expect("build Codex MCP");
+
+        assert!(table.get("startup_timeout_sec").is_none());
+        assert!(table.get("tool_timeout_sec").is_none());
+    }
+
+    #[test]
+    fn codex_toml_import_preserves_timeout_fields() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.local]
+type = "stdio"
+command = "npx"
+args = ["-y", "pkg"]
+startup_timeout_sec = 120
+tool_timeout_sec = 300
+
+[mcp_servers.remote]
+type = "http"
+url = "https://example.com/mcp"
+startup_timeout_sec = 25
+tool_timeout_sec = 1800
+
+[mcp_servers.remote.http_headers]
+X-Test = "yes"
+"#,
+        )
+        .expect("write fixture");
+
+        let servers = import_servers_from_toml(&config_path, "mcp_servers", "codex")
+            .expect("import Codex MCP");
+        let local = servers
+            .iter()
+            .find(|server| server.name == "local")
+            .expect("local server");
+        assert_eq!(local.server_config["command"], "npx");
+        assert_eq!(local.server_config["startup_timeout_sec"], 120);
+        assert_eq!(local.server_config["tool_timeout_sec"], 300);
+        let remote = servers
+            .iter()
+            .find(|server| server.name == "remote")
+            .expect("remote server");
+        assert_eq!(remote.server_config["url"], "https://example.com/mcp");
+        assert_eq!(remote.server_config["headers"]["X-Test"], "yes");
+        assert_eq!(remote.server_config["startup_timeout_sec"], 25);
+        assert_eq!(remote.server_config["tool_timeout_sec"], 1800);
+    }
+
+    #[test]
+    fn grok_toml_config_uses_official_fields_without_cmd_wrapper() {
+        let mut server = build_npx_stdio_server();
+        server.server_config["cwd"] = json!("/workspace");
+        server.server_config["startup_timeout_sec"] = json!(30);
+        server.server_config["tool_timeout_sec"] = json!(6000);
+        server.server_config["tool_timeouts"] = json!({ "search": 45 });
+
+        let table = build_grok_toml_server_config(&server, false).expect("build Grok MCP");
+
+        assert!(table.get("type").is_none());
+        assert_eq!(table["command"].as_str(), Some("npx"));
+        assert_eq!(table["cwd"].as_str(), Some("/workspace"));
+        assert_eq!(table["enabled"].as_bool(), Some(false));
+        assert_eq!(table["startup_timeout_sec"].as_integer(), Some(30));
+        assert_eq!(table["tool_timeout_sec"].as_integer(), Some(6000));
+        assert_eq!(table["tool_timeouts"]["search"].as_integer(), Some(45));
+    }
+
+    #[test]
+    fn grok_toml_import_preserves_remote_and_timeout_fields() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.local]
+command = "npx"
+args = ["-y", "pkg"]
+cwd = "/workspace"
+enabled = false
+startup_timeout_sec = 30
+tool_timeout_sec = 6000
+
+[mcp_servers.local.tool_timeouts]
+search = 45
+
+[mcp_servers.remote]
+url = "https://example.com/mcp"
+enabled = true
+bearer_token_env_var = "MCP_TOKEN"
+
+[mcp_servers.remote.headers]
+X-Test = "yes"
+"#,
+        )
+        .expect("write fixture");
+
+        let servers =
+            import_servers_from_toml(&config_path, "mcp_servers", "grok").expect("import Grok MCP");
+        let local = servers
+            .iter()
+            .find(|server| server.name == "local")
+            .expect("local server");
+        assert_eq!(local.server_config["command"], "npx");
+        assert_eq!(local.server_config["cwd"], "/workspace");
+        assert_eq!(local.server_config["enabled"], false);
+        assert_eq!(local.server_config["tool_timeouts"]["search"], 45);
+        let remote = servers
+            .iter()
+            .find(|server| server.name == "remote")
+            .expect("remote server");
+        assert_eq!(remote.server_config["headers"]["X-Test"], "yes");
+        assert_eq!(remote.server_config["bearer_token_env_var"], "MCP_TOKEN");
+    }
+
+    #[test]
+    fn standard_json_config_skips_cmd_wrapper_for_wsl_target() {
+        let server = build_npx_stdio_server();
+
+        let config = build_json_server_config(&server, None, true, "claude_code", false).unwrap();
+
+        assert_eq!(config["command"], "npx");
+        assert_eq!(
+            config["args"],
+            json!(["-y", "--prefer-online", "@sammysnake/fast-context-mcp"])
+        );
+    }
+
+    #[test]
+    fn standard_json_config_wraps_cmd_for_windows_target() {
+        let server = build_npx_stdio_server();
+
+        let config = build_json_server_config(&server, None, true, "claude_code", true).unwrap();
+
+        assert_eq!(config["command"], "cmd");
+        assert_eq!(
+            config["args"],
+            json!([
+                "/c",
+                "npx",
+                "-y",
+                "--prefer-online",
+                "@sammysnake/fast-context-mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn opencode_array_config_skips_cmd_wrapper_for_wsl_target() {
+        let server = build_npx_stdio_server();
+        let format = get_format_config("opencode").expect("opencode format should exist");
+
+        let config =
+            build_json_server_config(&server, Some(format), true, "opencode", false).unwrap();
+
+        assert_eq!(
+            config["command"],
+            json!([
+                "npx",
+                "-y",
+                "--prefer-online",
+                "@sammysnake/fast-context-mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn opencode_array_config_wraps_cmd_for_windows_target() {
+        let server = build_npx_stdio_server();
+        let format = get_format_config("opencode").expect("opencode format should exist");
+
+        let config =
+            build_json_server_config(&server, Some(format), true, "opencode", true).unwrap();
+
+        assert_eq!(
+            config["command"],
+            json!([
+                "cmd",
+                "/c",
+                "npx",
+                "-y",
+                "--prefer-online",
+                "@sammysnake/fast-context-mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_nested_openclaw_mcp_servers() {
+        let config = json!({
+            "mcp": {
+                "servers": {
+                    "gemini": {
+                        "type": "stdio",
+                        "command": "node",
+                        "args": ["server.js"]
+                    }
+                }
+            }
+        });
+
+        let servers = parse_mcp_servers_from_value(&config, "mcp.servers", None).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "gemini");
+        assert_eq!(servers[0].server_type, "stdio");
+        assert_eq!(servers[0].server_config["command"], "node");
+        assert_eq!(servers[0].server_config["args"], json!(["server.js"]));
+    }
+
+    #[test]
+    fn build_gemini_like_http_config_uses_http_url() {
+        let server = build_http_server();
+        let format = get_format_config("gemini_cli").expect("gemini_cli format should exist");
+
+        let config =
+            build_json_server_config(&server, Some(format), true, "gemini_cli", false).unwrap();
+
+        assert_eq!(config["type"], "http");
+        assert_eq!(config["httpUrl"], "https://example.com/mcp");
+        assert!(config.get("url").is_none());
+        assert_eq!(config["headers"]["Authorization"], "Bearer token");
+    }
+
+    #[test]
+    fn build_antigravity_http_config_uses_server_url() {
+        let server = build_http_server();
+        let format = get_format_config("antigravity").expect("antigravity format should exist");
+
+        let config =
+            build_json_server_config(&server, Some(format), true, "antigravity", false).unwrap();
+
+        assert_eq!(config["type"], "http");
+        assert_eq!(config["serverUrl"], "https://example.com/mcp");
+        assert!(config.get("httpUrl").is_none());
+        assert!(config.get("url").is_none());
+        assert_eq!(config["headers"]["Authorization"], "Bearer token");
+    }
+
+    #[test]
+    fn build_standard_http_config_keeps_url_for_non_gemini_tools() {
+        let server = build_http_server();
+
+        let config = build_json_server_config(&server, None, true, "claude_code", false).unwrap();
+
+        assert_eq!(config["type"], "http");
+        assert_eq!(config["url"], "https://example.com/mcp");
+        assert!(config.get("httpUrl").is_none());
+    }
+
+    #[test]
+    fn parse_gemini_like_http_prefers_http_url() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "httpUrl": "https://example.com/mcp",
+                    "url": "https://legacy.example.com/mcp",
+                    "headers": {
+                        "Authorization": "Bearer token"
+                    }
+                }
+            }
+        });
+        let format = get_format_config("qwen_code").expect("qwen_code format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "http");
+        assert_eq!(servers[0].server_config["url"], "https://example.com/mcp");
+        assert_eq!(
+            servers[0].server_config["headers"]["Authorization"],
+            "Bearer token"
+        );
+    }
+
+    #[test]
+    fn parse_gemini_like_http_falls_back_to_url() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "url": "https://legacy.example.com/mcp"
+                }
+            }
+        });
+        let format = get_format_config("antigravity").expect("antigravity format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "http");
+        assert_eq!(
+            servers[0].server_config["url"],
+            "https://legacy.example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn parse_antigravity_http_prefers_server_url() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "serverUrl": "https://example.com/mcp",
+                    "httpUrl": "https://legacy.example.com/mcp",
+                    "headers": {
+                        "Authorization": "Bearer token"
+                    }
+                }
+            }
+        });
+        let format = get_format_config("antigravity").expect("antigravity format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "http");
+        assert_eq!(servers[0].server_config["url"], "https://example.com/mcp");
+        assert_eq!(
+            servers[0].server_config["headers"]["Authorization"],
+            "Bearer token"
+        );
+    }
+
+    #[test]
+    fn parse_antigravity_http_falls_back_to_legacy_http_url() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "type": "http",
+                    "httpUrl": "https://legacy.example.com/mcp"
+                }
+            }
+        });
+        let format = get_format_config("antigravity").expect("antigravity format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "http");
+        assert_eq!(
+            servers[0].server_config["url"],
+            "https://legacy.example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn parse_gemini_like_http_url_without_type_infers_http() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "httpUrl": "https://example.com/mcp"
+                }
+            }
+        });
+        let format = get_format_config("gemini_cli").expect("gemini_cli format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "http");
+        assert_eq!(servers[0].server_config["url"], "https://example.com/mcp");
+    }
+
+    #[test]
+    fn parse_gemini_like_url_without_type_falls_back_to_http() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "url": "https://example.com/sse"
+                }
+            }
+        });
+        let format = get_format_config("gemini_cli").expect("gemini_cli format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "http");
+        assert_eq!(servers[0].server_config["url"], "https://example.com/sse");
+    }
+
+    #[test]
+    fn parse_gemini_like_explicit_sse_type_keeps_sse() {
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "type": "sse",
+                    "url": "https://example.com/sse"
+                }
+            }
+        });
+        let format = get_format_config("gemini_cli").expect("gemini_cli format should exist");
+
+        let servers = parse_mcp_servers_from_value(&config, "mcpServers", Some(format)).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_type, "sse");
+        assert_eq!(servers[0].server_config["url"], "https://example.com/sse");
+    }
+
+    /// Build a stdio McpServer with the given command and args (helper for
+    /// path-expansion tests).
+    fn build_stdio_server_with(command: &str, args: &[&str]) -> McpServer {
+        McpServer {
+            id: String::new(),
+            name: "pathy".to_string(),
+            server_type: "stdio".to_string(),
+            server_config: json!({
+                "command": command,
+                "args": args,
+            }),
+            enabled_tools: vec![],
+            sync_details: None,
+            description: None,
+            user_group: None,
+            user_note: None,
+            tags: vec![],
+            timeout: None,
+            sort_index: 0,
+            management_enabled: true,
+            disabled_previous_tools: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn expand_stdio_paths_expands_tilde_command_and_arg() {
+        let server =
+            build_stdio_server_with("~/.fastctx/bin/fastctx.exe", &["-c", "~/config/mcp.json"]);
+
+        let expanded = expand_stdio_paths(&server);
+
+        let expected_cmd = expand_local_path("~/.fastctx/bin/fastctx.exe").unwrap();
+        assert_eq!(expanded.server_config["command"], json!(expected_cmd));
+        assert_eq!(
+            expanded.server_config["args"][0],
+            json!("-c"),
+            "pure flag args must not be touched"
+        );
+        let expected_arg = expand_local_path("~/config/mcp.json").unwrap();
+        assert_eq!(expanded.server_config["args"][1], json!(expected_arg));
+    }
+
+    #[test]
+    fn expand_stdio_paths_expands_appdata_placeholder() {
+        // %APPDATA% only exists on Windows; on other platforms the literal is
+        // preserved (env var unset), so assert conditionally.
+        let server = build_stdio_server_with("%APPDATA%/mcp/server.exe", &[]);
+        let expanded = expand_stdio_paths(&server);
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            assert_eq!(
+                expanded.server_config["command"],
+                json!(format!("{appdata}/mcp/server.exe"))
+            );
+        } else {
+            assert_eq!(
+                expanded.server_config["command"],
+                json!("%APPDATA%/mcp/server.exe")
+            );
+        }
+    }
+
+    #[test]
+    fn expand_stdio_paths_leaves_absolute_command_unchanged() {
+        let abs = if cfg!(windows) {
+            r"C:\Users\someone\fastctx.exe"
+        } else {
+            "/usr/local/bin/fastctx"
+        };
+        let server = build_stdio_server_with(abs, &["-y"]);
+        let expanded = expand_stdio_paths(&server);
+        assert_eq!(expanded.server_config["command"], json!(abs));
+        assert_eq!(expanded.server_config["args"], json!(["-y"]));
+    }
+
+    #[test]
+    fn expand_stdio_paths_skips_non_stdio() {
+        let server = build_http_server();
+        let expanded = expand_stdio_paths(&server);
+        assert_eq!(expanded.server_type, "http");
+        assert_eq!(expanded.server_config["url"], "https://example.com/mcp");
+    }
+
+    #[test]
+    fn expand_stdio_paths_leaves_pure_flags_untouched() {
+        let server = build_stdio_server_with(
+            "npx",
+            &["-y", "--prefer-online", "@sammysnake/fast-context-mcp"],
+        );
+        let expanded = expand_stdio_paths(&server);
+        assert_eq!(expanded.server_config["command"], json!("npx"));
+        assert_eq!(
+            expanded.server_config["args"],
+            json!(["-y", "--prefer-online", "@sammysnake/fast-context-mcp"])
+        );
+    }
 }

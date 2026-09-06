@@ -1,5 +1,5 @@
-import React from 'react';
-import { Button, Card, Empty, Space, Typography, Popconfirm, Collapse, Tag } from 'antd';
+import type React from 'react';
+import { Button, Card, Empty, Space, Typography, Popconfirm, Collapse, Tag, Switch, Tooltip } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined, CopyOutlined, LockOutlined, SafetyOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import {
@@ -9,8 +9,8 @@ import {
   PointerSensor,
   useSensor,
   useSensors,
-  DragEndEvent,
 } from '@dnd-kit/core';
+import type { DragEndEvent } from '@dnd-kit/core';
 import {
   arrayMove,
   SortableContext,
@@ -22,9 +22,17 @@ import { restrictToVerticalAxis } from '@dnd-kit/modifiers';
 import { CSS } from '@dnd-kit/utilities';
 import SdkTag from '@/components/common/SdkTag';
 import ModelItem from '@/components/common/ModelItem';
-import type { ProviderDisplayData, ModelDisplayData, I18nPrefix, OfficialModelDisplayData } from './types';
+import ProviderNameLink from '@/components/common/ProviderNameLink';
+import ProviderConnectivityStatus from '@/features/coding/shared/providerConnectivity/ProviderConnectivityStatus';
+import type {
+  ProviderDisplayData,
+  ModelDisplayData,
+  I18nPrefix,
+  OfficialModelDisplayData,
+  ProviderConnectivityStatusItem,
+} from './types';
 
-const { Title, Text } = Typography;
+const { Text } = Typography;
 
 interface ProviderCardProps {
   provider: ProviderDisplayData;
@@ -39,6 +47,10 @@ interface ProviderCardProps {
   onEdit?: () => void;
   onCopy?: () => void;
   onDelete?: () => void;
+  /** Whether the built-in delete Popconfirm should wrap the delete button. */
+  deleteConfirm?: boolean;
+  /** When set, the delete button stays rendered but disabled, with this tooltip on hover (e.g. it is the default provider). */
+  deleteDisabledReason?: string;
   /** Extra action buttons (e.g., "Save to Settings" button for OpenCode) */
   extraActions?: React.ReactNode;
 
@@ -47,6 +59,10 @@ interface ProviderCardProps {
   onEditModel?: (modelId: string) => void;
   onCopyModel?: (modelId: string) => void;
   onDeleteModel?: (modelId: string) => void;
+  onSetPrimaryModel?: (modelId: string) => void;
+  modelSelectionMode?: boolean;
+  selectedModelIds?: string[];
+  onToggleModelSelection?: (modelId: string, selected: boolean) => void;
 
   /** Model drag-and-drop */
   modelsDraggable?: boolean;
@@ -55,8 +71,20 @@ interface ProviderCardProps {
   /** Official models from auth.json (read-only, merged display) */
   officialModels?: OfficialModelDisplayData[];
 
+  /** Whether this provider is disabled (only used when onToggleDisabled is provided). */
+  isDisabled?: boolean;
+
+  /** Toggle callback for provider disabled state. When provided, a small Switch will be shown in card header. */
+  onToggleDisabled?: () => void;
+
+  /** Provider connectivity status for batch test. */
+  connectivityStatus?: ProviderConnectivityStatusItem;
+
   /** i18n prefix for translations */
   i18nPrefix?: I18nPrefix;
+
+  /** Short tag shown beside the model-section title (e.g. "内置 · 适配器默认模型"). */
+  modelSourceTag?: string;
 }
 
 /**
@@ -70,15 +98,25 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
   onEdit,
   onCopy,
   onDelete,
+  deleteConfirm = true,
+  deleteDisabledReason,
   extraActions,
   onAddModel,
   onEditModel,
   onCopyModel,
   onDeleteModel,
+  onSetPrimaryModel,
+  modelSelectionMode = false,
+  selectedModelIds = [],
+  onToggleModelSelection,
   modelsDraggable = false,
   onReorderModels,
   officialModels,
+  isDisabled,
+  onToggleDisabled,
+  connectivityStatus,
   i18nPrefix = 'settings',
+  modelSourceTag,
 }) => {
   const { t } = useTranslation();
 
@@ -156,11 +194,15 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
         onEdit={onEditModel ? () => onEditModel(model.id) : undefined}
         onCopy={onCopyModel ? () => onCopyModel(model.id) : undefined}
         onDelete={onDeleteModel ? () => onDeleteModel(model.id) : undefined}
+        onSetPrimary={onSetPrimaryModel ? () => onSetPrimaryModel(model.id) : undefined}
+        selectionMode={modelSelectionMode}
+        selected={selectedModelIds.includes(model.id)}
+        onSelectChange={onToggleModelSelection ? (selected) => onToggleModelSelection(model.id, selected) : undefined}
         i18nPrefix={i18nPrefix}
       />
     ));
 
-    if (modelsDraggable) {
+    if (modelsDraggable && !modelSelectionMode) {
       return (
         <DndContext
           sensors={modelSensors}
@@ -271,9 +313,20 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
   return (
     <div ref={setNodeRef} style={style}>
       <Card
-        style={{ marginBottom: 16 }}
+        style={{
+          marginBottom: 12,
+          borderColor: 'var(--color-border-card)',
+          boxShadow: 'var(--shadow-card-sm)',
+          transition: 'box-shadow 0.16s ease',
+        }}
         styles={{
           body: { padding: '8px 12px' },
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.boxShadow = 'var(--shadow-card-sm-hover)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.boxShadow = 'var(--shadow-card-sm)';
         }}
       >
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
@@ -295,9 +348,22 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
           <div style={{ flex: 1 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
               <div>
-                <Title level={5} style={{ margin: 0, marginBottom: 4 }}>
-                  {provider.name}
-                </Title>
+                <div
+                  style={{
+                    margin: 0,
+                    marginBottom: 4,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                  }}
+                >
+                  <ProviderConnectivityStatus item={connectivityStatus} />
+                  <ProviderNameLink
+                    name={provider.name}
+                    baseUrl={provider.baseUrl}
+                    style={{ fontSize: 14, fontWeight: 600 }}
+                  />
+                </div>
                 <Space size={8} wrap>
                   {provider.name !== provider.id && (
                     <>
@@ -316,6 +382,23 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
               </div>
 
               <Space>
+                {onToggleDisabled && (
+                  <Tooltip
+                    title={
+                      isDisabled
+                        ? t(`${i18nPrefix}.provider.disabled`)
+                        : t(`${i18nPrefix}.provider.enabled`)
+                    }
+                  >
+                    <Switch
+                      size="small"
+                      checked={!isDisabled}
+                      onChange={() => {
+                        onToggleDisabled();
+                      }}
+                    />
+                  </Tooltip>
+                )}
                 {onEdit && (
                   <Button
                     size="small"
@@ -330,7 +413,13 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
                     onClick={onCopy}
                   />
                 )}
-                {onDelete && (
+                {onDelete && deleteDisabledReason ? (
+                  <Tooltip title={deleteDisabledReason}>
+                    <span>
+                      <Button size="small" danger icon={<DeleteOutlined />} disabled />
+                    </span>
+                  </Tooltip>
+                ) : onDelete && (deleteConfirm ? (
                   <Popconfirm
                     title={t(`${i18nPrefix}.provider.deleteProvider`)}
                     description={t(`${i18nPrefix}.provider.confirmDelete`, { name: provider.name })}
@@ -340,7 +429,9 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
                   >
                     <Button size="small" danger icon={<DeleteOutlined />} />
                   </Popconfirm>
-                )}
+                ) : (
+                  <Button size="small" danger icon={<DeleteOutlined />} onClick={onDelete} />
+                ))}
               </Space>
             </div>
 
@@ -353,9 +444,16 @@ const ProviderCard: React.FC<ProviderCardProps> = ({
                   key: provider.id,
                   label: (
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
-                      <Text strong style={{ fontSize: 13 }}>
-                        {t(`${i18nPrefix}.model.title`)} ({models.length + (officialModels?.length || 0)})
-                      </Text>
+                      <Space size={8}>
+                        <Text strong style={{ fontSize: 13 }}>
+                          {t(`${i18nPrefix}.model.title`)} ({models.length + (officialModels?.length || 0)})
+                        </Text>
+                        {modelSourceTag && (
+                          <Tag color="blue" style={{ fontSize: 11, marginLeft: 0 }}>
+                            {modelSourceTag}
+                          </Tag>
+                        )}
+                      </Space>
                       <Space size={4} onClick={(e) => e.stopPropagation()}>
                         {extraActions}
                         {onAddModel && (

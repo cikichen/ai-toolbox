@@ -1,7 +1,10 @@
 import React, { useRef, useCallback, useEffect, useState } from 'react';
 import MonacoEditor from 'react-monaco-editor';
 import type { editor } from 'monaco-editor';
-import * as monaco from 'monaco-editor';
+import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
+// Register the JSON language (tokenization + diagnostics + worker) without
+// pulling in css/html/typescript workers that no editor in the app uses.
+import 'monaco-editor/esm/vs/language/json/monaco.contribution';
 import { useThemeStore } from '@/stores/themeStore';
 
 type EditorMode = 'tree' | 'text' | 'table';
@@ -13,6 +16,10 @@ export interface JsonEditorProps {
   onChange?: (value: unknown, isValid: boolean) => void;
   /** Callback when editor loses focus and content is valid */
   onBlur?: (value: unknown, isValid: boolean) => void;
+  /** Callback with raw editor content on every keystroke */
+  onRawChange?: (value: string) => void;
+  /** Callback with raw editor content when editor loses focus */
+  onRawBlur?: (value: string) => void;
   /** Editor mode: 'tree', 'text', or 'table' (only 'text' is supported with Monaco) */
   mode?: EditorMode;
   /** Read-only mode */
@@ -42,6 +49,8 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   value,
   onChange,
   onBlur,
+  onRawChange,
+  onRawBlur,
   mode: _mode = 'text',
   readOnly = false,
   height = 300,
@@ -57,8 +66,11 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const validateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [editorContent, setEditorContent] = useState<string | null>(null);
+  const editorContentRef = useRef<string | null>(null);
+  const lastExternalValueStringRef = useRef<string | null>(null);
   // 标记用户是否正在编辑器中输入
   const isUserEditingRef = useRef(false);
+  const [isUserEditing, setIsUserEditing] = useState(false);
 
   // 规范化值为字符串
   const normalizedValue = value === undefined || value === null ? '' : value;
@@ -175,19 +187,24 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   ) => {
     editorRef.current = editorInstance;
     validateAndSetMarkers(valueString);
+    editorContentRef.current = valueString;
+    lastExternalValueStringRef.current = valueString;
     setEditorContent(valueString);
 
     // 监听焦点事件，用于判断用户是否正在编辑，并动态切换行高亮
     editorInstance.onDidFocusEditorText(() => {
       isUserEditingRef.current = true;
+      setIsUserEditing(true);
       editorInstance.updateOptions({ renderLineHighlight: 'line' });
     });
     editorInstance.onDidBlurEditorText(() => {
       isUserEditingRef.current = false;
+      setIsUserEditing(false);
       editorInstance.updateOptions({ renderLineHighlight: 'none' });
+      const currentContent = editorInstance.getValue();
+      onRawBlur?.(currentContent);
       // 失去焦点时触发 onBlur 回调
       if (onBlur) {
-        const currentContent = editorInstance.getValue();
         const trimmedValue = currentContent.trim();
         if (trimmedValue === '') {
           onBlur(null, true);
@@ -201,10 +218,12 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
         }
       }
     });
-  }, [valueString, validateAndSetMarkers, onBlur]);
+  }, [valueString, validateAndSetMarkers, onBlur, onRawBlur]);
 
   const handleChange = useCallback((newValue: string) => {
+    editorContentRef.current = newValue;
     setEditorContent(newValue);
+    onRawChange?.(newValue);
 
     // 防抖验证
     if (validateTimeoutRef.current) {
@@ -230,44 +249,36 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       // JSON 无效
       onChange(newValue, false);
     }
-  }, [onChange, validateAndSetMarkers]);
+  }, [onChange, onRawChange, validateAndSetMarkers]);
 
   // 当外部 value 变化时更新编辑器
   useEffect(() => {
-    // 比较是否真的变化了
-    const newValueStr = typeof normalizedValue === 'string'
-      ? normalizedValue
-      : (normalizedValue === '' ? '' : JSON.stringify(normalizedValue, null, 2));
-
-    console.log('[JsonEditor] useEffect triggered', {
-      newValueStr,
-      editorContent,
-      isUserEditing: isUserEditingRef.current,
-    });
-
-    // 如果编辑器当前内容与新值相同，不需要更新
-    if (editorContent === newValueStr) {
-      console.log('[JsonEditor] Editor content matches new value, skipping');
+    if (lastExternalValueStringRef.current === valueString) {
       return;
     }
 
     // 如果用户正在编辑器中输入（编辑器有焦点），不要覆盖用户的输入
-    if (isUserEditingRef.current) {
-      console.log('[JsonEditor] User is editing, skipping external update');
+    if (isUserEditing) {
       return;
     }
 
-    console.log('[JsonEditor] Updating editorContent to:', newValueStr);
-    setEditorContent(newValueStr);
+    lastExternalValueStringRef.current = valueString;
+
+    if (editorContentRef.current === valueString) {
+      return;
+    }
+
+    editorContentRef.current = valueString;
+    setEditorContent(valueString);
 
     // 更新编辑器内容（如果编辑器已挂载）
     if (editorRef.current) {
       const model = editorRef.current.getModel();
       if (model) {
-        model.setValue(newValueStr);
+        model.setValue(valueString);
       }
     }
-  }, [normalizedValue, editorContent]);
+  }, [valueString, isUserEditing]);
 
   useEffect(() => {
     return () => {
@@ -296,6 +307,7 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
     tabSize: 2,
     renderLineHighlight: 'none',
     scrollbar: {
+      alwaysConsumeMouseWheel: false,
       vertical: 'auto',
       horizontal: 'auto',
       verticalScrollbarSize: 8,
@@ -314,14 +326,7 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   // 判断是否显示 placeholder - 只要编辑器有任何字符就不显示
   // editorContent 始终与编辑器实际内容同步
   const showPlaceholder = placeholder && (editorContent === null || editorContent.trim() === '');
-
-  console.log('[JsonEditor] Render', {
-    value,
-    normalizedValue,
-    valueString,
-    editorContent,
-    showPlaceholder,
-  });
+  const displayedValue = editorContent ?? valueString;
 
   // Monaco theme based on app theme
   const monacoTheme = resolvedTheme === 'dark' ? 'vs-dark' : 'vs';
@@ -344,7 +349,7 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
           height={actualHeight}
           language="json"
           theme={monacoTheme}
-          value={valueString}
+          value={displayedValue}
           options={options}
           onChange={handleChange}
           editorDidMount={handleEditorDidMount}

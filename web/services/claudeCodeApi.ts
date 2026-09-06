@@ -8,16 +8,35 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   ClaudeCodeProvider,
   ClaudeCommonConfig,
+  ClaudeCommonConfigInput,
+  ConfigPathInfo,
   ClaudeLocalConfigInput,
   ClaudeSettings,
   ClaudePluginStatus,
+  ClaudeInstalledPlugin,
+  ClaudeKnownMarketplace,
+  ClaudeMarketplaceAddInput,
+  ClaudeMarketplaceAutoUpdateInput,
+  ClaudeMarketplacePlugin,
+  ClaudeMarketplaceRemoveInput,
+  ClaudeMarketplaceUpdateInput,
+  ClaudePluginActionInput,
+  ClaudePluginBulkActionInput,
+  ClaudePluginBulkActionResult,
+  ClaudePluginRuntimeStatus,
+  ClaudeProviderInput,
 } from '@/types/claudecode';
+import type { OpenCodeAllApiHubProvider, OpenCodeAllApiHubProvidersResult } from '@/services/opencodeApi';
 
 /**
  * Get Claude Code configuration file path
  */
 export const getClaudeConfigPath = async (): Promise<string> => {
   return await invoke<string>('get_claude_config_path');
+};
+
+export const getClaudeRootPathInfo = async (): Promise<ConfigPathInfo> => {
+  return await invoke<ConfigPathInfo>('get_claude_root_path_info');
 };
 
 /**
@@ -38,7 +57,7 @@ export const listClaudeProviders = async (): Promise<ClaudeCodeProvider[]> => {
  * Create a new Claude Code provider
  */
 export const createClaudeProvider = async (
-  provider: Omit<ClaudeCodeProvider, 'id' | 'createdAt' | 'updatedAt'>
+  provider: ClaudeProviderInput
 ): Promise<ClaudeCodeProvider> => {
   return await invoke<ClaudeCodeProvider>('create_claude_provider', { provider });
 };
@@ -83,6 +102,22 @@ export const applyClaudeConfig = async (providerId: string): Promise<void> => {
 };
 
 /**
+ * Launch Claude Code CLI with a temporary provider settings file.
+ * Does not rewrite the applied settings.json.
+ */
+export const launchClaudeProviderCli = async (
+  providerId: string,
+  options?: { fullAccess?: boolean; cwd?: string; terminal?: string | null },
+): Promise<void> => {
+  await invoke('launch_claude_provider_cli', {
+    providerId,
+    fullAccess: options?.fullAccess ?? false,
+    cwd: options?.cwd ?? null,
+    terminal: options?.terminal ?? null,
+  });
+};
+
+/**
  * Read Claude Code settings.json
  */
 export const readClaudeSettings = async (): Promise<ClaudeSettings> => {
@@ -96,11 +131,15 @@ export const getClaudeCommonConfig = async (): Promise<ClaudeCommonConfig | null
   return await invoke<ClaudeCommonConfig | null>('get_claude_common_config');
 };
 
+export const extractClaudeCommonConfigFromCurrentFile = async (): Promise<ClaudeCommonConfig> => {
+  return await invoke<ClaudeCommonConfig>('extract_claude_common_config_from_current_file');
+};
+
 /**
  * Save common configuration
  */
-export const saveClaudeCommonConfig = async (config: string): Promise<void> => {
-  await invoke('save_claude_common_config', { config });
+export const saveClaudeCommonConfig = async (input: ClaudeCommonConfigInput): Promise<void> => {
+  await invoke('save_claude_common_config', { input });
 };
 
 /**
@@ -126,6 +165,82 @@ export const getClaudePluginStatus = async (): Promise<ClaudePluginStatus> => {
  */
 export const applyClaudePluginConfig = async (enabled: boolean): Promise<boolean> => {
   return await invoke<boolean>('apply_claude_plugin_config', { enabled });
+};
+
+export const getClaudePluginRuntimeStatus = async (): Promise<ClaudePluginRuntimeStatus> => {
+  return await invoke<ClaudePluginRuntimeStatus>('get_claude_plugin_runtime_status');
+};
+
+export const listClaudeInstalledPlugins = async (): Promise<ClaudeInstalledPlugin[]> => {
+  return await invoke<ClaudeInstalledPlugin[]>('list_claude_installed_plugins');
+};
+
+export const listClaudeKnownMarketplaces = async (): Promise<ClaudeKnownMarketplace[]> => {
+  return await invoke<ClaudeKnownMarketplace[]>('list_claude_known_marketplaces');
+};
+
+export const listClaudeMarketplacePlugins = async (): Promise<ClaudeMarketplacePlugin[]> => {
+  return await invoke<ClaudeMarketplacePlugin[]>('list_claude_marketplace_plugins');
+};
+
+export const addClaudeMarketplace = async (input: ClaudeMarketplaceAddInput): Promise<void> => {
+  await invoke('add_claude_marketplace', { input });
+};
+
+export const updateClaudeMarketplace = async (
+  input: ClaudeMarketplaceUpdateInput,
+): Promise<void> => {
+  await invoke('update_claude_marketplace', { input });
+};
+
+export const setClaudeMarketplaceAutoUpdate = async (
+  input: ClaudeMarketplaceAutoUpdateInput,
+): Promise<void> => {
+  await invoke('set_claude_marketplace_auto_update', { input });
+};
+
+export const removeClaudeMarketplace = async (
+  input: ClaudeMarketplaceRemoveInput,
+): Promise<void> => {
+  await invoke('remove_claude_marketplace', { input });
+};
+
+export const installClaudePluginUserScope = async (
+  input: ClaudePluginActionInput,
+): Promise<void> => {
+  await invoke('install_claude_plugin_user_scope', { input });
+};
+
+export const enableClaudePluginUserScope = async (
+  input: ClaudePluginActionInput,
+): Promise<void> => {
+  await invoke('enable_claude_plugin_user_scope', { input });
+};
+
+export const disableClaudePluginUserScope = async (
+  input: ClaudePluginActionInput,
+): Promise<void> => {
+  await invoke('disable_claude_plugin_user_scope', { input });
+};
+
+export const setClaudePluginsUserScopeEnabled = async (
+  input: ClaudePluginBulkActionInput,
+): Promise<ClaudePluginBulkActionResult> => {
+  return await invoke<ClaudePluginBulkActionResult>('set_claude_plugins_user_scope_enabled', {
+    input,
+  });
+};
+
+export const updateClaudePluginUserScope = async (
+  input: ClaudePluginActionInput,
+): Promise<void> => {
+  await invoke('update_claude_plugin_user_scope', { input });
+};
+
+export const uninstallClaudePluginUserScope = async (
+  input: ClaudePluginActionInput,
+): Promise<void> => {
+  await invoke('uninstall_claude_plugin_user_scope', { input });
 };
 
 /**
@@ -163,4 +278,16 @@ export const applyClaudeOnboardingSkip = async (): Promise<boolean> => {
  */
 export const clearClaudeOnboardingSkip = async (): Promise<boolean> => {
   return await invoke<boolean>('clear_claude_onboarding_skip');
+};
+
+export const listClaudeAllApiHubProviders = async (): Promise<OpenCodeAllApiHubProvidersResult> => {
+  return await invoke<OpenCodeAllApiHubProvidersResult>('list_claude_all_api_hub_providers');
+};
+
+export const resolveClaudeAllApiHubProviders = async (
+  providerIds: string[]
+): Promise<OpenCodeAllApiHubProvider[]> => {
+  return await invoke<OpenCodeAllApiHubProvider[]>('resolve_claude_all_api_hub_providers', {
+    request: { providerIds },
+  });
 };

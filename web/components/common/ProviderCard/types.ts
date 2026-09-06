@@ -20,6 +20,7 @@ export interface ModelDisplayData {
   name: string;
   contextLimit?: number;
   outputLimit?: number;
+  isPrimary?: boolean;
 }
 
 /**
@@ -34,7 +35,17 @@ export interface OfficialModelDisplayData {
   status?: string;
 }
 
+export type ProviderConnectivityState = 'idle' | 'running' | 'success' | 'error';
+
+export interface ProviderConnectivityStatusItem {
+  status: ProviderConnectivityState;
+  errorMessage?: string;
+  tooltipMessage?: string;
+  modelId?: string;
+  totalMs?: number;
+}
+
 /**
  * i18n prefix type for different pages
  */
-export type I18nPrefix = 'settings' | 'opencode' | 'openclaw';
+export type I18nPrefix = 'settings' | 'opencode' | 'openclaw' | 'pi' | 'grok' | 'ohMyPi' | 'dsh';

@@ -2,7 +2,7 @@ import React from 'react';
 import { Modal, Checkbox, Button, Empty, Spin, Typography, Tag, message } from 'antd';
 import { CloudServerOutlined, AppstoreOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
-import { readOpenCodeConfig } from '@/services/opencodeApi';
+import { readCurrentOpenCodeProviders } from '@/services/opencodeApi';
 import type { OpenCodeProvider } from '@/types/opencode';
 import type { OpenClawProviderConfig, OpenClawModel } from '@/types/openclaw';
 import styles from './ImportFromOpenCodeModal.module.less';
@@ -29,6 +29,7 @@ function npmToApi(npm?: string): string | undefined {
     case '@ai-sdk/google':
       return 'google-generative-ai';
     case '@ai-sdk/openai':
+      return 'openai-responses';
     case '@ai-sdk/openai-compatible':
       return 'openai-completions';
     default:
@@ -80,12 +81,15 @@ const ImportFromOpenCodeModal: React.FC<Props> = ({
   const loadProviders = React.useCallback(async () => {
     setLoading(true);
     try {
-      const cfg = await readOpenCodeConfig();
-      if (!cfg || !cfg.provider) {
+      const providers = await readCurrentOpenCodeProviders();
+      const providerEntries = Object.entries(providers);
+
+      if (providerEntries.length === 0) {
         setEntries([]);
         return;
       }
-      const list = Object.entries(cfg.provider).map(([id, p]) => ({
+
+      const list = providerEntries.map(([id, p]) => ({
         providerId: id,
         provider: p,
       }));
@@ -159,7 +163,7 @@ const ImportFromOpenCodeModal: React.FC<Props> = ({
       onCancel={onCancel}
       width={640}
       className={styles.modal}
-      destroyOnClose
+      destroyOnHidden
       footer={[
         <Button key="cancel" onClick={onCancel}>
           {t('common.cancel')}

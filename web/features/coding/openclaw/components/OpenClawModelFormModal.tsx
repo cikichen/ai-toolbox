@@ -3,7 +3,12 @@ import { Modal, Form, Input, AutoComplete, Button, InputNumber, Tag, Divider, Ro
 import { RightOutlined, DownOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/stores';
-import { PRESET_MODELS, type PresetModel } from '@/constants/presetModels';
+import {
+  PRESET_MODELS,
+  getPresetModelsVersion,
+  subscribePresetModels,
+  type PresetModel,
+} from '@/constants/presetModels';
 import JsonEditor from '@/components/common/JsonEditor';
 import type { OpenClawModel } from '@/types/openclaw';
 
@@ -36,7 +41,7 @@ const OUTPUT_LIMIT_OPTIONS = [
 /** Map OpenClaw API protocol to npm SDK type for preset models lookup */
 const API_TO_NPM: Record<string, string> = {
   'openai-completions': '@ai-sdk/openai-compatible',
-  'openai-responses': '@ai-sdk/openai-compatible',
+  'openai-responses': '@ai-sdk/openai',
   'anthropic-messages': '@ai-sdk/anthropic',
   'google-generative-ai': '@ai-sdk/google',
 };
@@ -95,6 +100,11 @@ const OpenClawModelFormModal: React.FC<Props> = ({
   const [presetsExpanded, setPresetsExpanded] = React.useState(false);
   const [extraParamsValue, setExtraParamsValue] = React.useState<unknown>(undefined);
   const [extraParamsValid, setExtraParamsValid] = React.useState(true);
+  const presetModelsVersion = React.useSyncExternalStore(
+    subscribePresetModels,
+    getPresetModelsVersion,
+    getPresetModelsVersion,
+  );
 
   const labelCol = { span: language === 'zh-CN' ? 5 : 7 };
   const wrapperCol = { span: 19 };
@@ -105,20 +115,20 @@ const OpenClawModelFormModal: React.FC<Props> = ({
   const presetModels = React.useMemo(() => {
     if (!npmType) return [];
     return PRESET_MODELS[npmType] || [];
-  }, [npmType]);
+  }, [npmType, presetModelsVersion]);
 
   const otherPresetModels = React.useMemo(() => {
     if (!npmType) return [];
     return Object.entries(PRESET_MODELS)
       .filter(([type]) => type !== npmType)
       .flatMap(([, models]) => models);
-  }, [npmType]);
+  }, [npmType, presetModelsVersion]);
 
   // If no npmType, show all presets as a flat list
   const allPresetModels = React.useMemo(() => {
     if (npmType) return [];
     return Object.values(PRESET_MODELS).flat();
-  }, [npmType]);
+  }, [npmType, presetModelsVersion]);
 
   const handlePresetSelect = (preset: PresetModel) => {
     form.setFieldsValue({
@@ -167,7 +177,7 @@ const OpenClawModelFormModal: React.FC<Props> = ({
         form.resetFields();
         setExtraParamsValue(undefined);
         setExtraParamsValid(true);
-        setAdvancedExpanded(false);
+        setAdvancedExpanded(true);
       }
       setPresetsExpanded(false);
     }
@@ -183,6 +193,7 @@ const OpenClawModelFormModal: React.FC<Props> = ({
   const handleOk = async () => {
     try {
       const values = await form.validateFields();
+
       const result: ModelFormValues = { ...values };
       // Include extra params if valid and non-empty
       if (extraParamsValid && typeof extraParamsValue === 'object' && extraParamsValue !== null && Object.keys(extraParamsValue).length > 0) {
@@ -208,7 +219,7 @@ const OpenClawModelFormModal: React.FC<Props> = ({
         </Button>,
       ]}
       width={600}
-      destroyOnClose
+      destroyOnHidden
     >
       <Form
         form={form}
@@ -312,7 +323,7 @@ const OpenClawModelFormModal: React.FC<Props> = ({
             style={{ width: '100%' }}
             filterOption={(inputValue, option) =>
               (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
-              option?.value.includes(inputValue)) ?? false
+                option?.value.includes(inputValue)) ?? false
             }
           />
         </Form.Item>
@@ -331,7 +342,7 @@ const OpenClawModelFormModal: React.FC<Props> = ({
             style={{ width: '100%' }}
             filterOption={(inputValue, option) =>
               (option?.label.toLowerCase().includes(inputValue.toLowerCase()) ||
-              option?.value.includes(inputValue)) ?? false
+                option?.value.includes(inputValue)) ?? false
             }
           />
         </Form.Item>

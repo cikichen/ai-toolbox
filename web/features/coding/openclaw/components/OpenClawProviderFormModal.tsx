@@ -1,9 +1,10 @@
 import React from 'react';
-import { Modal, Form, Input, Select, Button } from 'antd';
-import { ImportOutlined, EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
+import { Modal, Form, Input, Select, Button, Switch } from 'antd';
+import { EyeOutlined, EyeInvisibleOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/stores';
 import type { OpenClawProviderConfig } from '@/types/openclaw';
+import { hasOpenClawUserAgent } from '../utils/providerHeaders';
 
 const API_PROTOCOLS = [
   { value: 'openai-completions', label: 'OpenAI Completions' },
@@ -18,6 +19,8 @@ export interface ProviderFormValues {
   baseUrl?: string;
   apiKey?: string;
   api?: string;
+  /** 是否发送浏览器 User-Agent(写入 headers["User-Agent"]) */
+  userAgent?: boolean;
 }
 
 interface Props {
@@ -26,6 +29,7 @@ interface Props {
   existingIds: string[];
   onCancel: () => void;
   onSubmit: (values: ProviderFormValues) => void;
+  /** Kept for restore; OpenCode import entry is currently hidden. */
   onOpenImport?: () => void;
 }
 
@@ -35,7 +39,7 @@ const OpenClawProviderFormModal: React.FC<Props> = ({
   existingIds,
   onCancel,
   onSubmit,
-  onOpenImport,
+  onOpenImport: _onOpenImport,
 }) => {
   const { t } = useTranslation();
   const language = useAppStore((state) => state.language);
@@ -54,10 +58,11 @@ const OpenClawProviderFormModal: React.FC<Props> = ({
           baseUrl: editingProvider.config.baseUrl || '',
           apiKey: editingProvider.config.apiKey || '',
           api: editingProvider.config.api || 'openai-completions',
+          userAgent: hasOpenClawUserAgent(editingProvider.config),
         });
       } else {
         form.resetFields();
-        form.setFieldsValue({ api: 'openai-completions' });
+        form.setFieldsValue({ api: 'openai-completions', userAgent: false });
       }
       setShowApiKey(false);
     }
@@ -86,7 +91,7 @@ const OpenClawProviderFormModal: React.FC<Props> = ({
         </Button>,
       ]}
       width={800}
-      destroyOnClose
+      destroyOnHidden
     >
       <Form
         form={form}
@@ -145,19 +150,16 @@ const OpenClawProviderFormModal: React.FC<Props> = ({
           />
         </Form.Item>
 
-        {/* Import from OpenCode button — only in add mode */}
-        {!isEdit && onOpenImport && (
-          <Form.Item wrapperCol={{ offset: language === 'zh-CN' ? 4 : 6, span: 20 }} style={{ marginBottom: 0 }}>
-            <Button
-              type="dashed"
-              icon={<ImportOutlined />}
-              onClick={onOpenImport}
-            >
-              {t('openclaw.providers.importFromOpenCode')}
-            </Button>
-          </Form.Item>
-        )}
-      </Form>
+        <Form.Item
+          name="userAgent"
+          label={t('openclaw.providers.userAgent')}
+          valuePropName="checked"
+          extra={t('openclaw.providers.userAgentHint')}
+        >
+          <Switch />
+        </Form.Item>
+
+        </Form>
     </Modal>
   );
 };

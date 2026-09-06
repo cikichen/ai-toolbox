@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tauri::Manager;
 
+use super::central_repo::{merge_skill_settings_sqlite, read_skill_settings_i64_from_sqlite};
+
 const CACHE_DIR_NAME: &str = "skills-git-cache";
 const CACHE_META_FILE: &str = ".skills-cache.json";
 pub const DEFAULT_GIT_CACHE_CLEANUP_DAYS: i64 = 30;
@@ -17,32 +19,13 @@ struct RepoCacheMeta {
 }
 
 /// Get git cache cleanup days from settings
-pub async fn get_git_cache_cleanup_days(state: &crate::DbState) -> i64 {
-    let result: std::result::Result<i64, String> = async {
-        let db = state.0.lock().await;
-        let mut result = db
-            .query("SELECT * FROM skill_settings:`skills` LIMIT 1")
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let records: Vec<serde_json::Value> = result.take(0).map_err(|e| e.to_string())?;
-
-        if let Some(record) = records.first() {
-            if let Some(days) = record
-                .get("git_cache_cleanup_days")
-                .and_then(|v| v.as_i64())
-            {
-                return Ok(days);
-            }
-        }
-        Ok(DEFAULT_GIT_CACHE_CLEANUP_DAYS)
-    }.await;
-
-    result.unwrap_or(DEFAULT_GIT_CACHE_CLEANUP_DAYS)
+pub async fn get_git_cache_cleanup_days(state: &crate::SqliteDbState) -> i64 {
+    read_skill_settings_i64_from_sqlite(state, "git_cache_cleanup_days")
+        .unwrap_or(DEFAULT_GIT_CACHE_CLEANUP_DAYS)
 }
 
 /// Set git cache cleanup days in settings
-pub async fn set_git_cache_cleanup_days(state: &crate::DbState, days: i64) -> Result<i64> {
+pub async fn set_git_cache_cleanup_days(state: &crate::SqliteDbState, days: i64) -> Result<i64> {
     if !(0..=MAX_GIT_CACHE_CLEANUP_DAYS).contains(&days) {
         anyhow::bail!(
             "cleanup days must be between 0 and {}",
@@ -50,38 +33,24 @@ pub async fn set_git_cache_cleanup_days(state: &crate::DbState, days: i64) -> Re
         );
     }
 
-    let db = state.0.lock().await;
     let now = super::types::now_ms();
 
-    db.query("UPSERT skill_settings:`skills` MERGE { git_cache_cleanup_days: $days, updated_at: $now }")
-        .bind(("days", days))
-        .bind(("now", now))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to save setting: {}", e))?;
+    merge_skill_settings_sqlite(
+        state,
+        serde_json::json!({
+            "git_cache_cleanup_days": days,
+            "updated_at": now,
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("failed to save setting to SQLite: {}", e))?;
 
     Ok(days)
 }
 
 /// Get git cache TTL seconds from settings
-pub async fn get_git_cache_ttl_secs(state: &crate::DbState) -> i64 {
-    let result: std::result::Result<i64, String> = async {
-        let db = state.0.lock().await;
-        let mut result = db
-            .query("SELECT * FROM skill_settings:`skills` LIMIT 1")
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let records: Vec<serde_json::Value> = result.take(0).map_err(|e| e.to_string())?;
-
-        if let Some(record) = records.first() {
-            if let Some(secs) = record.get("git_cache_ttl_secs").and_then(|v| v.as_i64()) {
-                return Ok(secs);
-            }
-        }
-        Ok(DEFAULT_GIT_CACHE_TTL_SECS)
-    }.await;
-
-    result.unwrap_or(DEFAULT_GIT_CACHE_TTL_SECS)
+pub async fn get_git_cache_ttl_secs(state: &crate::SqliteDbState) -> i64 {
+    read_skill_settings_i64_from_sqlite(state, "git_cache_ttl_secs")
+        .unwrap_or(DEFAULT_GIT_CACHE_TTL_SECS)
 }
 
 /// Cleanup old git cache directories

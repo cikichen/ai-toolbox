@@ -15,6 +15,21 @@ export interface BackupFileInfo {
   size: number;
 }
 
+export interface RestoreWarning {
+  tool: string;
+  originalPath: string;
+  fallbackPath: string;
+}
+
+export interface RestoreResult {
+  warnings: RestoreWarning[];
+  willReapplyApplied?: boolean;
+}
+
+export interface RestoreOptions {
+  skipCliCustomRoots?: boolean;
+}
+
 /**
  * Backup database to a local zip file
  * @param backupPath - The directory to save the backup file
@@ -33,8 +48,14 @@ export const backupDatabase = async (backupPath: string): Promise<string> => {
  * Restore database from a local zip file
  * @param zipFilePath - The path to the backup zip file
  */
-export const restoreDatabase = async (zipFilePath: string): Promise<void> => {
-  await invoke('restore_database', { zipFilePath });
+export const restoreDatabase = async (
+  zipFilePath: string,
+  options?: RestoreOptions
+): Promise<RestoreResult> => {
+  return await invoke<RestoreResult>('restore_database', {
+    zipFilePath,
+    skipCliCustomRoots: options?.skipCliCustomRoots ?? false,
+  });
 };
 
 /**
@@ -110,14 +131,16 @@ export const restoreFromWebDAV = async (
   username: string,
   password: string,
   remotePath: string,
-  filename: string
-): Promise<void> => {
-  await invoke('restore_from_webdav', {
+  filename: string,
+  options?: RestoreOptions
+): Promise<RestoreResult> => {
+  return await invoke<RestoreResult>('restore_from_webdav', {
     url,
     username,
     password,
     remotePath,
     filename,
+    skipCliCustomRoots: options?.skipCliCustomRoots ?? false,
   });
 };
 

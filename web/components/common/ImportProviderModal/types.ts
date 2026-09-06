@@ -7,6 +7,16 @@ export interface ImportProviderModalProps {
   onImport: (providers: OpenCodeFavoriteProvider[]) => void;
   /** Provider IDs that already exist in current config */
   existingProviderIds: string[];
+  /** Optional title override */
+  title?: string;
+  /** Optional empty description override */
+  emptyDescription?: string;
+  /** Translation prefix for generic provider import texts */
+  i18nPrefix?: string;
+  /** Optional provider filter */
+  providerFilter?: (provider: OpenCodeFavoriteProvider) => boolean;
+  /** Optional provider list transformer for source-specific dedupe or ordering */
+  providerListTransform?: (providers: OpenCodeFavoriteProvider[]) => OpenCodeFavoriteProvider[];
 }
 
 export interface ProviderCardItemProps {

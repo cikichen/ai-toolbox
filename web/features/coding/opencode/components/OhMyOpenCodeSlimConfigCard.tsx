@@ -1,11 +1,12 @@
-import React from 'react';
-import { Card, Typography, Space, Button, Tag, Switch, Dropdown, message } from 'antd';
-import { EditOutlined, CopyOutlined, DeleteOutlined, CheckCircleOutlined, MoreOutlined, HolderOutlined } from '@ant-design/icons';
+import { Card, Typography, Space, Button, Tag, Switch, Dropdown, message, Tooltip } from 'antd';
+import { EditOutlined, CopyOutlined, DeleteOutlined, CheckOutlined, MoreOutlined, HolderOutlined } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { SLIM_AGENT_TYPES, SLIM_AGENT_DISPLAY_NAMES, type OhMyOpenCodeSlimConfig, type SlimAgentType } from '@/types/ohMyOpenCodeSlim';
+import AppliedTag from '@/components/common/AppliedTag';
+import { SLIM_AGENT_TYPES, getSlimAgentDisplayNameKey, type OhMyOpenCodeSlimConfig, type SlimAgentType } from '@/types/ohMyOpenCodeSlim';
+import { splitSlimModelValue } from './ohMyOpenCodeSlimFormUtils';
 
 const { Text } = Typography;
 
@@ -22,6 +23,8 @@ interface OhMyOpenCodeSlimConfigCardProps {
   onDelete: (config: OhMyOpenCodeSlimConfig) => void;
   onApply: (config: OhMyOpenCodeSlimConfig) => void;
   onToggleDisabled: (config: OhMyOpenCodeSlimConfig, isDisabled: boolean) => void;
+  allowClearAppliedConfig?: boolean;
+  onClearAppliedConfig?: (config: OhMyOpenCodeSlimConfig) => void;
 }
 
 const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
@@ -33,6 +36,8 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
   onDelete,
   onApply,
   onToggleDisabled,
+  allowClearAppliedConfig = false,
+  onClearAppliedConfig,
 }) => {
   const { t } = useTranslation();
 
@@ -52,8 +57,12 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
     opacity: isDragging ? 0.5 : (config.isDisabled ? 0.6 : 1),
   };
 
+  const isLocalConfig = config.id === '__local__';
+  // `__local__` is a local-file bridge, not a managed applied preset.
+  const showAsApplied = isSelected && !isLocalConfig;
+
   const handleToggleDisabled = (checked: boolean) => {
-    if (isSelected && !checked) {
+    if (showAsApplied && !checked) {
       message.warning(t('common.disableAppliedConfigWarning'));
       return;
     }
@@ -72,10 +81,13 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
     // Iterate in the predefined order for built-in agents
     SLIM_AGENT_TYPES.forEach((agentType) => {
       const agent = config.agents?.[agentType];
-      if (agent && typeof agent.model === 'string' && agent.model) {
-        const displayName = SLIM_AGENT_DISPLAY_NAMES[agentType].split(' ')[0]; // Get short name
-        const variant = typeof agent.variant === 'string' && agent.variant ? agent.variant : undefined;
-        result.push({ name: displayName, model: agent.model, variant });
+      const modelState = splitSlimModelValue(agent?.model);
+      if (agent && modelState.primaryModel) {
+        const displayName = t(getSlimAgentDisplayNameKey(agentType));
+        const variant = typeof agent.variant === 'string' && agent.variant
+          ? agent.variant
+          : modelState.primaryVariant;
+        result.push({ name: displayName, model: modelState.primaryModel, variant });
       }
     });
 
@@ -83,9 +95,12 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
     Object.keys(config.agents).forEach((key) => {
       if (!BUILT_IN_AGENT_KEYS.has(key)) {
         const agent = config.agents?.[key as SlimAgentType];
-        if (agent && typeof agent.model === 'string' && agent.model) {
-          const variant = typeof agent.variant === 'string' && agent.variant ? agent.variant : undefined;
-          result.push({ name: key, model: agent.model, variant, isCustom: true });
+        const modelState = splitSlimModelValue(agent?.model);
+        if (agent && modelState.primaryModel) {
+          const variant = typeof agent.variant === 'string' && agent.variant
+            ? agent.variant
+            : modelState.primaryVariant;
+          result.push({ name: key, model: modelState.primaryModel, variant, isCustom: true });
         }
       }
     });
@@ -105,14 +120,15 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
   // Get configured count (only built-in agents for the X/Y display)
   const configuredCount = config.agents
     ? Object.keys(config.agents).filter((key) => {
-        const agent = config.agents?.[key as SlimAgentType];
-        return BUILT_IN_AGENT_KEYS.has(key) && agent && typeof agent.model === 'string' && !!agent.model;
-      }).length
+      const agent = config.agents?.[key as SlimAgentType];
+      return BUILT_IN_AGENT_KEYS.has(key) && !!splitSlimModelValue(agent?.model).primaryModel;
+    }).length
     : 0;
   const totalAgents = STANDARD_AGENT_COUNT;
+  const canClearAppliedConfig = showAsApplied && allowClearAppliedConfig;
 
   const menuItems: MenuProps['items'] = [
-    {
+    ...(!isLocalConfig ? [{
       key: 'toggle',
       label: (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
@@ -132,7 +148,7 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
           />
         </div>
       ),
-    },
+    }] : []),
     {
       key: 'edit',
       label: t('common.edit'),
@@ -146,7 +162,7 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
       onClick: () => onCopy(config),
     },
     // Hide delete button for __local__ config
-    ...(config.id !== '__local__' ? [
+    ...(!isLocalConfig ? [
       {
         type: 'divider' as const,
       },
@@ -165,12 +181,19 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
       <Card
         size="small"
         style={{
-          marginBottom: 8,
-          borderColor: isSelected ? '#1890ff' : 'var(--color-border-secondary)',
-          backgroundColor: isSelected ? 'var(--color-bg-selected)' : 'var(--color-bg-container)',
-          transition: 'opacity 0.3s ease, border-color 0.2s ease',
+          marginBottom: 12,
+          borderColor: showAsApplied ? '#1890ff' : 'var(--color-border-card)',
+          backgroundColor: showAsApplied ? 'var(--color-bg-selected)' : 'var(--color-bg-container)',
+          boxShadow: 'var(--shadow-card-sm)',
+          transition: 'opacity 0.3s ease, border-color 0.2s ease, box-shadow 0.2s ease',
         }}
         styles={{ body: { padding: '8px 12px' } }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.boxShadow = 'var(--shadow-card-sm-hover)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.boxShadow = 'var(--shadow-card-sm)';
+        }}
       >
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
           {/* 拖拽手柄 */}
@@ -195,7 +218,7 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
                 <Text strong style={{ fontSize: 14, whiteSpace: 'nowrap' }}>{config.name}</Text>
 
                 {/* __local__ 配置提示 */}
-                {config.id === '__local__' && (
+                {isLocalConfig && (
                   <Text type="secondary" style={{ fontSize: 11 }}>
                     ({t('opencode.ohMyOpenCode.localConfigHint')})
                   </Text>
@@ -206,19 +229,25 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
                   {customAgentsCount > 0 && ` +${customAgentsCount}`}
                 </Tag>
 
-                {isSelected && (
-                  <Tag color="green" icon={<CheckCircleOutlined />} style={{ margin: 0 }}>
-                    {t('opencode.ohMyOpenCode.applied')}
-                  </Tag>
+                {showAsApplied && (
+                  <Tooltip title={canClearAppliedConfig ? t('opencode.ohMyOpenCode.clearAppliedTagTooltip') : undefined}>
+                    <AppliedTag
+                      style={{ cursor: canClearAppliedConfig ? 'pointer' : 'default' }}
+                      onClick={canClearAppliedConfig ? () => onClearAppliedConfig?.(config) : undefined}
+                    >
+                      {t('opencode.ohMyOpenCode.applied')}
+                    </AppliedTag>
+                  </Tooltip>
                 )}
               </div>
 
               {/* 右侧：操作按钮 */}
               <Space size={4}>
-                {!isSelected && (
+                {!isLocalConfig && !isSelected && (
                   <Button
                     type="link"
                     size="small"
+                    icon={<CheckOutlined />}
                     onClick={() => onApply(config)}
                     style={{ padding: '0 8px' }}
                     disabled={disabled || config.isDisabled}
@@ -246,8 +275,8 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
                   gap: '4px 12px',
                   lineHeight: '1.6'
                 }}>
-                  {agentsData.map((item, index) => (
-                    <span key={index} style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                  {agentsData.map((item) => (
+                    <span key={`${item.name}-${item.model}-${item.variant ?? 'default'}`} style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
                       <Text strong style={{ color: item.isCustom ? '#722ed1' : '#1890ff', fontSize: 12 }}>{item.name}</Text>
                       <Text type="secondary" style={{ fontSize: 12 }}>: </Text>
                       <Text type="secondary" style={{ fontSize: 12 }}>{item.model}</Text>
@@ -269,7 +298,7 @@ const OhMyOpenCodeSlimConfigCard: React.FC<OhMyOpenCodeSlimConfigCardProps> = ({
             )}
           </div>
         </div>
-    </Card>
+      </Card>
     </div>
   );
 };

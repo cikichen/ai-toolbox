@@ -8,12 +8,24 @@
 export interface FileMapping {
   id: string;
   name: string;
-  module: string; // "opencode" | "claude" | "codex" | "openclaw"
+  module: string; // "opencode" | "claude" | "codex" | "grok" | "kimi" | "openclaw" | "geminicli"
   windowsPath: string;
   wslPath: string;
   enabled: boolean;
   isPattern: boolean;
   isDirectory: boolean;
+  directoryExcludes: string[];
+  cleanupPaths: string[];
+}
+
+export interface WslDirectModuleStatus {
+  module: string;
+  isWslDirect: boolean;
+  reason?: string;
+  sourcePath?: string;
+  linuxPath?: string;
+  linuxUserRoot?: string;
+  distro?: string;
 }
 
 /**
@@ -30,6 +42,7 @@ export interface WSLSyncConfig {
   lastSyncTime?: string;
   lastSyncStatus: string; // "success" | "error" | "never"
   lastSyncError?: string;
+  moduleStatuses: WslDirectModuleStatus[];
 }
 
 /**
@@ -67,6 +80,7 @@ export interface WSLStatusResult {
   lastSyncTime?: string;
   lastSyncStatus: string;
   lastSyncError?: string;
+  moduleStatuses: WslDirectModuleStatus[];
 }
 
 /**
@@ -83,4 +97,6 @@ export interface SyncProgress {
   total: number;
   /** Overall progress message */
   message: string;
+  /** Current file being uploaded within the current item, when available */
+  currentFile?: string;
 }
